@@ -24,6 +24,10 @@ target_compile_definitions(netlib_corpus_test PRIVATE
   SOVSOLVE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 target_link_libraries(netlib_corpus_test PRIVATE sovsolve_analysis)
 
+sovsolve_add_test(canonical_test       property/canonical_test.cpp)
+target_compile_definitions(canonical_test PRIVATE
+  SOVSOLVE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+
 # Architecture enforcement. See scripts/check_layering.py -- the module
 # dependency graph is checked mechanically, not by convention.
 find_package(Python3 COMPONENTS Interpreter)
