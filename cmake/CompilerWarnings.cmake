@@ -12,3 +12,19 @@ function(sovsolve_set_warnings target)
       -Wnull-dereference -Wdouble-promotion -Wformat=2)
   endif()
 endfunction()
+
+# Static-link the GCC runtime on MinGW.
+#
+# Windows resolves DLLs from PATH, so any older libstdc++-6.dll belonging to
+# some unrelated application shadows the toolchain's own and the binary dies
+# with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) before main() runs. That is
+# environmental, not a code defect, but it makes the test suite unreliable and
+# would make any binary we hand to a teammate unreliable too.
+#
+# Linking the runtime statically removes the dependency entirely and makes the
+# executables self-contained.
+function(sovsolve_static_runtime target)
+  if(MINGW)
+    target_link_options(${target} PRIVATE -static-libgcc -static-libstdc++)
+  endif()
+endfunction()

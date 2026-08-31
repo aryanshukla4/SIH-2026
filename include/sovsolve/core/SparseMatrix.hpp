@@ -106,7 +106,41 @@ class SparseMatrix {
   }
 
   /// Verifies I1-I4. Debug builds and module boundaries; not a hot path.
-  [[nodiscard]] bool validate() const noexcept;
+  ///
+  /// Defined inline rather than out-of-line so no explicit instantiation list
+  /// has to be maintained as new (Format, T, Idx) combinations appear.
+  [[nodiscard]] bool validate() const noexcept {
+    static_assert(space == MemorySpace::Host, "validate() is host-only");
+
+    const std::size_t major = major_dim();
+    const std::size_t minor = minor_dim();
+
+    // I1: offsets shape, endpoints, monotonicity.
+    if (offsets_.size() != major + 1) return false;
+    if (offsets_.size() > 0 && offsets_[0] != Idx{0}) return false;
+    if (major > 0 && static_cast<std::size_t>(offsets_[major]) != nnz_) return false;
+    for (std::size_t i = 0; i < major; ++i) {
+      if (offsets_[i] > offsets_[i + 1]) return false;
+    }
+
+    // I4: parallel array lengths.
+    if (indices_.size() != nnz_ || values_.size() != nnz_) return false;
+
+    for (std::size_t i = 0; i < major; ++i) {
+      const std::size_t b = slice_begin(i);
+      const std::size_t e = slice_end(i);
+      for (std::size_t k = b; k < e; ++k) {
+        // I3: index in range.
+        if (indices_[k] < Idx{0}) return false;
+        if (static_cast<std::size_t>(indices_[k]) >= minor) return false;
+        // I2: strictly increasing within the slice -- sorted, so also
+        // duplicate-free. This is the invariant that actually gets violated,
+        // and the one cuSPARSE depends on.
+        if (k > b && indices_[k] <= indices_[k - 1]) return false;
+      }
+    }
+    return true;
+  }
 
  private:
   static constexpr std::size_t major_dim_of(std::size_t rows, std::size_t cols) noexcept {

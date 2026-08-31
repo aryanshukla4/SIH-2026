@@ -9,11 +9,20 @@ function(sovsolve_add_test name)
   target_link_libraries(${name} PRIVATE sovsolve sovsolve_test_support)
   sovsolve_set_warnings(${name})
   sovsolve_set_sanitizers(${name})
+  sovsolve_static_runtime(${name})
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
 sovsolve_add_test(header_compile_check unit/header_compile_check.cpp)
 sovsolve_add_test(core_types_test      unit/core_types_test.cpp)
+sovsolve_add_test(mps_reader_test      unit/mps_reader_test.cpp)
+
+# Corpus tests read real files, so they need an absolute data path -- ctest
+# runs them from the build tree, not the source tree.
+sovsolve_add_test(netlib_corpus_test   corpus/netlib_corpus_test.cpp)
+target_compile_definitions(netlib_corpus_test PRIVATE
+  SOVSOLVE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_link_libraries(netlib_corpus_test PRIVATE sovsolve_analysis)
 
 # Architecture enforcement. See scripts/check_layering.py -- the module
 # dependency graph is checked mechanically, not by convention.

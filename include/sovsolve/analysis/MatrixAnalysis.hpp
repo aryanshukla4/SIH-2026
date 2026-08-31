@@ -19,6 +19,7 @@
 #define SOVSOLVE_ANALYSIS_MATRIX_ANALYSIS_HPP
 
 #include <cstddef>
+#include <utility>
 #include <vector>
 
 #include "sovsolve/core/SparseMatrix.hpp"
