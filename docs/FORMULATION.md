@@ -40,12 +40,64 @@ Produced by the Canonicalizer, with a reversible transform stack.
 ```
     minimize      ½ xᵀQx + cᵀx
 
-    subject to    A x + s = b
+    subject to    A x = b
                   x ≥ 0
-                  s ≥ 0
 ```
 
+Every row is an equality and every variable is non-negative. This is the form
+`Ax + s = b, x ≥ 0, s ≥ 0` with the slacks appended as **columns**:
+
+```
+    A_canonical = [ A_structural | I_slack ]        x_canonical = [ x ; s ]
+```
+
+Writing it that way is not cosmetic. The `Ax + s = b, s ≥ 0` form cannot
+express an equality row — there is nowhere to put a slack that must be zero —
+and equality rows are the majority in real instances (516 of 821 rows in Netlib
+`25fv47`). Appending slack columns only to *inequality* rows handles both kinds
+uniformly.
+
+The column layout is `[structural | slack | bound]`, where `bound` holds the
+auxiliary variables introduced when a finite upper bound had to become a
+constraint row. `CanonicalProblem::slack_begin()` is where `s` starts.
+
 For LP, `Q = 0`.
+
+### 2.1 Column transforms are one affine map
+
+Every variable transform is an instance of `x = d·x' + t` with `d ∈ {+1, −1}`,
+so the whole update is uniform:
+
+```
+    A_new  = A D                     (scale column j by d_j)
+    bounds shift by  −A t
+    Q_new  = D Q D                   (Q_new[i][j] = d_i d_j Q[i][j])
+    c_new  = D (Q t + c)
+    offset = ½ tᵀQ t + cᵀt
+```
+
+| Original bounds | Transform | `d` | `t` |
+|---|---|---|---|
+| `l ≤ x`, no upper | shift | +1 | `l` |
+| `x ≤ u`, no lower | reflect | −1 | `u` |
+| `l ≤ x ≤ u` | shift, then a bound row `x' + t = u−l` | +1 | `l` |
+| free | split `x = x⁺ − x⁻` | — | — |
+
+Free variables are the one case outside the map. Splitting doubles the column
+and worsens conditioning (`x⁺` and `x⁻` are perfectly correlated near the
+solution), so the record is kept distinguishable — a later IPM can handle free
+variables natively without the loader changing.
+
+### 2.2 Row transforms
+
+| Original | Canonical |
+|---|---|
+| `aᵀx = b` | `aᵀx = b` — no slack |
+| `aᵀx ≤ u` | `aᵀx + s = u`, `s ≥ 0` |
+| `aᵀx ≥ l` | negate the row, then `−aᵀx + s = −l` |
+| `l ≤ aᵀx ≤ u` | `aᵀx + s = u` with a bound row for `s` |
+
+Row negation flips the sign of that row's dual; recovery inverts it.
 
 ---
 

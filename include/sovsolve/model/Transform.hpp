@@ -42,13 +42,18 @@ using core::Real;
 
 enum class TransformKind : std::uint8_t {
   // -- canonicalization ---------------------------------------------------
-  NegateObjective,     ///< maximize -> minimize
-  ShiftVariable,       ///< x >= l, l != 0  ->  x' = x - l
+  //
+  // Every column transform is an instance of the affine map x = d*x' + t with
+  // d in {+1, -1}. Keeping the two kinds distinct rather than collapsing them
+  // into one record makes the inverse readable at the point of use.
+  NegateObjective,     ///< maximize -> minimize; c and Q negated
+  ShiftVariable,       ///< x >= l  ->  x' = x - l          (d = +1, t = l)
+  NegateVariable,      ///< x <= u, no lower  ->  x' = u - x (d = -1, t = u)
   SplitFreeVariable,   ///< x free  ->  x = xp - xm, both >= 0
-  NegateVariable,      ///< x <= u with no lower bound  ->  x' = -x
-  AddBoundRow,         ///< x <= u  ->  x + t = u, t >= 0
-  AddSlack,            ///< a'x <= b  ->  a'x + s = b
-  BoundedSlack,        ///< l <= a'x <= u  ->  a'x + s = u, 0 <= s <= u - l
+  AddBoundRow,         ///< x' <= w  ->  x' + t = w, t >= 0
+  NegateRow,           ///< a'x >= b  ->  -a'x <= -b, so a slack can be added
+  AddSlack,            ///< a'x <= b  ->  a'x + s = b, s >= 0
+  BoundedSlack,        ///< l <= a'x <= u  ->  slack with its own bound row
   DropFreeRow,         ///< N rows after the objective
 
   // -- presolve (reserved; owned by the presolve module) -------------------
