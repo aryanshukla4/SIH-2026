@@ -1,0 +1,20 @@
+// Compile-only check: every public header parses standalone and together.
+#include "sovsolve/core/AlignedAllocator.hpp"
+#include "sovsolve/core/DenseMatrix.hpp"
+#include "sovsolve/core/LinearOperator.hpp"
+#include "sovsolve/core/NameArena.hpp"
+#include "sovsolve/core/SparseMatrix.hpp"
+#include "sovsolve/core/Span.hpp"
+#include "sovsolve/core/Status.hpp"
+#include "sovsolve/core/Types.hpp"
+#include "sovsolve/core/Vector.hpp"
+#include "sovsolve/core/Workspace.hpp"
+#include "sovsolve/model/Canonical.hpp"
+#include "sovsolve/model/Options.hpp"
+#include "sovsolve/model/Problem.hpp"
+#include "sovsolve/model/Solution.hpp"
+#include "sovsolve/model/Transform.hpp"
+#include "sovsolve/analysis/MatrixAnalysis.hpp"
+#include "sovsolve/io/Load.hpp"
+
+int main() { return 0; }
