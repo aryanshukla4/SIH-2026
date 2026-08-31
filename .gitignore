@@ -16,10 +16,14 @@ compile_commands.json
 .idea/
 CMakeUserPresets.json
 
-# Benchmark corpora are large and are fetched by scripts/, not committed.
-tests/corpus/netlib/
-tests/corpus/miplib/
-tests/corpus/qplib/
+# Benchmark corpora are fetched by scripts/fetch_netlib.py, not committed --
+# the full set is several MB. afiro and adlittle are the exceptions: they are
+# small, and committing them keeps the corpus test meaningful with no network.
+tests/data/netlib/*.mps
+!tests/data/netlib/afiro.mps
+!tests/data/netlib/adlittle.mps
+tests/data/miplib/
+tests/data/qplib/
 bench/results/*.json
 bench/results/*.csv
 
