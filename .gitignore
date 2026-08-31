@@ -1,0 +1,29 @@
+build/
+build-*/
+out/
+.cache/
+compile_commands.json
+*.o
+*.obj
+*.exe
+*.a
+*.lib
+*.so
+*.dll
+*.pdb
+.vs/
+.vscode/
+.idea/
+CMakeUserPresets.json
+
+# Benchmark corpora are large and are fetched by scripts/, not committed.
+tests/corpus/netlib/
+tests/corpus/miplib/
+tests/corpus/qplib/
+bench/results/*.json
+bench/results/*.csv
+
+# Oracle cross-check output (regenerated).
+tests/oracle/*.json
+__pycache__/
+*.pyc
