@@ -17,6 +17,7 @@ sovsolve_add_test(header_compile_check unit/header_compile_check.cpp)
 sovsolve_add_test(core_types_test      unit/core_types_test.cpp)
 sovsolve_add_test(mps_reader_test      unit/mps_reader_test.cpp)
 sovsolve_add_test(lp_reader_test       unit/lp_reader_test.cpp)
+sovsolve_add_test(qplib_reader_test    unit/qplib_reader_test.cpp)
 
 # Corpus tests read real files, so they need an absolute data path -- ctest
 # runs them from the build tree, not the source tree.

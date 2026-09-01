@@ -23,6 +23,10 @@ namespace sovsolve::io {
 [[nodiscard]] core::Expected<model::Problem> parse_lp(
     std::string_view content, const model::ReaderOptions& options);
 
+/// QPLIB, per Table 8 of Furini et al. Line-oriented and positional.
+[[nodiscard]] core::Expected<model::Problem> parse_qplib(
+    std::string_view content, const model::ReaderOptions& options);
+
 }  // namespace sovsolve::io
 
 #endif  // SOVSOLVE_IO_DETAIL_READERS_HPP

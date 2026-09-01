@@ -1,10 +1,10 @@
-// Deterministic mutation fuzzing for both parsers.
+// Deterministic mutation fuzzing for all three parsers.
 //
 // ---------------------------------------------------------------------------
 // Why guard pages instead of AddressSanitizer
 // ---------------------------------------------------------------------------
 //
-// The risk this targets is specific: both readers scan a memory-mapped buffer
+// The risk this targets is specific: the readers scan a memory-mapped buffer
 // with raw pointer arithmetic, and a malformed file is exactly what makes a
 // scanner walk off the end. ASan is the usual detector for that, but this
 // toolchain (MinGW-w64 GCC 15) ships no `libasan` or `libubsan`, so
@@ -323,8 +323,19 @@ bool model_is_coherent(const model::Problem& p) {
   return true;
 }
 
-std::vector<std::string> load_seeds() {
-  std::vector<std::string> seeds;
+/// A seed and the format it is meant to be read as.
+///
+/// The format travels WITH the seed rather than being sniffed from the mutated
+/// text. Sniffing would misroute exactly the inputs that matter: a mutation
+/// that damages the marker a sniffer keys on would silently send the input to
+/// the wrong parser, and the run would stop exercising the one it was aimed at.
+struct Seed {
+  std::string text;
+  io::FileFormat format;
+};
+
+std::vector<Seed> load_seeds() {
+  std::vector<Seed> seeds;
 #ifdef SOVSOLVE_TEST_DATA_DIR
   const fs::path data(SOVSOLVE_TEST_DATA_DIR);
 #else
@@ -337,16 +348,18 @@ std::vector<std::string> load_seeds() {
   for (const char* name : mps) {
     const fs::path f = data / "netlib" / (std::string(name) + ".mps");
     std::string text;
-    if (read_file(f, text)) seeds.push_back(std::move(text));
+    if (read_file(f, text)) {
+      seeds.push_back({std::move(text), io::FileFormat::Mps});
+    }
   }
   {
     std::string text;
     if (read_file(data / "lp" / "blend.lp", text)) {
-      seeds.push_back(std::move(text));
+      seeds.push_back({std::move(text), io::FileFormat::Lp});
     }
   }
   // Hand-written seeds covering constructs the corpus lacks.
-  seeds.emplace_back(R"(NAME          RNG
+  seeds.push_back({R"(NAME          RNG
 ROWS
  N  COST
  L  R1
@@ -368,8 +381,8 @@ QUADOBJ
     X         X            2.0
     X         Y            1.0
 ENDATA
-)");
-  seeds.emplace_back(R"(Maximize
+)", io::FileFormat::Mps});
+  seeds.push_back({R"(Maximize
  obj: 3 x + 2 y + [ 2 x ^ 2 + 4 x * y ] / 2
 Subject To
  c1: -5 <= x + y <= 10
@@ -380,7 +393,55 @@ Bounds
 General
  x
 End
-)");
+)", io::FileFormat::Lp});
+
+  // QPLIB, from the format's own specification. This is the seed that most
+  // needs fuzzing: the format is POSITIONAL with no section keywords, so a
+  // damaged count does not desynchronise into a syntax error -- it shifts every
+  // subsequent field, and the reader has nothing to resynchronise on.
+  seeds.push_back({R"(! example problem
+MIPBAND
+QML
+Minimize
+3
+2
+5
+1 1 2.0
+2 1 -1.0
+2 2 2.0
+3 2 -1.0
+3 3 2.0
+-0.2
+1
+2 -0.4
+0.0
+4
+1 1 1.0
+1 2 1.0
+2 1 1.0
+2 3 1.0
+1.0E+20
+1.0
+0
+1.0E+20
+0
+0.0
+0
+1.0
+1
+2 2.0
+0
+1
+3 2
+1.0
+0
+0.0
+0
+0.0
+0
+0
+0
+)", io::FileFormat::Qplib});
   return seeds;
 }
 
@@ -399,16 +460,12 @@ void run_fuzz(std::size_t iterations) {
   std::size_t incoherent = 0;
 
   for (std::size_t it = 0; it < iterations; ++it) {
-    const std::string& seed = seeds[pick(rng, seeds.size())];
-    std::string input = mutate(seed, rng);
+    const Seed& seed = seeds[pick(rng, seeds.size())];
+    std::string input = mutate(seed.text, rng);
     // Occasionally stack two mutations -- one is often repaired by the
     // parser's own resynchronisation, two much less often.
     if (pick(rng, 3) == 0) input = mutate(input, rng);
-
-    const bool looks_lp = input.find("Subject To") != std::string::npos ||
-                          input.find("Minimize") != std::string::npos ||
-                          input.find("Maximize") != std::string::npos;
-    const auto format = looks_lp ? io::FileFormat::Lp : io::FileFormat::Mps;
+    const auto format = seed.format;
 
     if (!buf.load(input.data(), input.size())) {
       ::sovsolve::test::record(__FILE__, __LINE__, "guard", "allocation failed");
