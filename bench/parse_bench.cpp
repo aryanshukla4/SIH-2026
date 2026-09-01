@@ -9,6 +9,7 @@
 // anywhere and scales past what Netlib provides. Real files are measured too
 // when a path is given on the command line.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -102,15 +103,31 @@ std::string generate_mps(std::size_t rows, std::size_t cols,
 }
 
 struct Result {
-  double parse_ms;
+  double parse_ms;    ///< best observed
+  double median_ms;   ///< median observed
+  double spread_pct;  ///< (median - best) / best, as a percentage
   std::size_t bytes;
   std::size_t rows, cols, nnz;
 };
 
+/// Time `repeats` parses and report the best AND the median.
+///
+/// Reporting only the best hides instability, and this benchmark has plenty:
+/// consecutive runs of the identical binary over identical input were measured
+/// differing by 2x. A figure quoted from a single best-of-3 is then not a
+/// measurement, it is a sample of the noise. The spread column makes that
+/// visible, so a claimed improvement smaller than the spread can be recognised
+/// as unmeasurable rather than believed.
+///
+/// One warm-up parse is discarded first. It pays the first-touch page faults
+/// for every buffer the parser allocates, which on a 64 MB instance accounts
+/// for most of the gap between the first run and the rest.
 Result measure(const std::string& text, int repeats) {
   Result r{};
-  double best = 1e300;
-  for (int i = 0; i < repeats; ++i) {
+  std::vector<double> samples;
+  samples.reserve(static_cast<std::size_t>(repeats));
+
+  for (int i = -1; i < repeats; ++i) {
     const auto t0 = std::chrono::steady_clock::now();
     auto p = sovsolve::io::parseProblem(text, sovsolve::io::FileFormat::Mps);
     const auto t1 = std::chrono::steady_clock::now();
@@ -118,15 +135,18 @@ Result measure(const std::string& text, int repeats) {
       std::fprintf(stderr, "parse failed: %s\n", p.error().format().c_str());
       std::exit(1);
     }
-    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    if (ms < best) {
-      best = ms;
-      r.rows = p->num_rows();
-      r.cols = p->num_cols();
-      r.nnz = p->nnz();
-    }
+    if (i < 0) continue;  // warm-up, discarded
+    samples.push_back(
+        std::chrono::duration<double, std::milli>(t1 - t0).count());
+    r.rows = p->num_rows();
+    r.cols = p->num_cols();
+    r.nnz = p->nnz();
   }
-  r.parse_ms = best;
+
+  std::sort(samples.begin(), samples.end());
+  r.parse_ms = samples.front();
+  r.median_ms = samples[samples.size() / 2];
+  r.spread_pct = 100.0 * (r.median_ms - r.parse_ms) / r.parse_ms;
   r.bytes = text.size();
   return r;
 }
@@ -142,16 +162,17 @@ void report(const char* label, const Result& r) {
   const double per_nnz =
       r.nnz > 0 ? csr_bytes / static_cast<double>(r.nnz) : 0.0;
 
-  std::printf("%-22s %8zu %8zu %10zu %9.1f %9.1f %10.2f %9.1f %8.1f\n", label,
-              r.rows, r.cols, r.nnz, mb * 1024.0, r.parse_ms, mb / sec,
+  std::printf("%-22s %8zu %8zu %10zu %9.1f %9.1f %7.1f%% %10.2f %9.1f %8.1f\n",
+              label, r.rows, r.cols, r.nnz, mb * 1024.0, r.parse_ms,
+              r.spread_pct, mb / sec,
               static_cast<double>(r.nnz) / sec / 1e6, per_nnz * 2.0);
 }
 
 void print_header() {
-  std::printf("%-22s %8s %8s %10s %9s %9s %10s %9s %8s\n", "instance", "rows",
-              "cols", "nnz", "size KB", "parse ms", "MB/s", "Mnnz/s",
-              "B/nnz");
-  std::printf("%s\n", std::string(101, '-').c_str());
+  std::printf("%-22s %8s %8s %10s %9s %9s %8s %10s %9s %8s\n", "instance",
+              "rows", "cols", "nnz", "size KB", "best ms", "spread", "MB/s",
+              "Mnnz/s", "B/nnz");
+  std::printf("%s\n", std::string(110, '-').c_str());
 }
 
 }  // namespace
@@ -168,10 +189,10 @@ int main(int argc, char** argv) {
     int repeats;
   };
   constexpr Case kCases[] = {
-      {"synthetic/small", 1000, 1500, 6, 0, 20},
-      {"synthetic/medium", 20000, 30000, 8, 0, 5},
-      {"synthetic/dense-cols", 20000, 30000, 8, 3, 5},
-      {"synthetic/large", 100000, 150000, 10, 0, 3},
+      {"synthetic/small", 1000, 1500, 6, 0, 40},
+      {"synthetic/medium", 20000, 30000, 8, 0, 15},
+      {"synthetic/dense-cols", 20000, 30000, 8, 3, 15},
+      {"synthetic/large", 100000, 150000, 10, 0, 9},
   };
 
   for (const auto& c : kCases) {
