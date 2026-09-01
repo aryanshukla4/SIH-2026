@@ -47,7 +47,11 @@ struct RowPlan {
   bool was_empty = false;    ///< dropped because no kept column touched it
   bool was_free = false;     ///< dropped because both bounds were infinite
   Real rhs = 0.0;
-  Real slack_upper = INF;
+  /// Ranged rows only: the bounded column `t` added for this row, and its
+  /// width `hi - lo`. A ranged row becomes an EQUALITY carrying `t`, not an
+  /// inequality with a two-sided slack.
+  Index range_col = kNone;
+  Real range_width = 0.0;
 };
 
 /// y <- M * t, using the CSR view.
@@ -100,7 +104,7 @@ bool CanonicalProblem::validate() const noexcept {
     return false;
   }
   if (num_equality > num_rows()) return false;
-  if (slack_upper.size() != num_inequality_rows()) return false;
+  if (num_range > num_cols()) return false;
   if (!A.csr.validate() || !A.csc.validate()) return false;
   if (!Q.empty() && (Q.rows() != num_cols() || Q.cols() != num_cols())) {
     return false;
@@ -203,6 +207,7 @@ core::Expected<CanonicalResult> canonicalize(const Problem& problem,
   std::vector<RowPlan> rows(m0);
   std::size_t n_equality = 0;
   std::size_t n_inequality = 0;
+  std::size_t n_range = 0;
 
   for (std::size_t i = 0; i < m0; ++i) {
     const Real raw_lo = problem.row_lower[i];
@@ -261,13 +266,17 @@ core::Expected<CanonicalResult> canonicalize(const Problem& problem,
       r.rhs = -lo;
       ++n_inequality;
     } else {
-      // Ranged: a'x + s = hi with 0 <= s <= hi - lo. The bounded slack is the
-      // one construct the handoff residual `rsy = -s.*y_I - mu` does not cover;
-      // it needs the same two-sided treatment a boxed column gets.
-      r.fate = RowFate::Inequality;
+      // Ranged: `a'x + t = hi` with `0 <= t <= hi - lo`, an EQUALITY carrying a
+      // bounded column. Not an inequality with a two-sided slack -- that would
+      // need a second dual and a matching residual, step-length test and mu
+      // term across six downstream modules, where a bounded column needs
+      // nothing new at all.
+      r.fate = RowFate::Equality;
       r.rhs = hi;
-      r.slack_upper = hi - lo;
-      ++n_inequality;
+      r.range_width = hi - lo;
+      r.range_col = 0;  // real index assigned once n_kept is final
+      ++n_equality;
+      ++n_range;
     }
   }
 
@@ -294,9 +303,18 @@ core::Expected<CanonicalResult> canonicalize(const Problem& problem,
           break;
       }
     }
+    // Range columns are appended after every kept original column, so the
+    // original columns keep indices `[0, n_kept)` and recovery stays a direct
+    // lookup.
+    std::size_t next_range = n_kept;
+    for (std::size_t i = 0; i < m0; ++i) {
+      if (rows[i].range_col == kNone) continue;
+      rows[i].range_col = static_cast<Index>(next_range++);
+    }
   }
 
   const std::size_t n_canon_rows = n_equality + n_inequality;
+  const std::size_t n_canon_cols = n_kept + n_range;
 
   // -- record the stack ----------------------------------------------------
   //
@@ -326,9 +344,10 @@ core::Expected<CanonicalResult> canonicalize(const Problem& problem,
     stack.push({TransformKind::MapRow, oi, r.canonical, 0.0, 0.0});
     if (r.negate) stack.push({TransformKind::NegateRow, oi, kNone, 0.0, 0.0});
     if (r.fate == RowFate::Inequality) {
-      const bool bounded = is_finite_bound(r.slack_upper);
-      stack.push({bounded ? TransformKind::BoundedSlack : TransformKind::AddSlack,
-                  oi, r.slack, r.rhs, r.slack_upper});
+      stack.push({TransformKind::AddSlack, oi, r.slack, r.rhs, 0.0});
+    } else if (r.range_col != kNone) {
+      stack.push({TransformKind::BoundedSlack, oi, r.range_col, r.rhs,
+                  r.range_width});
     }
   }
 
@@ -346,9 +365,10 @@ core::Expected<CanonicalResult> canonicalize(const Problem& problem,
   cp.objective_negated = maximize;
   cp.num_equality = n_equality;
 
-  cp.c = core::RealVector(n_kept, 0.0);
-  cp.col_lower = core::RealVector(n_kept, 0.0);
-  cp.col_upper = core::RealVector(n_kept, 0.0);
+  cp.num_range = n_range;
+  cp.c = core::RealVector(n_canon_cols, 0.0);
+  cp.col_lower = core::RealVector(n_canon_cols, 0.0);
+  cp.col_upper = core::RealVector(n_canon_cols, 0.0);
 
   Real offset = 0.0;
   for (std::size_t j = 0; j < n0; ++j) {
@@ -366,13 +386,14 @@ core::Expected<CanonicalResult> canonicalize(const Problem& problem,
   // -- right-hand sides and slack bounds -----------------------------------
 
   cp.b = core::RealVector(n_canon_rows, 0.0);
-  cp.slack_upper = core::RealVector(n_inequality, INF);
   for (std::size_t i = 0; i < m0; ++i) {
     const auto& r = rows[i];
     if (r.fate == RowFate::Dropped) continue;
     cp.b[static_cast<std::size_t>(r.canonical)] = r.rhs;
-    if (r.fate == RowFate::Inequality) {
-      cp.slack_upper[static_cast<std::size_t>(r.slack)] = r.slack_upper;
+    if (r.range_col != kNone) {
+      const auto rc = static_cast<std::size_t>(r.range_col);
+      cp.col_lower[rc] = 0.0;
+      cp.col_upper[rc] = r.range_width;
     }
   }
 
@@ -398,10 +419,11 @@ core::Expected<CanonicalResult> canonicalize(const Problem& problem,
         if (col_map[j] == kNone) continue;  // folded into the right-hand side
         emit(r.canonical, col_map[j], row_sign * val[k]);
       }
+      if (r.range_col != kNone) emit(r.canonical, r.range_col, 1.0);
     }
   };
 
-  core::SparseBuilder builder(n_canon_rows, n_kept);
+  core::SparseBuilder builder(n_canon_rows, n_canon_cols);
   enumerate([&](Index r, Index c, Real) { builder.count(r, c); });
   if (auto st = builder.allocate(); !st.ok()) return st.error();
   enumerate([&](Index r, Index c, Real v) { builder.insert(r, c, v); });
@@ -426,7 +448,7 @@ core::Expected<CanonicalResult> canonicalize(const Problem& problem,
       }
     };
 
-    core::SparseBuilder qb(n_kept, n_kept);
+    core::SparseBuilder qb(n_canon_cols, n_canon_cols);
     enumerate_q([&](Index r, Index c, Real) { qb.count(r, c); });
     if (auto st = qb.allocate(); !st.ok()) return st.error();
     enumerate_q([&](Index r, Index c, Real v) { qb.insert(r, c, v); });

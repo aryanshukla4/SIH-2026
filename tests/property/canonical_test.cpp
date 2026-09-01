@@ -56,9 +56,13 @@ struct CanonPoint {
 struct RowLayout {
   std::vector<std::size_t> canonical;  ///< kNone-equivalent: npos when dropped
   std::vector<std::size_t> slack;      ///< npos unless an inequality
+  /// Ranged rows only: the bounded column added for the row. A ranged row is
+  /// an EQUALITY carrying that column, not an inequality with a bounded slack.
+  std::vector<std::size_t> range_col;
   std::vector<bool> negated;
   std::size_t num_equality = 0;
   std::size_t num_inequality = 0;
+  std::size_t num_range = 0;
   static constexpr std::size_t kDropped = static_cast<std::size_t>(-1);
 };
 
@@ -82,6 +86,7 @@ RowLayout row_layout(const model::Problem& p,
   RowLayout out;
   out.canonical.assign(p.num_rows(), RowLayout::kDropped);
   out.slack.assign(p.num_rows(), RowLayout::kDropped);
+  out.range_col.assign(p.num_rows(), RowLayout::kDropped);
   out.negated.assign(p.num_rows(), false);
 
   const auto off = p.A.csr.offsets();
@@ -107,6 +112,11 @@ RowLayout row_layout(const model::Problem& p,
     if (lf && hf && lo == hi) {
       kind[i] = 0;
       ++out.num_equality;
+    } else if (lf && hf) {
+      // Ranged: an equality plus a bounded column, not a two-sided slack.
+      kind[i] = 2;
+      ++out.num_equality;
+      ++out.num_range;
     } else {
       kind[i] = 1;
       out.negated[i] = lf && !hf;
@@ -118,12 +128,20 @@ RowLayout row_layout(const model::Problem& p,
   std::size_t next_ineq = out.num_equality;
   std::size_t next_slack = 0;
   for (std::size_t i = 0; i < p.num_rows(); ++i) {
-    if (kind[i] == 0) {
+    if (kind[i] == 0 || kind[i] == 2) {
       out.canonical[i] = next_eq++;
     } else if (kind[i] == 1) {
       out.canonical[i] = next_ineq++;
       out.slack[i] = next_slack++;
     }
+  }
+  // Range columns are appended after the kept original columns.
+  std::size_t next_range = 0;
+  for (std::size_t j = 0; j < col_map.size(); ++j) {
+    if (col_map[j] != RowLayout::kDropped) ++next_range;
+  }
+  for (std::size_t i = 0; i < p.num_rows(); ++i) {
+    if (kind[i] == 2) out.range_col[i] = next_range++;
   }
   return out;
 }
@@ -139,7 +157,7 @@ CanonPoint forward_map(const model::Problem& p, const std::vector<Real>& x,
   for (const auto m : col_map) {
     if (m != RowLayout::kDropped) ++n_kept;
   }
-  out.x.assign(n_kept, 0.0);
+  out.x.assign(n_kept + rl.num_range, 0.0);
   out.s.assign(rl.num_inequality, 0.0);
 
   for (std::size_t j = 0; j < p.num_cols(); ++j) {
@@ -152,7 +170,9 @@ CanonPoint forward_map(const model::Problem& p, const std::vector<Real>& x,
   const auto val = p.A.csr.values();
 
   for (std::size_t i = 0; i < p.num_rows(); ++i) {
-    if (rl.slack[i] == RowLayout::kDropped) continue;
+    const bool has_slack = rl.slack[i] != RowLayout::kDropped;
+    const bool has_range = rl.range_col[i] != RowLayout::kDropped;
+    if (!has_slack && !has_range) continue;
     Real act = 0.0;
     for (auto k = static_cast<std::size_t>(off[i]);
          k < static_cast<std::size_t>(off[i + 1]); ++k) {
@@ -162,7 +182,11 @@ CanonPoint forward_map(const model::Problem& p, const std::vector<Real>& x,
     // against the full original activity either way -- the two shifts cancel.
     const Real lo = p.row_lower[i];
     const Real hi = p.row_upper[i];
-    out.s[rl.slack[i]] = rl.negated[i] ? (act - lo) : (hi - act);
+    if (has_slack) {
+      out.s[rl.slack[i]] = rl.negated[i] ? (act - lo) : (hi - act);
+    } else {
+      out.x[rl.range_col[i]] = hi - act;  // a'x + t = hi
+    }
   }
   return out;
 }
@@ -211,11 +235,9 @@ void check_roundtrip(const char* label, const model::Problem& p,
 
   bool slacks_ok = true;
   for (std::size_t k = 0; k < pt.s.size(); ++k) {
+    // Every canonical slack is one-sided. A ranged row does not produce a
+    // two-sided slack; it produces an equality plus a bounded column.
     if (pt.s[k] < -1e-9) slacks_ok = false;
-    if (is_finite_bound(cp.slack_upper[k]) &&
-        pt.s[k] > cp.slack_upper[k] + 1e-9) {
-      slacks_ok = false;
-    }
   }
   CHECK(slacks_ok);
 
@@ -444,11 +466,22 @@ ENDATA
   auto canon = model::canonicalize(p);
   CHECK(canon.has_value());
   if (!canon.has_value()) return;
+  // Three ranged rows become three EQUALITIES, each carrying one bounded
+  // column: 3 rows unchanged, 2 original columns plus 3 range columns.
   CHECK_EQ(canon->problem.num_rows(), std::size_t{3});
-  CHECK_EQ(canon->problem.num_equality, std::size_t{0});
-  for (std::size_t k = 0; k < canon->problem.slack_upper.size(); ++k) {
-    CHECK(is_finite_bound(canon->problem.slack_upper[k]));
+  CHECK_EQ(canon->problem.num_equality, std::size_t{3});
+  CHECK_EQ(canon->problem.num_inequality_rows(), std::size_t{0});
+  CHECK_EQ(canon->problem.num_range, std::size_t{3});
+  CHECK_EQ(canon->problem.num_cols(), std::size_t{5});
+  // Each range column is bounded by the row's width, and none is fixed --
+  // a zero-width range would be an equality row, not a ranged one.
+  const std::size_t first = canon->problem.num_cols() - canon->problem.num_range;
+  for (std::size_t k = first; k < canon->problem.num_cols(); ++k) {
+    CHECK_NEAR(canon->problem.col_lower[k], 0.0, 1e-12);
+    CHECK(is_finite_bound(canon->problem.col_upper[k]));
+    CHECK(canon->problem.col_upper[k] > 0.0);
   }
+  CHECK(canon->problem.is_ipm_startable());
 
   check_roundtrip("ranged", p, {5.0, 1.0});
   check_roundtrip("ranged b", p, {6.0, 2.0});
@@ -507,6 +540,64 @@ ENDATA
   CHECK(p.has_quadratic());
   check_roundtrip("qp", p, {2.0, 0.0});
   check_roundtrip("qp b", p, {3.5, 4.25});
+}
+
+void test_maximize_quadratic_negates_Q() {
+  // The scope says `Q` is symmetric POSITIVE semidefinite. A legitimate
+  // concave maximization arrives with `Q` NEGATIVE semidefinite, so the sense
+  // flip has to negate `Q` as well as `c` -- otherwise the stated scope
+  // silently fails to hold for a valid input, and the factorization meets an
+  // indefinite matrix it was promised it would not see.
+  const auto p = parse(R"(NAME          MAXQP
+OBJSENSE
+    MAX
+ROWS
+ N  obj
+ L  R1
+COLUMNS
+    x         obj          4.0   R1           1.0
+    y         obj          2.0   R1           1.0
+RHS
+    RHS       R1          10.0
+QUADOBJ
+    x         x           -2.0
+    y         y           -4.0
+ENDATA
+)");
+  CHECK(p.sense == core::ObjSense::Maximize);
+  CHECK(p.has_quadratic());
+
+  auto canon = model::canonicalize(p);
+  CHECK(canon.has_value());
+  if (!canon.has_value()) return;
+  const auto& cp = canon->problem;
+  CHECK(cp.objective_negated);
+
+  // Original: max 4x + 2y - x^2 - 2y^2   (concave, Q = diag(-2,-4))
+  // Canonical: min -4x - 2y + x^2 + 2y^2 (convex,  Q = diag(+2,+4))
+  const auto q = [&](std::size_t i, std::size_t j) {
+    const auto off = cp.Q.csr.offsets();
+    const auto idx = cp.Q.csr.indices();
+    const auto val = cp.Q.csr.values();
+    Real s = 0.0;
+    for (auto k = static_cast<std::size_t>(off[i]);
+         k < static_cast<std::size_t>(off[i + 1]); ++k) {
+      if (static_cast<std::size_t>(idx[k]) == j) s += val[k];
+    }
+    return s;
+  };
+  CHECK_NEAR(q(0, 0), 2.0, 1e-12);
+  CHECK_NEAR(q(1, 1), 4.0, 1e-12);
+  CHECK_NEAR(cp.c[0], -4.0, 1e-12);
+  CHECK_NEAR(cp.c[1], -2.0, 1e-12);
+
+  // Every diagonal entry non-negative is the cheap necessary condition for PSD
+  // that the canonical form is supposed to guarantee.
+  for (std::size_t i = 0; i < cp.num_cols(); ++i) CHECK(q(i, i) >= 0.0);
+
+  // At x = y = 1 the original objective is 4 + 2 - 1 - 2 = 3.
+  check_roundtrip("max qp", p, {1.0, 1.0});
+  check_roundtrip("max qp b", p, {2.0, 0.5});
 }
 
 // ---------------------------------------------------------------------------
@@ -715,7 +806,7 @@ ENDATA
   CHECK_EQ(cp.num_equality, std::size_t{1});
   CHECK_EQ(cp.num_inequality_rows(), std::size_t{2});
   CHECK_EQ(cp.num_rows(), std::size_t{3});
-  CHECK_EQ(cp.slack_upper.size(), std::size_t{2});
+  CHECK_EQ(cp.num_range, std::size_t{0});
   CHECK(cp.validate());
 }
 
@@ -911,6 +1002,7 @@ int main() {
   test_ranged_rows();
   test_maximize();
   test_quadratic();
+  test_maximize_quadratic_negates_Q();
 
   test_fixed_variable_is_substituted_out();
   test_fixed_variable_in_quadratic();

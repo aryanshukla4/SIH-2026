@@ -67,6 +67,22 @@ ordering permutes rows again downstream, so preserving file order buys nothing.
 
 For LP, `Q = 0`.
 
+### 2.0 Objective sense — negate both `c` and `Q`
+
+The canonical form is a **minimization**. A maximization input is negated,
+recorded as `NegateObjective`, and inverted when the objective is reported.
+
+`Q` must be negated along with `c` and the constant. A legitimate concave
+maximization arrives with `Q` **negative** semidefinite, and
+
+```
+    max  cᵀx + ½xᵀQx      ≡      min  (−c)ᵀx + ½xᵀ(−Q)x
+```
+
+so `−Q` is the PSD matrix §10 assumes. Negating `c` alone leaves the
+factorization facing an indefinite matrix it was promised it would never see,
+surfacing as a wrong-signed pivot with no obvious cause.
+
 ### 2.1 Column transforms — there are none
 
 This is the point of the bounded-variable form. No column is shifted, reflected
@@ -128,16 +144,32 @@ the canonicalizer is not the last stage to touch the model.
 | `ax = b` | equality block, no slack |
 | `ax <= u` | `ax + s = u`, `s >= 0` |
 | `ax >= l` | negate the row, then `-ax + s = -l` |
-| `l <= ax <= u` | `ax + s = u` with `0 <= s <= u-l` |
+| `l <= ax <= u` | equality `ax + t = u` with a bounded column `0 <= t <= u-l` |
 | both bounds infinite | dropped (vacuous) |
 | empty over kept columns | dropped, or `PrimalInfeasible` |
 
 Row negation flips the sign of that row's dual; recovery inverts it (§4).
 
-A **ranged** row produces a slack with a finite upper bound, which needs the
-same two-sided complementarity treatment a boxed column gets — `rsy` in §5
-covers only `s >= 0`. No instance in our corpus has a ranged row, so that path
-is unit-tested but not exercised by the benchmark set.
+A **ranged** row does not produce a two-sided slack. It becomes an equality
+carrying one extra bounded column, so `s` stays strictly one-sided everywhere
+and `rsy` in §5 remains correct as written.
+
+Two alternatives were rejected. Giving `s` a finite upper bound makes it
+two-sided, which costs a second dual, an extra complementarity residual, an
+extra step-length test and an extra term in `mu` — six modules of change against
+one column. Splitting the row into `ax <= u` and `-ax >= -l` is worse: the two
+rows are negatives, so their 2×2 contribution to `AΘAᵀ` is
+
+```
+    [  d  -d ]      d = aᵀΘa > 0        determinant = d² - d² = 0
+    [ -d   d ]
+```
+
+singular, propped up only by the slack diagonal — which vanishes exactly at
+convergence, when a satisfied range makes both sides tight.
+
+No instance in our corpus has a ranged row, so this path is unit-tested but not
+exercised by the benchmark set.
 
 ---
 
