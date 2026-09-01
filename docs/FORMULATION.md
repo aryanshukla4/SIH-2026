@@ -401,13 +401,32 @@ Sherman-Morrison.
 ### 10.2 Augmented / quasi-definite KKT — LP and QP
 
 ```
-    | -(Q + T^-1)      A  | | dx |     | . |
-    |                     | |    |  =  |   |
-    |      A         D_s  | | dy |     | . |
+    | -(Q + T^-1 + delta_p I)          A          | | dx |     | . |
+    |                                             | |    |  =  |   |
+    |          A                (D_s + delta_d I) | | dy |     | . |
 ```
 
-Quasi-definite, so an `LDL` factorization with a fixed (symmetry-based) ordering
-exists. This is the required path for QP and a valid path for LP.
+**Both deltas are mandatory here, and neither is optional decoration.** `T^-1`
+is never inverted on this path, so the §10.1 floor does not apply — `delta_p`
+replaces it.
+
+- `delta_p` — a free column's zero entry of `T^-1` is exact and harmless as a
+  *value*, which is why free columns select this path. But the (1,1) block still
+  has to be definite, and `Q` is only positive *semi*definite: on a free column
+  where `Q` is also zero the block has an entirely zero row.
+- `delta_d` — `D_s` is zero on every **equality** row by construction, since an
+  equality row has no slack. So the (2,2) block is singular across the whole
+  equality block before rank deficiency in `A` is even considered. On an
+  all-equality model it is entirely zero; `gas11` is 459 of 459 equality rows.
+
+Quasi-definiteness is the objective, not a side effect. A quasi-definite matrix
+— negative definite `(1,1)`, positive definite `(2,2)` — admits an `LDLᵀ`
+factorization for **any** symmetric permutation. That is exactly what lets §10.3
+fix an ordering from the sparsity pattern once and reuse it with no numerical
+pivoting. Drop either delta and the matrix is merely symmetric indefinite, and a
+fixed ordering is no longer safe.
+
+This is the required path for QP and a valid path for LP.
 
 **A high free-column share also selects this path.** Here a zero entry of
 `T^-1` is exact and harmless — the zero only causes trouble when `dx` is
@@ -421,6 +440,19 @@ reason in the `ReductionDescriptor`.
   Ordering and symbolic factorization are computed **once** and reused.
 - `cond(AΘAᵀ) ~ 1/μ²` by construction. Primal-dual regularization plus iterative refinement
   is required, not optional, and regularization events must be counted for diagnostics.
+- Regularization **escalates on breakdown and decays on success**:
+  `δ ← min(δ·escalate, δ_max)` after a failed factorization or refinement,
+  `δ ← max(δ/decay, δ_floor)` after a clean solve. A pure ratchet is wrong — once
+  escalated and never lowered, every later iteration solves a system perturbed
+  more than it needs and refinement pays for it in passes. At `δ_max` with a
+  still-failing factorization, return `NUMERICAL_ERROR` rather than escalating
+  further.
+- `MatrixAnalysis` **goes stale**. It is a pure function of the matrix handed to
+  it, and presolve changes `free_columns` directly (free column singleton
+  substitution exists to reduce it), along with `dense_columns` and `empty_rows`.
+  A reduction chosen from the ingestion-time analysis is chosen on numbers that
+  have since changed, so §10 selects from the analysis of the model it will
+  actually factorize — after presolve and scaling.
 
 ---
 
