@@ -135,3 +135,32 @@ output, all cheap presolve wins.
   ships compressed.
 - **Instances beyond ~1.5 M nonzeros.** The `int32` overflow path is tested by
   construction but not on a real instance that large.
+
+---
+
+## Measurement reliability — read before quoting a number
+
+Parse throughput on the development machine (MinGW, Windows) is **not stable
+enough to support a small optimisation claim**. Repeated runs of an identical
+binary over identical input were measured at 24, 41, 56, 82 and 85 MB/s on the
+same 64 MB instance — a 3.5x spread with nothing changed between runs. One
+`spread` reading reached 104%.
+
+`bench/parse_bench.cpp` therefore reports the **spread** alongside the best
+time, rather than a best-of-N alone. A best-of-N presented on its own is what
+turns this noise into a confident false claim: any two builds can be made to
+look 2x apart by rerunning.
+
+Rules that follow from this:
+
+- **Do not quote a throughput improvement smaller than the reported spread.**
+  On this machine that currently rules out anything under roughly 2x.
+- Prefer measurements noise cannot corrupt. For a parser those exist: cache hit
+  rates, allocation counts, bytes per nonzero, symbol-table probe counts. The
+  column-memo in `MpsReader` is justified by a **57.5% measured hit rate over
+  the Netlib corpus**, not by a timing delta.
+- Numbers destined for the submission need a quiet machine, several runs, and
+  the spread quoted with them.
+
+`B/nnz` and `peak RSS` are stable and can be quoted directly — they do not
+depend on timing.
