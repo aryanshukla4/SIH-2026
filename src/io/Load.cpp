@@ -45,8 +45,7 @@ core::Expected<model::Problem> parseProblem(std::string_view content,
     case FileFormat::Lp:
       return parse_lp(content, options);
     case FileFormat::Qplib:
-      return core::make_error(ErrorCode::NotImplemented,
-                              "QPLIB reader is not implemented yet");
+      return parse_qplib(content, options);
   }
   return core::make_error(ErrorCode::NotImplemented, "unrecognized file format");
 }

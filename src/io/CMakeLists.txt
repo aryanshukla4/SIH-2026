@@ -3,6 +3,7 @@ add_library(sovsolve_io STATIC
   MpsReader.cpp
   LpReader.cpp
   MpsWriter.cpp
+  QplibReader.cpp
   detail/MappedFile.cpp)
 
 target_include_directories(sovsolve_io
