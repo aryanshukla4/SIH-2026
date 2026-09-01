@@ -6,8 +6,19 @@
 // inverted -- so `x[j]` is the value of the column named `col_names[j]` in the
 // file that was loaded, and nothing else.
 //
-// Duals follow the sign convention in docs/FORMULATION.md section 4: `w >= 0`
-// is carried explicitly rather than eliminated as `w = -y`.
+// Duals follow the team convention in docs/FORMULATION.md section 4: the
+// inequality-slack dual is eliminated as `w_s = -y_I` and never stored, since
+// it is not independent and a stored copy can drift from `-y_I` under rounding.
+//
+// That convention was checked against HiGHS and already matches what it, CPLEX
+// and Gurobi report, so NO global sign normalization is applied here. For a
+// minimization: `<=` rows get a non-positive dual, `>=` rows a non-negative
+// one, and a variable at its lower bound a non-negative reduced cost.
+//
+// The one sign flip `recover_solution()` performs is local: the canonicalizer
+// negates `>=` rows to fit `A_I x + s = b_I`, and those duals are negated back.
+// That flip is what produces the positive `>=` dual above. A second, global
+// flip on top would invert every inequality dual.
 
 #ifndef SOVSOLVE_MODEL_SOLUTION_HPP
 #define SOVSOLVE_MODEL_SOLUTION_HPP
@@ -29,7 +40,12 @@ struct SolutionQuality {
   Real primal_infeasibility = 0.0;  ///< ||rp||_inf / (1 + ||b||_inf)
   Real dual_infeasibility = 0.0;    ///< ||rd||_inf / (1 + ||c||_inf)
   Real relative_gap = 0.0;          ///< |c'x - b'y| / (1 + |c'x|)
-  Real complementarity = 0.0;       ///< mu = (x'z + s'w) / (n + m)
+  /// mu, averaged over the ACTIVE complementarity pairs only: `(x-l)'z` over
+  /// columns with a finite lower bound, `(u-x)'v` over those with a finite
+  /// upper bound, and `-s'y_I` over the inequality rows. Pairs belonging to an
+  /// infinite bound do not exist and must not be counted, or a model with many
+  /// free columns reports a mu far below the truth.
+  Real complementarity = 0.0;
 
   /// Largest violation of an original bound, after inverting the transform
   /// stack. Recovery through shifts and splits can introduce small violations
@@ -49,10 +65,17 @@ struct Solution {
   RealVector x;  ///< length n, original columns
   RealVector s;  ///< length m, row slacks
 
-  /// Duals. `y` is free in sign; `z` and `w` are non-negative.
-  RealVector y;  ///< length m, row duals
-  RealVector z;  ///< length n, reduced costs / duals for x >= 0
-  RealVector w;  ///< length m, duals for s >= 0
+  /// Duals. `y` is free in sign; `z` and `v` are non-negative.
+  RealVector y;  ///< length m, row duals, in the standard reporting sign
+  RealVector z;  ///< length n, duals for the lower bounds `x >= l`
+  RealVector v;  ///< length n, duals for the upper bounds `x <= u`
+
+  /// Reduced cost of column `j`, the quantity most callers mean by "the dual
+  /// of a variable". Both parts are non-negative and at most one is nonzero at
+  /// a solution, so the difference carries the sign.
+  [[nodiscard]] Real reduced_cost(std::size_t j) const noexcept {
+    return z[j] - v[j];
+  }
 
   SolutionQuality quality;
 

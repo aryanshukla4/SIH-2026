@@ -15,6 +15,7 @@ const char* to_string(ErrorCode code) noexcept {
     case ErrorCode::UndefinedName: return "undefined name";
     case ErrorCode::DimensionMismatch: return "dimension mismatch";
     case ErrorCode::InconsistentBounds: return "inconsistent bounds";
+    case ErrorCode::PrimalInfeasible: return "primal infeasible";
     case ErrorCode::UnsupportedFeature: return "unsupported feature";
     case ErrorCode::IndexOverflow: return "index overflow";
     case ErrorCode::OutOfMemory: return "out of memory";

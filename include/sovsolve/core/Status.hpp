@@ -32,6 +32,12 @@ enum class ErrorCode : std::uint8_t {
   UndefinedName,        ///< reference to a row/column never declared
   DimensionMismatch,
   InconsistentBounds,   ///< lower > upper after all sections applied
+  /// The model is infeasible by inspection -- a verdict, not a malfunction.
+  /// Raised when canonicalization finds a row whose activity is identically
+  /// zero over the remaining columns while its right-hand side excludes zero.
+  /// Reported here rather than handed to the solver, where it would surface as
+  /// an unexplained factorization breakdown instead of an answer.
+  PrimalInfeasible,
   UnsupportedFeature,   ///< e.g. SOS sets — recorded, never silently dropped
   IndexOverflow,        ///< nonzero count exceeds the Index type
   OutOfMemory,
