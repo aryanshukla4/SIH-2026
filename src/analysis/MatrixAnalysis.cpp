@@ -260,4 +260,22 @@ BoundClassification classify_bounds(core::HostSpan<const Real> lower,
   return b;
 }
 
+std::vector<Index> free_column_singletons(const core::SparseMatrixPair<>& matrix,
+                                          core::HostSpan<const Real> lower,
+                                          core::HostSpan<const Real> upper) {
+  std::vector<Index> out;
+  const std::size_t n =
+      std::min(matrix.cols(), std::min(lower.size(), upper.size()));
+  const auto off = matrix.csc.offsets();
+  for (std::size_t j = 0; j < n; ++j) {
+    // Exactly one entry in the column, and no bound on either side.
+    if (off[j + 1] - off[j] != 1) continue;
+    if (core::is_finite_bound(lower[j]) || core::is_finite_bound(upper[j])) {
+      continue;
+    }
+    out.push_back(static_cast<Index>(j));
+  }
+  return out;
+}
+
 }  // namespace sovsolve::analysis

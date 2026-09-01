@@ -374,6 +374,13 @@ instance of a failure that reaches every basic variable near convergence. A
 floor applied only to columns tagged free fixes iteration 0 and leaves
 iteration 35 broken.
 
+Nor does presolve remove the free columns for you. Free column singleton
+substitution — the rule that eliminates a hand-written slack exactly — covers
+only **89 of the corpus's 381 free columns (23%)**, and on `gas11` 89 of 375.
+Roughly 286 genuine free columns still reach the KKT builder there, a third of
+that instance's 862 columns. The floor is the primary mechanism, not a fallback
+for whatever presolve leaves behind.
+
 **`delta_d` is separate and equally mandatory.** `delta_p` bounds `T` from
 above; it cannot help when `A` itself is rank deficient, since then `A T A` is
 singular for every `T`. Empty rows are the clearest instance — the canonicalizer

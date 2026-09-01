@@ -117,9 +117,19 @@ rows/columns, fixed variables, simple redundant rows, bound tightening, obvious 
 Preserve reconstruction information.
 
 **Free column singleton substitution.** A free variable appearing in exactly one row is an
-explicitly-written slack and substitutes out exactly. This is the cheapest way to remove
-free-variable pressure at the source rather than regularizing around it. gas11 has 375 free
-columns and 351 singleton columns, which strongly suggests most of them are this pattern.
+explicitly-written slack and substitutes out exactly: the single row determines its value,
+so both disappear together. Worth doing -- it is cheap and it removes the pressure at the
+source rather than regularizing around it.
+
+MEASURED, and it does not remove most of it. Across the corpus 89 of 381 free columns are
+singletons -- 23%. On gas11, 89 of 375. An earlier draft of this spec inferred from the raw
+counts (375 free, 351 singleton) that most free columns were this pattern; the intersection
+was computed and they are not. The two sets barely overlap: most of gas11's singleton columns
+are bounded, and most of its free columns appear in several rows.
+
+So roughly 286 GENUINE free columns still reach the KKT builder on gas11, a third of its 862
+columns. That makes the Module 9 Theta^-1 floor the primary mechanism rather than a fallback
+for whatever presolve leaves behind, and it is why the floor is unconditional.
 
 **Re-check empty rows after every reduction pass.** This module GENERATES them: fixing a
 variable or eliminating a singleton can leave a row with no entries. Module 2 cleared the
