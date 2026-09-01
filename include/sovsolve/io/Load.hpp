@@ -32,9 +32,15 @@ enum class FileFormat : std::uint8_t {
 
 /// Load a model from disk.
 ///
-/// Handles gzip-compressed input transparently (MIPLIB ships `.mps.gz`).
-/// Decompression uses zlib, a compression library rather than a solver
-/// library, so it is clean under the "from scratch" constraint.
+/// Handles gzip-compressed input transparently **when built with zlib**, which
+/// MIPLIB needs since it ships `.mps.gz`. zlib is a compression library rather
+/// than a solver library, so it is clean under the "from scratch" constraint.
+///
+/// It is OPTIONAL, and the CMake configure step reports which way it went. With
+/// zlib absent -- as on the current development machine -- a `.gz` input
+/// returns `UnsupportedFeature` naming the cause, rather than being mis-parsed
+/// as text. So MIPLIB cannot be loaded on such a build without decompressing
+/// first, and the corpus tests here cover Netlib only.
 ///
 /// The returned `Problem` is the model exactly as written -- no presolve, no
 /// scaling, no canonicalization. See model/Canonical.hpp for the transform to
