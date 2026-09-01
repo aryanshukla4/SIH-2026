@@ -48,3 +48,16 @@ if(Python3_FOUND)
 else()
   message(WARNING "Python3 not found: layering check will not run")
 endif()
+
+# External validation. Everything else here checks the ingestion layer against
+# itself; this checks it against HiGHS (via SciPy) and against Netlib's
+# published optima. Skips cleanly when SciPy or Python is absent -- it is a
+# dev-only oracle and never a build dependency.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_FOUND AND TARGET modeldump)
+  add_test(NAME oracle_check
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/scripts/oracle_check.py
+            $<TARGET_FILE:modeldump>
+            ${CMAKE_CURRENT_SOURCE_DIR}/data/netlib)
+endif()

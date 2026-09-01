@@ -1,0 +1,4 @@
+add_executable(modeldump main.cpp)
+target_link_libraries(modeldump PRIVATE sovsolve_io sovsolve_model)
+sovsolve_set_warnings(modeldump)
+sovsolve_static_runtime(modeldump)

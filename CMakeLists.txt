@@ -47,6 +47,14 @@ add_library(sovsolve INTERFACE)
 target_link_libraries(sovsolve INTERFACE
   sovsolve_core sovsolve_model sovsolve_analysis sovsolve_io)
 
+# Tools come BEFORE tests: the oracle test runs `modeldump`, and a
+# `if(TARGET modeldump)` guard is evaluated at configure time, so a test
+# declared first would silently not be registered at all.
+if(SOVSOLVE_BUILD_TOOLS)
+  add_subdirectory(tools/mpsinfo)
+  add_subdirectory(tools/modeldump)
+endif()
+
 if(SOVSOLVE_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
@@ -54,8 +62,4 @@ endif()
 
 if(SOVSOLVE_BUILD_BENCH)
   add_subdirectory(bench)
-endif()
-
-if(SOVSOLVE_BUILD_TOOLS)
-  add_subdirectory(tools/mpsinfo)
 endif()
