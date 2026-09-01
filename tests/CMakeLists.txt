@@ -29,6 +29,10 @@ sovsolve_add_test(roundtrip_test       corpus/roundtrip_test.cpp)
 target_compile_definitions(roundtrip_test PRIVATE
   SOVSOLVE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 
+sovsolve_add_test(parser_fuzz          fuzz/parser_fuzz.cpp)
+target_compile_definitions(parser_fuzz PRIVATE
+  SOVSOLVE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+
 sovsolve_add_test(canonical_test       property/canonical_test.cpp)
 target_compile_definitions(canonical_test PRIVATE
   SOVSOLVE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
