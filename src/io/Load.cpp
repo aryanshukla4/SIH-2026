@@ -43,8 +43,7 @@ core::Expected<model::Problem> parseProblem(std::string_view content,
     case FileFormat::Auto:
       return parse_mps(content, options);
     case FileFormat::Lp:
-      return core::make_error(ErrorCode::NotImplemented,
-                              "CPLEX LP format reader is not implemented yet");
+      return parse_lp(content, options);
     case FileFormat::Qplib:
       return core::make_error(ErrorCode::NotImplemented,
                               "QPLIB reader is not implemented yet");

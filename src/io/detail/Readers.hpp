@@ -19,6 +19,10 @@ namespace sovsolve::io {
 [[nodiscard]] core::Expected<model::Problem> parse_mps(
     std::string_view content, const model::ReaderOptions& options);
 
+/// CPLEX LP format, accepting Gurobi's superset.
+[[nodiscard]] core::Expected<model::Problem> parse_lp(
+    std::string_view content, const model::ReaderOptions& options);
+
 }  // namespace sovsolve::io
 
 #endif  // SOVSOLVE_IO_DETAIL_READERS_HPP
