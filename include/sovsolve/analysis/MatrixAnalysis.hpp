@@ -109,6 +109,38 @@ struct MatrixAnalysis {
   bool has_invalid_values = false;
 };
 
+/// Classification of a set of bound pairs -- either the column bounds
+/// `l <= x <= u` or the row bounds `l_r <= Ax <= u_r`.
+///
+/// Two of these counts are consumed by modules downstream rather than merely
+/// reported:
+///
+///   * `free_count` feeds the KKT builder's choice of reduction. A free column
+///     contributes neither barrier term, so its entry of `Theta^-1` is exactly
+///     zero. In the augmented system that zero is exact and harmless; it only
+///     causes trouble when `dx` is eliminated to form the normal equations. A
+///     high free share is therefore a reason to take the augmented path,
+///     alongside a non-diagonal `Q`. Netlib gas11 is 375 free of 862 columns.
+///
+///   * `fixed_count` must be ZERO on a canonicalized model. `l == u` makes
+///     `x-l > 0` and `u-x > 0` jointly unsatisfiable, so the interior-point
+///     method cannot take a first step. A nonzero count here is a violation of
+///     the canonicalizer's contract, not a difficult instance.
+struct BoundClassification {
+  std::size_t total = 0;
+  std::size_t free_count = 0;        ///< both bounds infinite
+  std::size_t fixed_count = 0;       ///< both finite and equal
+  std::size_t boxed_count = 0;       ///< both finite, lower < upper
+  std::size_t lower_only_count = 0;  ///< finite lower, infinite upper
+  std::size_t upper_only_count = 0;  ///< infinite lower, finite upper
+  std::size_t inconsistent_count = 0;  ///< lower > upper: infeasible by itself
+};
+
+/// Classify `lower[k] <= . <= upper[k]` for every `k`. The two spans must be
+/// the same length; a shorter pair is classified only over the common prefix.
+[[nodiscard]] BoundClassification classify_bounds(
+    core::HostSpan<const Real> lower, core::HostSpan<const Real> upper) noexcept;
+
 struct AnalysisOptions {
   /// Multiplier k in the `k * sqrt(rows)` dense-column rule.
   double dense_column_factor = 2.0;

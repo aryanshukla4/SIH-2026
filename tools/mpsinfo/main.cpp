@@ -52,19 +52,11 @@ void print_row_shapes(const sovsolve::model::Problem& p) {
 }
 
 void print_col_shapes(const sovsolve::model::Problem& p) {
-  std::size_t boxed = 0, lower_only = 0, upper_only = 0, free_cols = 0, fixed = 0;
-  for (std::size_t j = 0; j < p.num_cols(); ++j) {
-    const bool lo = sovsolve::core::is_finite_bound(p.col_lower[j]);
-    const bool hi = sovsolve::core::is_finite_bound(p.col_upper[j]);
-    if (lo && hi) {
-      if (p.col_lower[j] == p.col_upper[j]) ++fixed;
-      else ++boxed;
-    } else if (lo) ++lower_only;
-    else if (hi) ++upper_only;
-    else ++free_cols;
-  }
+  const auto b = sovsolve::analysis::classify_bounds(p.col_lower.span(),
+                                                     p.col_upper.span());
   std::printf("  boxed %zu   lower-only %zu   upper-only %zu   fixed %zu   free %zu\n",
-              boxed, lower_only, upper_only, fixed, free_cols);
+              b.boxed_count, b.lower_only_count, b.upper_only_count,
+              b.fixed_count, b.free_count);
 }
 
 }  // namespace

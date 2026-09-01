@@ -110,14 +110,16 @@ void check_structure(const fs::path& path, std::size_t& parsed) {
   CHECK_EQ(p.row_names.size(), p.num_rows());
 
   // Every bound pair is orderable and every row bound is too.
-  bool bounds_ok = true;
-  for (std::size_t j = 0; j < p.num_cols(); ++j) {
-    if (p.col_lower[j] > p.col_upper[j]) bounds_ok = false;
-  }
-  for (std::size_t i = 0; i < p.num_rows(); ++i) {
-    if (p.row_lower[i] > p.row_upper[i]) bounds_ok = false;
-  }
-  CHECK(bounds_ok);
+  const auto cb = analysis::classify_bounds(p.col_lower.span(), p.col_upper.span());
+  const auto rb = analysis::classify_bounds(p.row_lower.span(), p.row_upper.span());
+  CHECK_EQ(cb.inconsistent_count, std::size_t{0});
+  CHECK_EQ(rb.inconsistent_count, std::size_t{0});
+
+  // The classification partitions: every column falls in exactly one class.
+  CHECK_EQ(cb.free_count + cb.fixed_count + cb.boxed_count +
+               cb.lower_only_count + cb.upper_only_count,
+           p.num_cols());
+  CHECK_EQ(cb.total, p.num_cols());
 
   // A real objective row was identified, and no NaN or infinity slipped in.
   CHECK(!p.objective_row_name.empty());
@@ -125,10 +127,12 @@ void check_structure(const fs::path& path, std::size_t& parsed) {
   CHECK(!a.has_invalid_values);
   CHECK_EQ(a.nnz, p.nnz());
 
-  std::printf("  %-12s %5zu x %5zu  nnz %7zu  %-4s  disc %4zu  dense-col %zu\n",
+  std::printf("  %-12s %5zu x %5zu  nnz %7zu  %-4s  disc %4zu  dense-col %zu  "
+              "free %4zu  fixed %4zu  empty-row %zu\n",
               path.stem().string().c_str(), p.num_rows(), p.num_cols(), p.nnz(),
               p.has_discrete() ? "MILP" : "LP", p.num_discrete(),
-              a.dense_columns.size());
+              a.dense_columns.size(), cb.free_count, cb.fixed_count,
+              a.empty_rows.size());
 }
 
 void test_reparse_is_deterministic() {
