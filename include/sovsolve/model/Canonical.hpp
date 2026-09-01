@@ -10,36 +10,58 @@
 // ---------------------------------------------------------------------------
 //
 //     minimize    1/2 x'Qx + c'x
-//     subject to  A x = b
-//                 x >= 0
+//     subject to  A_E x       = b_E
+//                 A_I x + s   = b_I,   s >= 0
+//                 l <= x <= u
 //
-// Every row is an equality and every variable is non-negative. The handoff
-// form `Ax + s = b, x >= 0, s >= 0` is exactly this with the slacks appended
-// as columns: `A_canonical = [A_structural | I_slack]` and
-// `x_canonical = [x ; s]`.
+// This is the bounded-variable form the team settled on. Two properties of it
+// matter more than they look:
 //
-// Writing it that way rather than as a separate `s` vector matters, because
-// the handoff form cannot express an equality row -- there is nowhere to put a
-// slack that must be zero. Real models are full of equality rows (516 of the
-// 821 rows in Netlib 25fv47), so a formulation that cannot represent them is
-// not usable. Appending slack columns only to inequality rows handles both
-// kinds uniformly.
+//   * Equality rows carry NO slack. A form that appends `s >= 0` to every row
+//     cannot express an equality, and equalities are the majority of rows in
+//     real instances -- 516 of 821 in 25fv47, all 459 in gas11.
+//
+//   * Finite variable bounds stay NATIVE. Turning each `x <= u` into a
+//     constraint row grows `A*Theta*A'` by one row per boxed column, measured
+//     at +750% on rgn and +648% on gt2. Two complementarity pairs per variable
+//     costs one extra vector instead.
+//
+// `A_E` and `A_I` are contiguous ROW BLOCKS of one matrix, not two matrices:
+// rows [0, num_equality) are `A_E` and the rest are `A_I`. One matrix keeps
+// `A*x` and `A'*y` as single kernel calls, which is what the IPM actually does
+// with them every iteration; the fill-reducing ordering permutes the rows again
+// downstream anyway, so preserving file order buys nothing.
 //
 // ---------------------------------------------------------------------------
-// Column transforms are one affine map
+// The startability contract
 // ---------------------------------------------------------------------------
 //
-// Every variable transform is an instance of `x = d*x' + t` with `d` in
-// {+1, -1}, so the whole objective and matrix update is uniform:
+// The output is either startable by the interior-point method, or a definite
+// infeasibility verdict. Nothing structurally unsolvable reaches the solver.
+// This is a contract rather than an optimization, so it cannot be delegated to
+// the presolver, which callers may switch off.
 //
-//     A_new  = A D                         (scale column j by d_j)
-//     bounds shift by  -A t
-//     Q_new  = D Q D                       (Q_new[i][j] = d_i d_j Q[i][j])
-//     c_new  = D (Q t + c)
-//     offset = 1/2 t'Q t + c't
+// Two conditions, both measured on the Netlib corpus and both common:
 //
-// Free variables are the one case outside this map: they are split into
-// `x = xp - xm` with both parts non-negative.
+//   * No column has `l == u`. The IPM needs `x-l > 0` and `u-x > 0` at once;
+//     their sum is `u-l`, so a fixed column admits no strictly interior point
+//     and the method cannot take a first step. 1067 fixed columns appear across
+//     8 of our 19 instances. They are substituted out here.
+//
+//   * No row of `A` is entirely zero. An all-zero row makes that row and column
+//     of `A*Theta*A'` identically zero for every `Theta` -- an exact zero pivot
+//     no regularization of `Theta` can repair. 80bau3b has 25, greenbea 3.
+//     Consistent ones are dropped; an inconsistent one (`0 = 5`) returns
+//     INFEASIBLE rather than being handed on to fail numerically later.
+//
+// Note that substituting fixed columns out can CREATE an empty row, when a row
+// met the kept columns nowhere. Emptiness is therefore tested after the
+// substitution, not before.
+//
+// Free variables are NOT split into `x = xp - xm`. The split doubles the column
+// count and makes the pair structurally dependent, and interior-point methods
+// converge poorly on it. Free columns stay free; the KKT builder floors their
+// zero entry of `Theta^-1`.
 
 #ifndef SOVSOLVE_MODEL_CANONICAL_HPP
 #define SOVSOLVE_MODEL_CANONICAL_HPP
@@ -59,24 +81,35 @@ namespace sovsolve::model {
 
 /// The solver's working model. See the header comment for the exact form.
 struct CanonicalProblem {
-  RealVector c;                    ///< length num_cols()
-  core::SparseMatrixPair<> A;      ///< num_rows() x num_cols(), all equalities
-  core::SparseMatrixPair<> Q;      ///< empty for LP
-  RealVector b;                    ///< length num_rows()
+  RealVector c;                ///< length num_cols()
+  core::SparseMatrixPair<> A;  ///< num_rows() x num_cols()
+  core::SparseMatrixPair<> Q;  ///< empty for LP
+  RealVector b;                ///< length num_rows()
 
-  /// Column layout: `[structural | slack | bound]`.
+  /// Native variable bounds. Either may be infinite; a free column has both
+  /// infinite. No entry satisfies `col_lower[j] == col_upper[j]` -- fixed
+  /// columns were substituted out.
+  RealVector col_lower;
+  RealVector col_upper;
+
+  /// Upper bounds on the inequality slacks, length num_inequality_rows().
   ///
-  /// - `structural` are the transformed original variables, plus one extra
-  ///   column for each free variable that was split.
-  /// - `slack` are the `s` of `Ax + s = b`, one per inequality row.
-  /// - `bound` are the auxiliary variables `t` introduced by bound rows, one
-  ///   per finite upper bound that had to become a constraint.
-  std::size_t num_structural = 0;
-  std::size_t num_slack = 0;
-  std::size_t num_bound = 0;
+  /// `INF` for an ordinary one-sided row. Finite only for a RANGED row
+  /// `lo <= a'x <= hi`, which becomes `a'x + s = hi` with `0 <= s <= hi-lo`.
+  /// A bounded slack needs the same two-sided complementarity treatment as a
+  /// boxed variable, which the handoff residual `rsy = -s.*y_I - mu` does not
+  /// yet cover. No instance in our corpus has a ranged row, so this path is
+  /// implemented and unit-tested but not exercised by the benchmark set.
+  RealVector slack_upper;
 
-  /// Constant folded out of the objective by the shifts, in canonical
-  /// (minimization) space. Added back during recovery.
+  /// Row layout: equalities first, then inequalities.
+  /// `A_E` is rows `[0, num_equality)`; `A_I` is rows `[num_equality, m)`.
+  /// The slack vector `s` has length `num_inequality_rows()` and its element
+  /// `k` belongs to canonical row `num_equality + k`.
+  std::size_t num_equality = 0;
+
+  /// Constant folded out of the objective by substituting fixed columns, in
+  /// canonical (minimization) space. Added back during recovery.
   Real obj_offset = 0.0;
 
   /// True when the original model was a maximization and `c`/`Q` were negated.
@@ -84,17 +117,26 @@ struct CanonicalProblem {
 
   [[nodiscard]] std::size_t num_rows() const noexcept { return A.rows(); }
   [[nodiscard]] std::size_t num_cols() const noexcept { return A.cols(); }
-
-  /// First index of the slack block, i.e. where `s` begins inside `x`.
-  [[nodiscard]] std::size_t slack_begin() const noexcept { return num_structural; }
-  [[nodiscard]] std::size_t bound_begin() const noexcept {
-    return num_structural + num_slack;
+  [[nodiscard]] std::size_t num_inequality_rows() const noexcept {
+    return num_rows() - num_equality;
   }
 
   /// Objective value of a canonical point, in canonical (minimization) space.
   [[nodiscard]] Real objective(core::HostSpan<const Real> x) const noexcept;
 
   [[nodiscard]] bool validate() const noexcept;
+
+  /// Verify the startability contract: no fixed column, no all-zero row.
+  ///
+  /// This is what Module 6 (Initializer) runs before constructing a
+  /// SolverState. It is O(m + n + nnz) and exists because the canonicalizer is
+  /// not the last stage to touch the model -- presolve reductions create new
+  /// empty rows -- so establishing the contract once is not the same as it
+  /// holding when the IPM finally sees the model.
+  ///
+  /// Returns the offending index in `bad_index` and whether it names a row.
+  [[nodiscard]] bool is_ipm_startable(std::size_t* bad_index = nullptr,
+                                      bool* bad_is_row = nullptr) const noexcept;
 };
 
 /// Result of canonicalizing: the working model plus its inverse map.
@@ -105,18 +147,23 @@ struct CanonicalResult {
 
 /// Canonicalize `problem`. The input is not modified.
 ///
-/// Fails only on a model that is already infeasible by inspection (a bound
-/// pair with lower above upper), which is reported rather than propagated into
-/// a canonical model that cannot be solved.
+/// Fails on a model that is infeasible by inspection: a bound pair with lower
+/// above upper, or an all-zero row whose right-hand side excludes zero. Both
+/// are reported as definite verdicts rather than propagated into a model that
+/// cannot be solved.
 [[nodiscard]] core::Expected<CanonicalResult> canonicalize(
     const Problem& problem, const Options& options = {});
 
 /// Map a canonical-space solution back to the original model.
 ///
-/// Recovers primal values, row duals and reduced costs. Row duals pick up a
-/// sign flip wherever a `>=` row was negated; reduced costs pick up the dual
-/// of any bound row that was introduced for that column, since the bound row
-/// is carrying what was originally a bound multiplier.
+/// Recovers primal values, row duals and both bound duals. Row duals pick up a
+/// sign flip wherever a `>=` row was negated, and are then normalized to the
+/// reporting convention CPLEX, Gurobi and HiGHS use -- a positive dual for a
+/// `<=` row in a minimization. This is the single exit point of the pipeline,
+/// so it is the one place that normalization belongs.
+///
+/// A column substituted out as fixed gets its value back directly and its
+/// reduced cost computed from the recovered duals against the ORIGINAL data.
 [[nodiscard]] core::Expected<Solution> recover_solution(
     const Problem& original, const CanonicalProblem& canonical,
     const TransformStack& transforms, const Solution& canonical_solution);

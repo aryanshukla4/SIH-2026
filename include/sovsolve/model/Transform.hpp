@@ -43,26 +43,31 @@ using core::Real;
 enum class TransformKind : std::uint8_t {
   // -- canonicalization ---------------------------------------------------
   //
-  // Every column transform is an instance of the affine map x = d*x' + t with
-  // d in {+1, -1}. Keeping the two kinds distinct rather than collapsing them
-  // into one record makes the inverse readable at the point of use.
-  NegateObjective,     ///< maximize -> minimize; c and Q negated
-  ShiftVariable,       ///< x >= l  ->  x' = x - l          (d = +1, t = l)
-  NegateVariable,      ///< x <= u, no lower  ->  x' = u - x (d = -1, t = u)
-  SplitFreeVariable,   ///< x free  ->  x = xp - xm, both >= 0
-  AddBoundRow,         ///< x' <= w  ->  x' + t = w, t >= 0
-  NegateRow,           ///< a'x >= b  ->  -a'x <= -b, so a slack can be added
-  AddSlack,            ///< a'x <= b  ->  a'x + s = b, s >= 0
-  BoundedSlack,        ///< l <= a'x <= u  ->  slack with its own bound row
-  DropFreeRow,         ///< N rows after the objective
+  // In the bounded-variable form, variable bounds stay native, so no column is
+  // shifted, reflected or split. The only column operations are "keep" and
+  // "substitute out". Every original column pushes exactly ONE of the two, and
+  // every original row exactly one of MapRow / RemoveEmptyRow / DropFreeRow.
+  //
+  // Records are keyed by the ORIGINAL index in `primary`, never by position in
+  // the stack. Position-keyed recovery breaks the moment one column pushes no
+  // record: every later column then recovers the wrong value.
+  NegateObjective,      ///< maximize -> minimize; c and Q negated
+  KeepColumn,           ///< original column `primary` -> canonical `secondary`
+  RemoveFixedVariable,  ///< l == u; substituted out, `value` = the fixed value
+  MapRow,               ///< original row `primary` -> canonical `secondary`
+  NegateRow,            ///< a'x >= b  ->  -a'x <= -b, so a slack can be added
+  AddSlack,             ///< inequality row; `secondary` = index within s
+  BoundedSlack,         ///< ranged row; `secondary` = index in s, `value` = width
+  RemoveEmptyRow,       ///< all-zero row over the kept columns, RHS consistent
+  DropFreeRow,          ///< row with both bounds infinite; vacuous
 
   // -- presolve (reserved; owned by the presolve module) -------------------
-  RemoveEmptyRow,
   RemoveEmptyColumn,
-  RemoveFixedVariable,
   RemoveSingletonRow,
   RemoveRedundantRow,
   TightenBound,
+  ShiftVariable,   ///< x' = x - t
+  NegateVariable,  ///< x' = t - x
 
   // -- scaling ------------------------------------------------------------
   RowScaling,
