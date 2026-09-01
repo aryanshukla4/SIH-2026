@@ -1,0 +1,320 @@
+# CUDA LP/QP Solver — Final AI Generation Prompts (v3)
+
+**Status: LOCKED (v3, 2026-09-01).** Changes require team agreement.
+
+
+## Changes from v2
+- Common Prompt gains the Theta construction rule, the regularization contract and the
+  canonical-form guarantees, so generated modules cannot reintroduce v2 behaviour.
+- Prompt 1: `.mps` implemented, `.lp` next.
+- Prompt 2: fixed-variable removal, empty-row resolution, no free splitting, ranged rows
+  as an equality plus a bounded column, and a maximization negating c, Q and the constant.
+- Prompt 6: verifies the startability contract before building a SolverState.
+- Prompt 9: unconditional whole-diagonal floor plus dual regularization.
+- Prompt 11: escalation only.
+- Prompt 12: refine against the unregularized residual.
+- Prompt 17: no global dual sign flip — verified the convention already matches HiGHS.
+- Prompt 9: augmented path puts delta_p on the primal block, delta_d on the dual block.
+- Prompt 11: escalation must DECAY back toward the floor.
+- Prompt 17: drops the RANGE column added for a ranged row.
+- Prompt 18: explicit NaN guard; owns stall detection and returns the best iterate.
+
+## Common Prompt
+Implement one independent C++ module of a modular CUDA LP/QP interior-point solver.
+
+Scope: LP + convex QP (Q PSD). Deferred: MILP branch-and-bound, simplex, crossover. Preserve
+future integrality data.
+
+Use only: Scalar, Vector, Matrix, Problem, SolverState, Diagnostics, MatrixAnalysis,
+TransformRecord, ReductionDescriptor. Do not invent separate
+DenseMatrix/CSRMatrix/CSCMatrix/CPUVector/GPUVector public types. Element precision and index
+type are TEMPLATE PARAMETERS, never runtime fields — a runtime precision tag puts a branch in
+the innermost loop of the solver.
+
+Problem stores `A,Q,c,row_lower,row_upper,col_lower,col_upper,objective_sense,
+objective_constant,integrality_flags`. Working IPM form:
+```text
+A_E x = b_E
+A_I x + s = b_I, s>=0
+l <= x <= u
+```
+Equality rows have no slack. Finite variable bounds remain native; never create a row for
+every upper bound.
+
+**Guarantees the Canonicalizer has already established.** Any module downstream of Module 2
+may rely on these and must not re-check them defensively:
+- no column has l_j == u_j (fixed variables are substituted out)
+- no row of A is entirely zero (empty rows are dropped, or the model was declared INFEASIBLE)
+- free variables are NOT split into xp - xm; they remain single free columns
+
+Dual convention:
+```text
+y = row duals; unrestricted on equality rows
+z >= 0 = lower-bound dual
+v >= 0 = upper-bound dual
+w_s = -y_I for the inequality-row slack dual — NOT stored as a vector
+slack_dual(y) = -y     helper, so sign tests read positively
+```
+
+Residuals:
+```text
+rp_E=A_E*x-b_E
+rp_I=A_I*x+s-b_I
+rd=Q*x+c-A^T*y-z+v
+rxz=(x-l).*z-mu*1
+ruv=(u-x).*v-mu*1
+rsy=-s.*y_I-mu*1
+```
+Newton equations:
+```text
+Q dx-A^T dy-dz+dv=-rd
+A_E dx=-rp_E
+A_I dx+ds=-rp_I
+Z dx+X_L dz=-rxz
+-V dx+(U-X) dv=-ruv
+-Y_I ds-S dy_I=-rsy
+```
+
+**Theta construction rule — applies wherever Theta appears.** Build Theta^-1 and floor it.
+Never divide by a diagonal entry that can be zero:
+```text
+Theta^-1 = X_L^-1 Z + (U-X)^-1 V         omit a term where that bound is infinite
+Theta^-1 <- max(Theta^-1, delta_p)       WHOLE diagonal, unconditional, every iteration
+Theta    <- (Theta^-1)^-1
+```
+A free variable contributes neither term, so its entry is exactly zero at iteration 0. Any
+variable that ends strictly between its bounds at the optimum also drives its entry to zero,
+because z_j -> 0 and v_j -> 0 there. The floor therefore applies to the whole diagonal, not
+only to columns tagged free. `1.0/0.0` is `inf` in IEEE754 — no exception, no crash — and
+`0*inf` is NaN, which then compares false against every convergence threshold, so the solve
+fails silently and reports MAX_ITERATIONS on a solvable problem.
+
+Use iterative loops, FP64 initially, explicit CPU/GPU memory and minimal transfers. CUDA
+libraries are numerical primitives, not the optimization algorithm.
+
+## Prompt 1 — Input / Problem Loader
+Implement `Problem loadProblem(const std::string& filepath);`. `.mps` is IMPLEMENTED and
+verified on 19 Netlib instances. Implement `.lp` next: CPLEX dialect as the base, accepting
+Gurobi's superset. Then a model writer, then QPLIB. Parse objective, sense, constant,
+row/column bounds, names and integrality flags. Do not canonicalize, presolve, scale or
+solve. Return parse/validation errors with line and column.
+
+## Prompt 2 — Canonicalizer
+Input Problem; output canonical Problem + TransformRecord. Preserve equality rows without
+slacks, add slacks only to inequality rows, preserve finite variable bounds, never convert
+upper bounds into rows. All transformations reversible.
+
+The contract is that the output is startable by the IPM, or a definite infeasibility verdict.
+This must NOT depend on the Presolver, which can be switched off. Therefore:
+
+1. Remove fixed variables (l_j == u_j). The IPM needs x-l > 0 AND u-x > 0; their sum is
+   u-l = 0, so with l = u no strictly interior point exists. Substitute:
+   `b_E -= A_E[:,j]*l_j`, `b_I -= A_I[:,j]*l_j`, `c += Q[:,j]*l_j`,
+   `objective_constant += c_j*l_j + 1/2*Q_jj*l_j^2`, delete column j. Record
+   RemoveFixedVariable(j, l_j).
+2. Resolve empty rows. `0 = 0` -> drop, record RemoveEmptyRow. `0 = b, b != 0` -> return
+   INFEASIBLE. Do not pass either to the IPM: an all-zero row makes that row and column of
+   A*Theta*A^T identically zero for every Theta, an exact zero pivot.
+3. Do NOT split free variables into xp - xm. It doubles columns, makes the pair structurally
+   dependent, and converges poorly in IPMs.
+
+4. Ranged rows (`lo <= a'x <= hi`, both finite and different) become an EQUALITY
+   plus one bounded column: `a'x + t = hi` with `0 <= t <= hi - lo`. Do NOT give
+   the slack `s` a finite upper bound -- that makes `s` two-sided and forces a
+   second dual, an extra residual, an extra step-length test and an extra mu term
+   across Prompts 6, 7, 8, 9, 14 and 16. Do NOT split the row into two one-sided
+   rows: they are negatives, so their 2x2 block in `A*Theta*A^T` is singular,
+   propped up only by a slack diagonal that vanishes at convergence. `s` stays
+   strictly one-sided, so `rsy = -s.*y_I - mu*1` stays correct as written.
+5. A maximization input is negated to a minimization: negate `c`, `Q` AND the
+   objective constant, and record `NegateObjective`. Negating `Q` is required,
+   not cosmetic -- a concave maximization has Q negative semidefinite, and only
+   `-Q` satisfies the scope's "Q symmetric positive semidefinite".
+
+## Prompt 3 — Matrix Analyzer
+Analyze Matrix and return MatrixAnalysis with dimensions, nnz, density, symmetry, dense
+columns, free/fixed column counts, empty and singleton rows/columns, value dynamic range,
+format and memory information. Support Dense/CSR/CSC. Do not impose one universal density
+threshold. free_columns feeds the Prompt 9 reduction choice.
+
+## Prompt 4 — Presolver
+Implement safe reversible reductions: empty rows/columns, fixed variables, simple redundant
+rows, bound tightening and obvious infeasibility. Include free column singleton substitution:
+a free variable in exactly one row is an explicitly-written slack and substitutes out exactly,
+removing free-variable pressure at the source. Return Problem + TransformRecord and preserve
+reconstruction data. This module reduces work; it is not what makes the model solvable.
+
+## Prompt 5 — Scaler
+Scale A,Q,c,row bounds and column bounds consistently. Record inverse scaling in
+TransformRecord. Preserve original interpretation/objective. Runs BEFORE regularization
+parameters are chosen — delta_p and delta_d are relative to scaled magnitudes.
+
+## Prompt 6 — Initializer
+Create SolverState containing x,s,y,z,v and affine/corrector directions, separate primal/dual
+alphas, mu, mu_aff and sigma. Maintain strict interiority for all active pairs; equality-row y
+is unrestricted.
+
+VERIFY the startability contract first, with an O(m+n) scan, before constructing the state:
+```text
+no column with col_lower[j] == col_upper[j]   -> else NUMERICAL_FAILURE, naming column j
+no row of A entirely zero                     -> else NUMERICAL_FAILURE, naming row i
+```
+Prompt 2 establishes the contract and Prompt 4 re-establishes it, but the Presolver CREATES
+new empty rows — fixing a variable or eliminating a singleton can leave a row with no entries
+— so a check made only at canonicalization time is in the wrong place. This module is the
+right owner because it is the one that cannot do its job when the contract is broken: placing
+a point strictly inside every bound is impossible for a fixed column. Fail here naming the
+offending index, not later as an unexplained factorization breakdown.
+
+## Prompt 7 — Residual Calculator
+Compute exactly the six residuals defined in the Common Prompt using vector operations. Omit
+complementarity pairs for infinite bounds. Return residual vectors and infinity norms.
+
+## Prompt 8 — Predictor-Corrector Controller
+Implement Mehrotra: affine system/solve, affine primal/dual steps, mu_aff,
+`sigma=clamp((mu_aff/mu)^3,0,1)`, corrector RHS with lower/upper/slack cross terms, corrector
+solve, final directions and separate primal/dual step lengths. Reuse symbolic/numerical
+structure where valid.
+
+## Prompt 9 — KKT / Newton System Builder
+Build from the bounded-variable Newton equations. Return Matrix + rhs + ReductionDescriptor.
+Never hardcode dy universally.
+
+Apply the Theta construction rule from the Common Prompt: build Theta^-1, floor the WHOLE
+diagonal at delta_p unconditionally on every iteration, then invert.
+
+Add dual regularization to the reduced system:
+```text
+(A Theta A^T + D_s + delta_d I) dy = rhs
+```
+delta_d is not optional and is not interchangeable with delta_p: delta_p bounds Theta from
+above, but cannot help when A itself is rank deficient, since then A*Theta*A^T is singular
+for every Theta.
+
+In the AUGMENTED path Theta^-1 is never inverted, so the floor does not apply there. Both
+deltas move into the blocks instead, and both are still mandatory:
+```text
+[ -(Q + Theta^-1 + delta_p I)          A^T           ]
+[            A                 (D_s + delta_d I)     ]
+```
+delta_p because Q is only positive SEMIdefinite, so a free column where Q is zero leaves the
+(1,1) block with a zero row. delta_d because D_s is zero on every EQUALITY row by
+construction, so the (2,2) block is singular across the equality block regardless of A's
+rank. Together they make the matrix quasi-definite, which is what guarantees an LDL^T
+factorization for ANY symmetric permutation -- the property Prompt 10 relies on to fix an
+ordering once and reuse it without numerical pivoting.
+
+For LP Q=0, eliminate diagonal complementarity variables and form the SPD dy Schur/
+normal-equations system. For general non-diagonal QP, use an augmented/quasi-definite
+symmetric KKT system for LDL^T; do not force dy reduction. A diagonal or cheaply invertible Q
+may use dy reduction when advantageous.
+
+A high free-column share also selects the augmented path: there a zero entry of Theta^-1 is
+exact and harmless, since the zero only causes trouble when dx is eliminated. Record the
+reason in the ReductionDescriptor.
+
+## Prompt 10 — Ordering / Symbolic Factorization
+Own fill-reducing ordering and symbolic analysis for the reference path. Reuse unchanged
+sparsity structure. If a sparse backend already owns analysis/reordering, provide a path that
+avoids duplicate work.
+
+## Prompt 11 — Regularization
+Implement ESCALATION only: numerical breakdown detection, raising delta_p/delta_d above the
+Prompt 9 floor when breakdown occurs, event counting, iterative-refinement hooks, metadata.
+
+Escalation must DECAY, not ratchet:
+```text
+on breakdown:     delta <- min(delta * escalation_factor, delta_max)  then refactor
+on a clean solve: delta <- max(delta / decay_factor, delta_floor)
+```
+Once escalated and never lowered, every later iteration solves a system perturbed more than
+it needs and refinement pays in extra passes. At delta_max with a still-failing
+factorization, return NUMERICAL_FAILURE rather than escalating further.
+
+Do NOT implement the Prompt 9 floor here. That floor covers a structural condition present
+before iteration 0, which detection cannot see — a free variable yields inf/NaN before any
+condition estimate exists, and NaN trips no threshold.
+
+Parameters are scale-aware: computed relative to scaled data magnitudes, with configurable
+floors in Options. The matrix dynamic range reaches 2.6e11 on gas11 before scaling.
+
+## Prompt 12 — Linear Solver
+Input Matrix + rhs + ReductionDescriptor + symbolic info. LP -> SPD/Cholesky-type path.
+General QP -> symmetric-indefinite LDL^T. Provide CPU reference, GPU implementation, residual
+verification, failure detection and iterative refinement. Use cuBLAS/cuSPARSE/cuSOLVER/cuDSS
+where appropriate.
+
+Refine against the UNREGULARIZED residual. The regularized system is a nearby problem, not
+the intended one; refining against the regularized residual converges accurately to the wrong
+system. Report the pass count.
+
+## Prompt 13 — Newton Direction Recovery
+Use ReductionDescriptor. LP dy path: recover dy then dx,ds,dz,dv. Augmented QP: recover/use
+complete directions. Never assume dy is always the solved variable. Verify all Newton
+equations.
+
+## Prompt 14 — Step-Length Calculator
+Return separate alpha_primal/alpha_dual. Enforce variable lower/upper bounds, positive s, z,
+v, and `slack_dual(y_I + ad*dy_I) > 0`; equality-row y is unrestricted. Use the slack_dual
+helper rather than an inline negation — a `-y > 0` test is easy to write backwards. Use a
+safety factor and handle infinite bounds.
+
+## Prompt 15 — State Updater
+Update x,s with alpha_primal and y,z,v with alpha_dual. Preserve affine/corrector fields for
+Diagnostics.
+
+## Prompt 16 — Mu / Barrier Controller
+Compute mu as the average over all active complementarity pairs: lower-bound, upper-bound and
+inequality-slack pairs. Compute mu_aff using affine steps and then
+`sigma=clamp((mu_aff/mu)^3,0,1)`. Handle infinite bounds.
+
+## Prompt 17 — Solution Reconstructor
+Reverse scaling, presolve and canonicalization using TransformRecord. Three canonicalization
+records to undo: RemoveFixedVariable (reinstate x_j = l_j and derive its reduced cost from
+the recovered duals), RemoveEmptyRow (zero dual), and BoundedSlack -- whose RANGE column is
+DROPPED, since it is not an original variable. Recompute that row's reported slack from the
+original activity rather than reading the dropped column. Return original variables,
+objective and feasibility information.
+
+Do NOT apply a global dual sign normalization. Verified against HiGHS: for a minimization it
+reports a NEGATIVE dual for a `<=` row, a POSITIVE dual for a `>=` row, and a positive reduced
+cost for a variable at its lower bound — which is already this solver's convention.
+
+The only sign work is local: NegateRow records mark the `>=` rows the Canonicalizer negated,
+and those duals are flipped back here. That flip is what produces the positive `>=` dual. A
+second, global flip on top would invert every inequality dual.
+
+## Prompt 18 — Convergence Checker
+After `stall_iterations` consecutive iterations without meaningful progress, terminate and
+return the BEST ITERATE seen with status MAX_ITERATIONS or NOT_CONVERGED -- never
+INFEASIBLE. That is the consumer of `stall_iterations`, and it is what "do not infer
+infeasibility from stagnation" leaves room for.
+
+Use relative, scale-aware infinity-norm criteria for primal feasibility, dual feasibility and
+complementarity/duality gap. Check iteration limit and numerical failure. Do not infer
+infeasibility from stagnation — INFEASIBLE comes only from a definite verdict.
+
+Guard every comparison against NaN explicitly. `NaN < tol` is false, so a poisoned solve runs
+silently to the iteration limit and reports MAX_ITERATIONS on a solvable problem. Test for
+non-finite residuals and report NUMERICAL_FAILURE instead.
+
+## Prompt 19 — Diagnostics
+Record all residual norms, three complementarity measures, aggregate mu, mu_aff, sigma, both
+step lengths, symbolic/factorization/solve/refinement/GPU-transfer times, regularization
+events, theta floor activations, refinement passes and status. Support CSV/JSON export for
+benchmark runs.
+
+## Prompt 20 — Logging
+Create concise human-readable iteration logs. Keep logging separate from Diagnostics.
+
+## Prompt 21 — Options / Parameters
+Centralize tolerances, iteration limit, delta_p_floor, delta_d_floor,
+regularization_escalation_factor, max_refinement_steps, safety factor, ordering, linear
+solver, presolve, scaling and GPU settings.
+
+## Generation Rule
+Before implementing a module: read the frozen types; define the interface; define ownership
+and CPU/GPU behavior; define errors/status; implement only that module; add focused tests; do
+not change mathematical conventions or other module interfaces; do not introduce duplicate
+public numerical types; do not add runtime precision fields; do not re-check the
+Canonicalizer's guarantees defensively; verify bounded-variable equations before optimization.

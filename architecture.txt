@@ -1,0 +1,468 @@
+# CUDA LP/QP Optimization Solver — Final Architecture (v3)
+
+**Status: LOCKED (v3, 2026-09-01).** Changes require team agreement.
+
+
+## Changes from v2
+1. Regularization policy rewritten and given an owner. v2 handled free variables "through
+   the solver's regularization policy"; that policy lives in Module 11, which is reactive
+   (it detects breakdown). A free variable produces inf/NaN before any condition estimate
+   exists, and NaN compares false against every threshold, so nothing ever detects it. The
+   floor is now applied unconditionally by Module 9 at construction time.
+2. The floor applies to the WHOLE Theta diagonal, not only free columns.
+3. Dual regularization added. Theta cannot repair a rank-deficient A.
+4. Empty rows resolved by the Canonicalizer, with an infeasibility verdict.
+5. Fixed variables (l == u) removed by the Canonicalizer, and the contract VERIFIED at
+   Module 6 — the Presolver creates new empty rows, so one check at canonicalization is not
+   enough.
+6. Free-variable splitting explicitly prohibited.
+7. Input section updated: .mps is implemented and working; .lp is next.
+8. Dual reporting sign VERIFIED against HiGHS — the convention already matches, so no
+   normalization is applied.
+9. Ranged rows: an equality plus a bounded column, so the slack stays one-sided.
+
+11. Augmented QP path: delta_p on the primal block, delta_d on the dual block. Both
+    mandatory; D_s is zero on every equality row, so the (2,2) block is singular without
+    delta_d regardless of A's rank.
+12. Regularization escalates on breakdown and DECAYS on success; a ratchet is wrong.
+13. MatrixAnalysis goes stale after presolve and must be re-run before Module 9 chooses.
+
+## Scope
+- LP
+- Convex QP (Q symmetric positive semidefinite)
+- Primal-dual interior-point method with Mehrotra predictor-corrector
+- Dense and sparse numerical paths
+- CPU reference and CUDA acceleration
+
+Deferred: MILP branch-and-bound, simplex and crossover. Preserve integrality data for
+future MILP.
+
+## Core rule
+Simple shared types -> independent modules -> one iterative IPM loop.
+
+Shared types:
+Scalar, Vector, Matrix, Problem, SolverState, Diagnostics, MatrixAnalysis,
+TransformRecord, ReductionDescriptor.
+
+## Input
+File Parser -> faithful Problem. `loadProblem(filepath)` accepts the file path directly.
+Parsing is separate from canonicalization, presolve, scaling and solving.
+
+Format status and order:
+- `.mps` — IMPLEMENTED. Verified on 19 Netlib instances; 9 match published dimensions
+  exactly. Fixed and free format, RANGES, BOUNDS, MARKER INTORG/INTEND, negated objective
+  constant, QUADOBJ/QMATRIX. This is what every benchmark named in the problem statement
+  ships as: Netlib, MIPLIB 2017 (.mps.gz) and Mittelmann.
+- `.lp` — NEXT. CPLEX dialect as the base, accepting Gurobi's superset. Human-readable,
+  which matters for demonstration; it carries no benchmark corpus of its own.
+- model writer — after LP. Enables round-trip testing, and lets one module owner hand
+  another a dumped canonical/presolved model instead of running the whole upstream pipeline.
+- QPLIB — after the writer. Named in the problem statement; has its own format.
+
+Problem stores objective sense/constant, A/Q, row lower/upper bounds, column lower/upper
+bounds, names where needed, and future integrality flags. Prefer row_lower/row_upper so
+equality, inequality and ranged rows are represented naturally.
+
+## Canonicalization decision
+Use a bounded-variable working form:
+
+min 1/2 x^T Q x + c^T x
+s.t. A_E x = b_E
+     A_I x + s = b_I, s >= 0
+     l <= x <= u
+
+Equality rows get NO slack. Finite variable bounds remain native bounds. Do NOT turn x <= u
+into extra constraint rows. All transformations are reversible through TransformRecord.
+
+### The Canonicalizer's contract
+Its output is either startable by the interior-point method, or a definite infeasibility
+verdict. Nothing that reaches the IPM may be unsolvable for a structural reason. This is a
+contract, not an optimization: it must not depend on the Presolver, which can be switched
+off.
+
+Three duties follow.
+
+**Fixed variables (l_j == u_j) are removed.** The IPM requires x-l > 0 AND u-x > 0
+simultaneously. Their sum is u-l = 0, so with l = u both cannot be positive: no strictly
+interior point exists and the method cannot take a first step. A fixed variable is a
+constant, not a variable, and is substituted out:
+
+```text
+b_E := b_E - A_E[:,j] * l_j
+b_I := b_I - A_I[:,j] * l_j
+c   := c   + Q[:,j] * l_j             (for the remaining columns)
+objective_constant += c_j*l_j + 1/2 * Q_jj * l_j^2
+column j deleted
+```
+
+recorded as RemoveFixedVariable(j, l_j); inverted by reinstating x_j = l_j and computing its
+reduced cost from the recovered duals. This is common, not a corner case: 1067 fixed columns
+appear across 8 of the 19 corpus instances (498 in 80bau3b, 250 in shell, 103 in greenbea).
+
+**Empty rows are resolved, not passed on.** An all-zero row of A makes the corresponding row
+and column of A*Theta*A^T identically zero regardless of Theta — an exact zero pivot. Two
+cases:
+
+```text
+0 = 0   (within tolerance)  -> drop the row, record RemoveEmptyRow
+0 = b,  b != 0              -> return INFEASIBLE
+```
+
+The second case must not be regularized away. Regularization would turn a provable
+infeasibility into NUMERICAL_FAILURE, which is a defeat rather than an answer. 80bau3b has
+25 empty rows and greenbea has 3.
+
+**Free variables stay free.** Splitting x = xp - xm is PROHIBITED. It doubles the column
+count, makes the two columns structurally dependent, and is well documented to converge
+poorly in interior-point methods. Free variables are handled by the regularization policy
+below and, where possible, removed earlier by the Presolver.
+
+### The contract is checked, not assumed -- MEASURED
+The Canonicalizer establishes the contract, but it is not the last module to touch the model.
+Any stage that removes a column can CREATE an empty row, by taking away the last entry some
+row had. A check performed only at canonicalization time is therefore in the wrong place -- a
+fresh empty row can still reach the IPM.
+
+This is measured, not hypothetical. Substituting out fixed columns creates empty rows in our
+own corpus, one stage before the Presolver even runs:
+
+```text
+instance    empty rows BEFORE    rows dropped AFTER    created by substitution
+gas11               0                    2                      2
+80bau3b            25                   27                      2
+standata            0                    1                      1
+greenbea            3                    3                      0
+25fv47              1                    1                      0
+```
+
+Three of those instances had NO empty row to begin with. A canonicalizer that tested for
+emptiness BEFORE substituting rather than after would have passed a structurally singular
+model on and reported success.
+
+So the responsibility is split:
+- Canonicalizer removes fixed variables and empty rows, so the contract holds even with
+  presolve switched off.
+- Presolver removes them again, because it generates new ones.
+- Initializer (Module 6) VERIFIES the contract before constructing a SolverState, and fails
+  with a specific status if it is violated.
+
+Module 6 is the right owner of the check because it is the module that cannot do its job when
+the contract is broken: it is asked to place a point strictly inside every bound, which is
+impossible for a fixed column. An O(m+n) scan makes the guarantee real rather than
+aspirational, and it catches a contract violation introduced by ANY upstream module, not only
+the two anticipated here.
+
+## Dual convention
+### Ranged rows -- an equality plus a bounded column
+A row with two finite, different bounds, `lo <= a'x <= hi`, is NOT expressible in
+`A_I x + s = b_I, s >= 0`: that form is one-sided. It becomes an EQUALITY carrying
+one extra bounded column:
+
+```text
+a'x + t = hi,      0 <= t <= hi - lo
+```
+
+which is exactly `lo <= a'x <= hi`, since `t = hi - a'x`.
+
+Two other treatments exist and both are worse.
+
+**Bounded slack** -- keep the row an inequality and give `s` a finite upper bound.
+This forces `s` to become two-sided like `x`: a second dual, an extra
+complementarity residual, an extra step-length test and an extra term in `mu`.
+That touches Modules 6, 7, 8, 9, 14 and 16. A bounded COLUMN needs none of it,
+because `l <= x <= u` is already the form every variable is in. One column
+against six modules.
+
+**Row splitting** -- replace the row with `a'x <= hi` and `-a'x <= -lo`. The two
+rows are negatives of each other, so their 2x2 contribution to `A*Theta*A^T` is
+
+```text
+[  d  -d ]        d = a^T Theta a > 0        determinant = d^2 - d^2 = 0
+[ -d   d ]
+```
+
+singular. It stays invertible only through the slack diagonal, which vanishes
+exactly at convergence, when a satisfied range makes both sides tight. That is
+self-inflicted ill-conditioning on the axis the problem statement asks us to
+demonstrate robustness along. It also grows `m`, which the "reduced system stays
+m x m" framing does not account for.
+
+So: ranged row -> equality + bounded column. The slack vector `s` stays strictly
+one-sided everywhere, and `rsy = -s.*y_I - mu*1` remains correct as written.
+
+No instance in our 19-instance corpus has a ranged row, so this path is
+unit-tested but not exercised by the benchmark set.
+
+### Objective sense -- negate BOTH c and Q
+The canonical form is fixed as a MINIMIZATION. A maximization input is converted
+by negating the objective, recorded as `NegateObjective` and inverted when the
+Solution Reconstructor reports the objective in the original sense.
+
+Negating `c` alone is not enough: `Q` must be negated too. A legitimate concave
+maximization arrives with `Q` NEGATIVE semidefinite, and
+
+```text
+max  c'x + 1/2 x'Qx        ==        min  (-c)'x + 1/2 x'(-Q)x
+```
+
+so `-Q` is the PSD matrix the solver's stated scope promises. Negate `c` and skip
+`Q` and the scope constraint "Q symmetric positive semidefinite" silently fails
+to hold for a valid input, and the factorization meets an indefinite matrix it
+was told it would never see -- surfacing as a wrong-signed pivot with no obvious
+cause. The objective constant is negated with them.
+
+## Dual convention
+`y` = row duals; unrestricted on equality rows and sign-restricted on inequality rows.
+`z >= 0` = lower-bound duals.
+`v >= 0` = upper-bound duals.
+For inequality-row slacks, `w_s = -y_I`, so `-y_I > 0`. No separate slack-dual vector is
+stored: w_s is not independent, and storing it duplicates state that can drift from -y_I
+under rounding. Where a sign test would otherwise read backwards, use a helper rather than
+a second vector:
+
+```text
+slack_dual(y_I) = -y_I           // so step-length and interiority tests read positively
+```
+
+**Reporting sign — VERIFIED, and no normalization is needed.** This convention already agrees
+with what HiGHS, CPLEX and Gurobi report. Measured against HiGHS for a minimization:
+
+```text
+<= row                        -> dual <= 0      matches y_I < 0 here
+>= row                        -> dual >= 0
+== row                        -> free sign
+variable at its lower bound   -> reduced cost >= 0   matches z >= 0 here
+```
+
+So do NOT apply a global sign flip at the exit point. The only flip required is local: the
+Canonicalizer negates a `>=` row to fit the `A_I x + s = b_I` form, so that row's dual is
+negated back during reconstruction — which is what produces the positive dual HiGHS reports
+for a `>=` row.
+
+Do NOT add a global normalization on top of that flip. Applying one would invert every
+inequality dual, and the error is silent -- the duals stay plausible, they are simply all
+backwards against any reference solver.
+
+Complementarity:
+```text
+(x-l).*z = mu*1
+(u-x).*v = mu*1
+-s.*y_I  = mu*1
+```
+Omit pairs for infinite bounds.
+
+## Residuals
+```text
+rp_E = A_E*x - b_E
+rp_I = A_I*x + s - b_I
+rd   = Q*x + c - A^T*y - z + v
+rxz  = (x-l).*z - mu*1
+ruv  = (u-x).*v - mu*1
+rsy  = -s.*y_I - mu*1
+```
+
+## Newton system
+```text
+Q dx - A^T dy - dz + dv = -rd
+A_E dx = -rp_E
+A_I dx + ds = -rp_I
+Z dx + X_L dz = -rxz
+-V dx + (U-X) dv = -ruv
+-Y_I ds - S dy_I = -rsy
+```
+where `X_L=diag(x-l)` and `U-X=diag(u-x)`.
+
+## LP path
+For Q=0, eliminate diagonal complementarity variables and form the SPD Schur/normal-equations
+system in dy. The reduced system remains m x m because variable bounds are not rows.
+
+Build Theta^-1. NEVER build Theta by inverting a diagonal that can contain zero:
+
+```text
+Theta^-1 = X_L^-1 Z + (U-X)^-1 V          term omitted where the bound is infinite
+Theta^-1 <- max(Theta^-1, delta_p)        elementwise floor, unconditional, every iteration
+Theta    <- (Theta^-1)^-1                 now always finite
+```
+
+then form and factor
+
+```text
+(A Theta A^T + D_s + delta_d I) dy = rhs
+```
+
+with D_s the diagonal slack contribution on inequality rows. Use a Cholesky-type
+factorization.
+
+## Regularization policy
+
+This section is normative. It is not "regularization if needed": both floors are applied on
+every iteration, whether or not anything has been detected.
+
+### Why the floor is not only about free variables
+A free variable has neither bound, so it contributes neither term and its Theta^-1 entry is
+exactly zero at iteration 0. That is the visible case. The same entry goes to zero for any
+variable that ends up strictly between its bounds at the optimum, because complementarity
+drives z_j -> 0 and v_j -> 0 there while (x-l) and (u-x) stay bounded away from zero:
+
+```text
+at a bound at the optimum:            Theta^-1 -> large,  Theta -> ~mu
+strictly inside at the optimum:       Theta^-1 -> ~mu,    Theta -> large
+```
+
+At mu = 1e-10 the two groups differ by roughly 1e20 — the cond(A*Theta*A^T) ~ 1/mu^2 growth
+already stated in this document, made concrete. Double precision resolves about 1e16.
+
+Free variables are therefore not a special case; they are the first instance of a failure
+that reaches every basic variable near convergence. A floor applied only to columns tagged
+free fixes iteration 0 and leaves iteration 35 broken. Apply it to the whole diagonal.
+
+### Why delta_p alone is not sufficient
+delta_p bounds Theta from above. It cannot help when A itself is rank deficient, because
+then A*Theta*A^T is singular for every Theta. Empty rows are the clearest instance and are
+present in the corpus. delta_d bounds the reduced system from below and is equally
+mandatory. Together they are standard primal-dual regularization.
+
+### Scale awareness
+delta_p and delta_d are set relative to the magnitudes of the SCALED data, after the Scaler
+has run, and have configurable floors in Options. An absolute constant is meaningless: the
+matrix dynamic range reaches 2.6e11 on gas11 before scaling.
+
+### Refinement is part of the policy, not an extra
+Regularization perturbs the Newton direction: the regularized system is a nearby problem,
+not the intended one. Every regularized solve is followed by iterative refinement against
+the UNREGULARIZED residual (Module 12). Without it the method converges accurately to the
+wrong system.
+
+### Regularization in the augmented / quasi-definite path
+
+The LP path floors `Theta^-1` because it INVERTS it. The augmented path never
+inverts it, so the floor is not what protects this path -- but it is not
+unprotected either. Both deltas appear, in different blocks:
+
+```text
+[ -(Q + Theta^-1 + delta_p I)          A^T           ] [dx]     [ . ]
+[            A                 (D_s + delta_d I)     ] [dy]  =  [ . ]
+```
+
+Both are mandatory here, for reasons that are structural rather than numerical.
+
+**delta_p.** A zero entry of `Theta^-1` -- a free column -- is exact and harmless
+as a VALUE, which is why the free-column case selects this path at all. But the
+(1,1) block still has to be definite. `Q` is only positive SEMIdefinite, so on a
+free column where `Q` is also zero the block has an entirely zero row. delta_p is
+what makes it definite. It replaces the floor; it is not additional to it.
+
+**delta_d.** `D_s` is zero on every EQUALITY row by construction -- an equality
+row has no slack. So the (2,2) block is singular across the whole equality block
+before rank deficiency in `A` is even considered. On an all-equality model the
+(2,2) block is entirely zero. gas11 is 459 of 459 equality rows. delta_d is what
+makes it definite.
+
+Quasi-definiteness is the objective, not a side effect. A quasi-definite matrix
+-- negative definite (1,1), positive definite (2,2) -- has an `LDL^T`
+factorization for ANY symmetric permutation. That is precisely what lets Module
+10 pick an ordering from the sparsity pattern alone, once, and reuse it every
+iteration with no numerical pivoting and no reordering. Without both deltas the
+matrix is merely symmetric indefinite, and a fixed ordering is no longer safe.
+
+So neither path is unregularized, and both draw the same two parameters from
+Options: the LP path floors `Theta^-1` and adds `delta_d` to the reduced system;
+the augmented path adds `delta_p` to the primal block and `delta_d` to the dual
+block.
+
+### Escalation and decay
+
+Module 9 applies both deltas at their floors every iteration. Module 11 raises
+them when a factorization or refinement fails, and must also bring them back
+down:
+
+```text
+on breakdown:     delta <- min(delta * escalation_factor, delta_max)
+                  refactor and retry
+on a clean solve: delta <- max(delta / decay_factor, delta_floor)
+```
+
+A pure ratchet is wrong. Once escalated, every later iteration solves a system
+perturbed more than it needs and iterative refinement pays for it in extra
+passes; decay is what returns accuracy after a transient. If delta reaches
+delta_max and the factorization still fails, return NUMERICAL_FAILURE rather
+than escalating further -- past that point the direction is too perturbed to be
+a Newton step. Record escalations and decays in Diagnostics.
+
+### Ownership
+- Module 9 (KKT Builder) applies delta_p and delta_d at construction, unconditionally.
+- Module 11 (Regularization) owns ESCALATION only: raising delta on detected breakdown,
+  counting events, reporting metadata. It does NOT own the floor.
+- Module 19 (Diagnostics) records floor activations and refinement passes per iteration.
+  These counts are the evidence for any numerical-robustness claim in the submission.
+
+## General QP path
+For general non-diagonal Q, do not universally force the LP dy reduction. Use an
+augmented/quasi-definite symmetric KKT system suitable for LDL^T. For diagonal/cheaply
+invertible Q, a dy Schur reduction may be selected when advantageous. KKT Builder returns
+ReductionDescriptor; downstream modules never assume dy is always the solved direction.
+
+**Free columns are an input to this choice.** In the augmented system a zero entry of
+Theta^-1 is exact and harmless: the zero only causes trouble when dx is eliminated to form
+the normal equations. A high proportion of free columns is therefore a legitimate reason to
+select the augmented path, alongside non-diagonal Q. gas11 is 375 free columns of 862 (44%).
+
+## Sparse structure
+Matrix supports Dense, CSR and CSC. CSR is useful for A*x; CSC for A^T*y. MatrixAnalyzer
+reports dimensions, nnz, density, symmetry, dense columns, free/fixed column counts, empty
+rows and storage information.
+
+### MatrixAnalysis goes stale -- re-run it
+
+`MatrixAnalysis` is a pure function of the matrix it is handed, so re-running it
+is cheap and it MUST be re-run after any stage that changes the matrix. Module 4
+changes `free_columns` directly -- free column singleton substitution exists
+precisely to reduce it -- and changes `dense_columns` and `empty_rows` with it.
+
+Module 9 therefore selects its reduction from the analysis of the model it will
+actually factorize, i.e. AFTER presolve and scaling. Choosing from the
+ingestion-time analysis would decide the LP-vs-augmented path on a free-column
+count that presolve has since changed. A consumer must state which analysis it
+is holding. Ordering/Symbolic Factorization owns fill-reducing ordering
+and symbolic analysis for the reference path and reuses it while the sparsity pattern is
+unchanged. If a backend such as cuDSS owns analysis/reordering, avoid duplicating that work.
+
+## Transformations
+Canonicalizer, Presolver and Scaler preserve reversible TransformRecord information.
+Solution Reconstructor reverses scaling, presolve and canonicalization in the correct reverse
+order. It applies NO global dual sign normalization — see Dual convention; the only sign work
+is flipping back the rows the Canonicalizer negated.
+
+## Mehrotra loop
+1. residuals
+2. affine system/solve
+3. affine primal/dual step lengths
+4. mu_aff
+5. sigma=clamp((mu_aff/mu)^3,0,1)
+6. corrector RHS with cross terms
+7. corrector solve
+8. final directions
+9. separate primal/dual steps
+10. state update
+11. convergence check
+12. diagnostics
+
+## GPU boundary
+CPU: parsing, model construction, some presolve and orchestration. GPU where practical:
+SpMV, dense operations, vector operations, residuals, KKT assembly, factorization/solve and
+refinement. Keep reused numerical data resident on GPU and avoid unnecessary transfers.
+Initial numerical precision: FP64; mixed precision with iterative refinement may be added
+later.
+
+CUDA primitives: cuBLAS, cuSPARSE, cuSOLVER and suitable cuDSS sparse direct functionality.
+The optimization algorithm remains in solver modules.
+
+## Infeasibility
+Do not infer infeasibility from stagnation. Statuses: OPTIMAL, INFEASIBLE (only from a
+definite verdict such as an inconsistent empty row or a crossed bound pair), MAX_ITERATIONS,
+NUMERICAL_FAILURE. A future HSDE module can provide stronger certificates.
+
+## Future MILP
+Do not implement branch-and-bound/simplex/crossover now. Preserve integrality flags, faithful
+bounds, TransformRecord and the separate Canonicalizer/Reconstructor so the LP/QP core can
+later be reused.
