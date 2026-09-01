@@ -229,4 +229,35 @@ MatrixAnalysis analyze(const core::SparseMatrixPair<>& matrix,
   return a;
 }
 
+BoundClassification classify_bounds(core::HostSpan<const Real> lower,
+                                    core::HostSpan<const Real> upper) noexcept {
+  BoundClassification b;
+  const std::size_t n = std::min(lower.size(), upper.size());
+  b.total = n;
+  for (std::size_t k = 0; k < n; ++k) {
+    const Real lo = lower[k];
+    const Real hi = upper[k];
+    const bool lf = core::is_finite_bound(lo);
+    const bool hf = core::is_finite_bound(hi);
+    if (lo > hi) {
+      ++b.inconsistent_count;
+      continue;
+    }
+    if (lf && hf) {
+      if (lo == hi) {
+        ++b.fixed_count;
+      } else {
+        ++b.boxed_count;
+      }
+    } else if (lf) {
+      ++b.lower_only_count;
+    } else if (hf) {
+      ++b.upper_only_count;
+    } else {
+      ++b.free_count;
+    }
+  }
+  return b;
+}
+
 }  // namespace sovsolve::analysis

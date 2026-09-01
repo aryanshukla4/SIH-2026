@@ -38,66 +38,106 @@ See `MPS-FORMAT-NOTES.md` for the exact translation tables.
 Produced by the Canonicalizer, with a reversible transform stack.
 
 ```
-    minimize      ½ xᵀQx + cᵀx
+    minimize      1/2 xQx + cx
 
-    subject to    A x = b
-                  x ≥ 0
+    subject to    A_E x       = b_E
+                  A_I x + s   = b_I,   s >= 0
+                  l <= x <= u
 ```
 
-Every row is an equality and every variable is non-negative. This is the form
-`Ax + s = b, x ≥ 0, s ≥ 0` with the slacks appended as **columns**:
+This is the **bounded-variable** form. Two properties of it carry the design:
 
-```
-    A_canonical = [ A_structural | I_slack ]        x_canonical = [ x ; s ]
-```
+**Equality rows carry no slack.** A form that appends `s >= 0` to every row
+cannot express an equality — there is nowhere to put a slack that must be zero
+— and equalities are the majority of rows in real instances: 516 of 821 in
+Netlib `25fv47`, all 459 in `gas11`.
 
-Writing it that way is not cosmetic. The `Ax + s = b, s ≥ 0` form cannot
-express an equality row — there is nowhere to put a slack that must be zero —
-and equality rows are the majority in real instances (516 of 821 rows in Netlib
-`25fv47`). Appending slack columns only to *inequality* rows handles both kinds
-uniformly.
+**Finite variable bounds stay native.** Turning each `x <= u` into a constraint
+row grows the reduced system by one row per boxed column. Measured on our
+corpus under the previous `Ax = b, x >= 0` form: **+750% rows on `rgn`, +648%
+on `gt2`, +154% on `80bau3b`** — worst on exactly the MILP instances, since a
+binary variable is boxed `[0,1]` by definition. Two complementarity pairs per
+variable costs one extra vector instead, and the reduced system stays `m x m`.
 
-The column layout is `[structural | slack | bound]`, where `bound` holds the
-auxiliary variables introduced when a finite upper bound had to become a
-constraint row. `CanonicalProblem::slack_begin()` is where `s` starts.
+`A_E` and `A_I` are contiguous **row blocks of one matrix**, not two matrices:
+rows `[0, num_equality)` are `A_E`, the rest are `A_I`, and `s[k]` belongs to
+canonical row `num_equality + k`. One matrix keeps `Ax` and `Ay` single kernel
+calls, which is what the IPM does with them every iteration. The fill-reducing
+ordering permutes rows again downstream, so preserving file order buys nothing.
 
 For LP, `Q = 0`.
 
-### 2.1 Column transforms are one affine map
+### 2.1 Column transforms — there are none
 
-Every variable transform is an instance of `x = d·x' + t` with `d ∈ {+1, −1}`,
-so the whole update is uniform:
+This is the point of the bounded-variable form. No column is shifted, reflected
+or split; bounds pass through to `col_lower` / `col_upper` untouched. The only
+column operation is **removal**, and only for a fixed column.
+
+In particular, **splitting a free variable as `x = x+ - x-` is prohibited.** It
+doubles the column count, makes the two columns structurally dependent, and is
+well documented to converge poorly in interior-point methods. A free column
+stays a single column with both bounds infinite; §10.1 covers the consequence.
+
+### 2.2 The startability contract
+
+The canonicalizer's output is either **startable by the IPM, or a definite
+infeasibility verdict**. This is a contract, not an optimization, so it must not
+depend on the presolver — callers can switch that off.
+
+**No column has `l == u`.** The IPM requires `x-l > 0` and `u-x > 0` at once;
+their sum is `u-l`, so a fixed column admits no strictly interior point and the
+method cannot take a first step. Fixed columns are substituted out:
 
 ```
-    A_new  = A D                     (scale column j by d_j)
-    bounds shift by  −A t
-    Q_new  = D Q D                   (Q_new[i][j] = d_i d_j Q[i][j])
-    c_new  = D (Q t + c)
-    offset = ½ tᵀQ t + cᵀt
+    b_E := b_E - A_E[:,j] l_j
+    b_I := b_I - A_I[:,j] l_j
+    c   := c   + Q[:,j] l_j                 (over the remaining columns)
+    offset += c_j l_j + 1/2 Q_jj l_j^2
+    column j deleted
 ```
 
-| Original bounds | Transform | `d` | `t` |
-|---|---|---|---|
-| `l ≤ x`, no upper | shift | +1 | `l` |
-| `x ≤ u`, no lower | reflect | −1 | `u` |
-| `l ≤ x ≤ u` | shift, then a bound row `x' + t = u−l` | +1 | `l` |
-| free | split `x = x⁺ − x⁻` | — | — |
+recorded as `RemoveFixedVariable(j, l_j)`. **1067 fixed columns across 8 of our
+19 instances** — 498 in `80bau3b`, 250 in `shell`, 103 in `greenbea`.
 
-Free variables are the one case outside the map. Splitting doubles the column
-and worsens conditioning (`x⁺` and `x⁻` are perfectly correlated near the
-solution), so the record is kept distinguishable — a later IPM can handle free
-variables natively without the loader changing.
+**No row of `A` is entirely zero.** An all-zero row makes that row and column of
+`A T A` identically zero for every `T` — an exact zero pivot, not an
+ill-conditioning, and nothing in the regularization policy can repair it. A
+consistent empty row is dropped; an inconsistent one (`0 = 5`) returns
+`PrimalInfeasible`, because regularizing it away would report
+`NUMERICAL_FAILURE` for a model that is provably infeasible.
 
-### 2.2 Row transforms
+**Emptiness is tested after the substitution, not before.** Removing a column
+can take away the last entry a row had. Measured on our own corpus, inside the
+canonicalizer, one stage before the presolver runs:
+
+| instance | empty rows before | rows dropped after | created |
+|---|---:|---:|---:|
+| gas11 | 0 | 2 | **2** |
+| 80bau3b | 25 | 27 | **2** |
+| standata | 0 | 1 | **1** |
+| greenbea | 3 | 3 | 0 |
+
+Three of those had none to begin with. `CanonicalProblem::is_ipm_startable()`
+exposes the same `O(m + n + nnz)` check for the initializer to re-run, because
+the canonicalizer is not the last stage to touch the model.
+
+### 2.3 Row transforms
 
 | Original | Canonical |
 |---|---|
-| `aᵀx = b` | `aᵀx = b` — no slack |
-| `aᵀx ≤ u` | `aᵀx + s = u`, `s ≥ 0` |
-| `aᵀx ≥ l` | negate the row, then `−aᵀx + s = −l` |
-| `l ≤ aᵀx ≤ u` | `aᵀx + s = u` with a bound row for `s` |
+| `ax = b` | equality block, no slack |
+| `ax <= u` | `ax + s = u`, `s >= 0` |
+| `ax >= l` | negate the row, then `-ax + s = -l` |
+| `l <= ax <= u` | `ax + s = u` with `0 <= s <= u-l` |
+| both bounds infinite | dropped (vacuous) |
+| empty over kept columns | dropped, or `PrimalInfeasible` |
 
-Row negation flips the sign of that row's dual; recovery inverts it.
+Row negation flips the sign of that row's dual; recovery inverts it (§4).
+
+A **ranged** row produces a slack with a finite upper bound, which needs the
+same two-sided complementarity treatment a boxed column gets — `rsy` in §5
+covers only `s >= 0`. No instance in our corpus has a ranged row, so that path
+is unit-tested but not exercised by the benchmark set.
 
 ---
 
@@ -105,94 +145,116 @@ Row negation flips the sign of that row's dual; recovery inverts it.
 
 | Variable | Length | Meaning | Sign requirement |
 |---|---|---|---|
-| `x` | `n` | primal variables | `x > 0` (strictly, in the interior) |
-| `s` | `m` | row slacks | `s > 0` |
-| `y` | `m` | duals for `Ax + s = b` | see §4 |
-| `z` | `n` | duals for `x ≥ 0` | `z > 0` |
-| `w` | `m` | duals for `s ≥ 0` | `w > 0` |
+| `x` | `n` | primal variables | `x-l > 0` and `u-x > 0` where the bound is finite |
+| `s` | `m_I` | inequality-row slacks | `s > 0` |
+| `y` | `m` | row duals | free on `A_E`; `-y_I > 0` on `A_I` |
+| `z` | `n` | duals for `x >= l` | `z > 0` |
+| `v` | `n` | duals for `x <= u` | `v > 0` |
+
+`s` has length `m_I = m - num_equality`, **not** `m`. Equality rows have no
+slack. The reduced cost of column `j` is `z_j - v_j`.
+
+A pair belonging to an **infinite** bound does not exist and is omitted
+everywhere — from `rxz`/`ruv`, from the `mu` average, and from step lengths. A
+free column contributes no pair at all.
 
 ---
 
 ## 4. Sign convention — **read this before touching any dual**
 
-The handoff docs adopt a convention in which the slack dual is *eliminated* as `w = −y`,
-which forces `y < 0` throughout. That is internally consistent, but it inverts every
-step-length test and every diagnostic print relative to the standard literature.
-
-**This codebase carries `w` explicitly, with `w ≥ 0`.**
-
-Cost: one vector of length `m`. Benefit: every positive variable is genuinely positive, so
-step-length code, initialization, and debug output all read naturally, and results can be
-cross-checked against textbooks and other solvers without mental sign inversion.
-
-The relationship to the docs' convention is exactly:
+The slack dual is **eliminated**, not stored:
 
 ```
-    w_here  =  −y_docs
-    y_here  =   y_docs
+    w_s = -y_I          so  -y_I > 0  on inequality rows
 ```
 
-Modules that consume duals must state which convention they use. **No silent conversions.**
+`w_s` is not an independent quantity. Storing it duplicates state that can drift
+from `-y_I` under rounding, leaving an invariant nobody maintains. Where a sign
+test would otherwise read backwards, use a helper rather than a second vector:
+
+```
+    slack_dual(y) = -y          // step-length and interiority tests read positively
+```
+
+### This convention already matches what other solvers report
+
+Verified against HiGHS. For a **minimization**:
+
+```
+    <= row                        ->  dual <= 0        matches -y_I > 0 here
+    >= row                        ->  dual >= 0
+    == row                        ->  free sign
+    variable at its lower bound   ->  reduced cost >= 0    matches z >= 0 here
+```
+
+So **no global sign normalization is applied at the exit point.** The only flip
+`recover_solution()` performs is local: `>=` rows were negated in §2.3, so their
+duals are negated back — and *that* flip is what produces the non-negative dual
+a `>=` row is reported with.
+
+An earlier draft of this file claimed the opposite and specified a global
+normalization at the reconstructor. It was wrong; applying it would invert every
+inequality dual. Recorded here so nobody reintroduces it.
 
 Derivation, for the record. With
 
 ```
-L = ½xᵀQx + cᵀx − yᵀ(Ax + s − b) − zᵀx − wᵀs
+L = 1/2 xQx + cx - y(Ax + s - b) - z(x - l) - v(u - x)
 ```
 
 stationarity gives
 
 ```
-∂L/∂x  =  Qx + c − Aᵀy − z  =  0
-∂L/∂s  =  −y − w            =  0     ⟹   w = −y
+dL/dx  =  Qx + c - Ay - z + v  =  0
+dL/ds  =  -y - w_s             =  0     =>   w_s = -y
 ```
-
-Carrying `w` explicitly means we keep both `y` (free sign) and `w ≥ 0` and enforce
-`w + y = 0` as part of the dual residual rather than by substitution.
 
 ---
 
 ## 5. Residuals
 
 ```
-    rp   =  A x + s − b                (length m)   primal feasibility
-    rd   =  Q x + c − Aᵀy − z          (length n)   dual / stationarity
-    rxz  =  X z − μ 1                  (length n)   x–z complementarity
-    rsw  =  S w − μ 1                  (length m)   s–w complementarity
+    rp_E =  A_E x - b_E                 (length m_E)   primal, equality rows
+    rp_I =  A_I x + s - b_I             (length m_I)   primal, inequality rows
+    rd   =  Qx + c - Ay - z + v         (length n)     dual / stationarity
+    rxz  =  (x-l).*z - mu 1             (length n)     lower-bound complementarity
+    ruv  =  (u-x).*v - mu 1             (length n)     upper-bound complementarity
+    rsy  =  -s.*y_I - mu 1              (length m_I)   slack complementarity
 ```
 
-`X`, `S`, `Z`, `W` denote `diag(x)`, `diag(s)`, `diag(z)`, `diag(w)`.
+`X_L`, `U-X`, `Z`, `V`, `S`, `Y_I` denote the corresponding diagonals.
 **They are never materialized** — always elementwise vector operations.
 
-Under the docs' `w = −y` convention, `rsw` is written `rsy = −Sy − μ1`. Identical equation.
+Omit the `rxz` entry where the lower bound is infinite and the `ruv` entry where
+the upper bound is infinite.
 
 ---
 
 ## 6. Complementarity measure
 
 ```
-    μ  =  ( xᵀz + sᵀw ) / ( n + m )
+    mu  =  [ sum (x-l).*z  +  sum (u-x).*v  +  sum (-s).*y_I ] / active_pair_count
 ```
 
-Equivalently `μ = (xᵀz − sᵀy) / (n + m)` under the docs' convention.
-
-Both complementarity pairs contribute. Using `μ = xᵀz / n` alone is wrong whenever slacks are
-explicit.
+`active_pair_count` counts only pairs that exist: one per finite lower bound,
+one per finite upper bound, one per inequality row. Dividing by `2n + m_I`
+instead understates `mu` badly on a model with many free or one-sided columns —
+`gas11` is 44% free columns, which contribute no pair at all.
 
 ---
 
 ## 7. Newton system
 
 ```
-    Q Δx − AᵀΔy − Δz        =  −rd
-    A Δx + Δs               =  −rp
-    Z Δx + X Δz             =  −rxz
-    W Δs + S Δw             =  −rsw
+    Q dx - A dy - dz + dv   =  -rd
+    A_E dx                  =  -rp_E
+    A_I dx + ds             =  -rp_I
+    Z dx + X_L dz           =  -rxz
+    -V dx + (U-X) dv        =  -ruv
+    -Y_I ds - S dy_I        =  -rsy
 ```
 
-Four blocks. Do not use a three-variable system.
-
----
+Six blocks. Do not collapse to a smaller system before §10 selects a reduction.
 
 ## 8. Step lengths — **two, not one**
 
@@ -200,18 +262,24 @@ Primal and dual variables reach their boundaries at different distances. Using a
 discards the larger of the two steps and costs 20–30% more iterations.
 
 ```
-    α_p  =  η · max { α ∈ (0,1] :  x + αΔx ≥ 0  and  s + αΔs ≥ 0 }
-    α_d  =  η · max { α ∈ (0,1] :  z + αΔz ≥ 0  and  w + αΔw ≥ 0 }
+    α_p  =  η · max { α ∈ (0,1] :  l < x + αΔx < u   and   s + αΔs > 0 }
+    α_d  =  η · max { α ∈ (0,1] :  z + αΔz > 0,  v + αΔv > 0,
+                                   slack_dual(y_I + αΔy_I) > 0 }
 ```
 
 with safety factor `0 < η < 1` (typically `η ≈ 0.995`).
+
+A bound test is skipped where that bound is infinite. Equality-row `y` is
+unrestricted and is never limited by the ratio test. Write the slack-dual test
+through the `slack_dual` helper rather than as an inline `−y > 0`, which is easy
+to write backwards.
 
 Update:
 
 ```
     x ← x + α_p Δx        y ← y + α_d Δy
     s ← s + α_p Δs        z ← z + α_d Δz
-                          w ← w + α_d Δw
+                          v ← v + α_d Δv
 ```
 
 ---
@@ -239,31 +307,81 @@ Two backends, selected by problem class.
 
 ### 10.1 Normal equations — LP only
 
-Eliminating `Δz`, `Δs`, `Δw`, then `Δx`:
+Eliminating `dz`, `dv`, `ds`, then `dx`:
 
 ```
-    ( A Θ Aᵀ + D ) Δy  =  rhs        Θ = Z⁻¹X ≻ 0,   D = W⁻¹S ≻ 0
+    ( A T A + D_s + delta_d I ) dy  =  rhs
 ```
 
-SPD, so Cholesky applies.
+with `D_s` the diagonal slack contribution on inequality rows. SPD, so Cholesky
+applies. The reduced system stays `m x m` because variable bounds are not rows.
 
-**Only valid for `Q = 0`.** For QP, eliminating `Δx` requires `(Q + X⁻¹Z)⁻¹`, which is a full
-matrix — the reduction is not available. See §10.2.
+**Build `T^-1`, never `T`.** The diagonal is
 
-**Caveat:** a single dense column `aⱼ` of `A` contributes `θⱼ aⱼaⱼᵀ`, a full dense rank-1
-update that makes `AΘAᵀ` dense. Dense columns must be detected (the matrix analyzer reports
-them) and split out via Sherman–Morrison.
+```
+    T^-1 = X_L^-1 Z + (U-X)^-1 V         term omitted where that bound is infinite
+    T^-1 <- max(T^-1, delta_p)           elementwise floor, unconditional, every iteration
+    T    <- (T^-1)^-1                    now always finite
+```
+
+**The floor covers the whole diagonal, not only free columns.** A free variable
+contributes neither term, so its entry is exactly zero at iteration 0 — that is
+the visible case. But the entry of any variable that ends up strictly *between*
+its bounds at the optimum also goes to zero, because complementarity drives
+`z_j -> 0` and `v_j -> 0` there while `(x-l)` and `(u-x)` stay away from zero:
+
+```
+    at a bound at the optimum:        T^-1 -> large,  T -> ~mu
+    strictly inside at the optimum:   T^-1 -> ~mu,    T -> large
+```
+
+At `mu = 1e-10` the two groups differ by roughly `1e20` — which is the
+`cond(A T A) ~ 1/mu^2` growth below, made concrete. Double precision resolves
+about `1e16`. So free variables are not a special case; they are the first
+instance of a failure that reaches every basic variable near convergence. A
+floor applied only to columns tagged free fixes iteration 0 and leaves
+iteration 35 broken.
+
+**`delta_d` is separate and equally mandatory.** `delta_p` bounds `T` from
+above; it cannot help when `A` itself is rank deficient, since then `A T A` is
+singular for every `T`. Empty rows are the clearest instance — the canonicalizer
+removes those (§2.2), but presolve creates new ones and `delta_d` covers what
+detection misses.
+
+Both floors are applied **at construction, unconditionally, by the KKT builder**
+— not by a reactive regularization module. A zero entry yields `inf` in IEEE754
+with no exception, `0*inf` yields `NaN`, and `NaN` compares false against every
+threshold: the solve then runs silently to the iteration limit and reports
+`MAX_ITERATIONS` on a solvable problem. There is nothing for a breakdown
+detector to detect.
+
+Regularization perturbs the Newton direction, so every regularized solve is
+followed by iterative refinement against the **unregularized** residual.
+
+**Only valid for `Q = 0`.** For QP, eliminating `dx` requires `(Q + T^-1)^-1`,
+which is a full matrix — the reduction is not available. See §10.2.
+
+**Caveat:** a single dense column `a_j` of `A` contributes `t_j a_j a_j`, a full
+dense rank-1 update that makes `A T A` dense. Dense columns must be detected
+(the matrix analyzer reports them; Netlib `israel` has 19) and split out via
+Sherman-Morrison.
 
 ### 10.2 Augmented / quasi-definite KKT — LP and QP
 
 ```
-    ⎡ −(Q + X⁻¹Z)      Aᵀ    ⎤ ⎡ Δx ⎤     ⎡ · ⎤
-    ⎢                        ⎥ ⎢    ⎥  =  ⎢   ⎥
-    ⎣      A         W⁻¹S    ⎦ ⎣ Δy ⎦     ⎣ · ⎦
+    | -(Q + T^-1)      A  | | dx |     | . |
+    |                     | |    |  =  |   |
+    |      A         D_s  | | dy |     | . |
 ```
 
-Quasi-definite, so an `LDLᵀ` factorization with a fixed (symmetry-based) ordering exists.
-This is the required path for QP and a valid path for LP.
+Quasi-definite, so an `LDL` factorization with a fixed (symmetry-based) ordering
+exists. This is the required path for QP and a valid path for LP.
+
+**A high free-column share also selects this path.** Here a zero entry of
+`T^-1` is exact and harmless — the zero only causes trouble when `dx` is
+eliminated to form the normal equations. `gas11` is 375 free of 862 columns
+(44%), so this is a real selection criterion, not a hypothetical one. Record the
+reason in the `ReductionDescriptor`.
 
 ### 10.3 Invariants both backends rely on
 
