@@ -542,6 +542,64 @@ ENDATA
   check_roundtrip("qp b", p, {3.5, 4.25});
 }
 
+void test_range_column_is_dropped_on_recovery() {
+  // A RANGE column is not an original variable, so the recovered solution must
+  // not contain it -- and the row's reported slack must be recomputed from the
+  // original activity rather than read out of the dropped column.
+  const auto p = parse(R"(NAME          RNGREC
+ROWS
+ N  COST
+ L  R1
+COLUMNS
+    X         COST         1.0   R1           1.0
+    Y         COST         1.0   R1           1.0
+RHS
+    RHS       R1          10.0
+RANGES
+    RNG       R1           6.0
+ENDATA
+)");
+  // R1 is 4 <= X + Y <= 10.
+  auto canon = model::canonicalize(p);
+  CHECK(canon.has_value());
+  if (!canon.has_value()) return;
+  const auto& cp = canon->problem;
+
+  // Two original columns plus one range column; the row became an equality.
+  CHECK_EQ(cp.num_cols(), std::size_t{3});
+  CHECK_EQ(cp.num_range, std::size_t{1});
+  CHECK_EQ(cp.num_equality, std::size_t{1});
+  CHECK_EQ(cp.num_inequality_rows(), std::size_t{0});
+
+  // Canonical point: X = 3, Y = 4 gives activity 7, so t = 10 - 7 = 3, which
+  // lies inside [0, 6] as it must.
+  model::Solution cs;
+  cs.x = core::RealVector(3, 0.0);
+  cs.x[0] = 3.0;
+  cs.x[1] = 4.0;
+  cs.x[2] = 3.0;
+  cs.y = core::RealVector(cp.num_rows(), 0.0);
+  cs.z = core::RealVector(cp.num_cols(), 0.0);
+  cs.v = core::RealVector(cp.num_cols(), 0.0);
+
+  auto back = model::recover_solution(p, cp, canon->transforms, cs);
+  CHECK(back.has_value());
+  if (!back.has_value()) return;
+
+  // The range column is gone: the solution has exactly the original columns.
+  CHECK_EQ(back->x.size(), p.num_cols());
+  CHECK_EQ(back->z.size(), p.num_cols());
+  CHECK_EQ(back->v.size(), p.num_cols());
+  CHECK_NEAR(back->x[0], 3.0, 1e-12);
+  CHECK_NEAR(back->x[1], 4.0, 1e-12);
+
+  // The reported slack is distance to the finite upper bound of the ORIGINAL
+  // row, recomputed from activity -- 10 - 7 = 3 -- not read from the column.
+  CHECK_EQ(back->s.size(), p.num_rows());
+  CHECK_NEAR(back->s[0], 3.0, 1e-12);
+  CHECK_NEAR(back->quality.max_bound_violation, 0.0, 1e-12);
+}
+
 void test_maximize_quadratic_negates_Q() {
   // The scope says `Q` is symmetric POSITIVE semidefinite. A legitimate
   // concave maximization arrives with `Q` NEGATIVE semidefinite, so the sense
@@ -1003,6 +1061,7 @@ int main() {
   test_maximize();
   test_quadratic();
   test_maximize_quadratic_negates_Q();
+  test_range_column_is_dropped_on_recovery();
 
   test_fixed_variable_is_substituted_out();
   test_fixed_variable_in_quadratic();

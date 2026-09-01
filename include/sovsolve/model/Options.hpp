@@ -55,17 +55,54 @@ struct IpmOptions {
   /// factorization, so it is nearly free.
   bool predictor_corrector = true;
 
-  /// Primal and dual regularization added to the reduced system.
+  /// Primal and dual regularization -- FLOORS, not the values themselves.
   ///
-  /// Not optional. cond(A*Theta*A') ~ 1/mu^2 by construction, so the system
-  /// becomes catastrophically ill-conditioned precisely as the method
-  /// converges. Regularization plus iterative refinement is the standard
-  /// mitigation, and the event counts are the evidence for any robustness
-  /// claim.
-  Real primal_regularization = 1e-8;
-  Real dual_regularization = 1e-8;
+  /// The working deltas are derived from the magnitudes of the SCALED data and
+  /// then clamped below by these; an absolute constant is meaningless when the
+  /// matrix dynamic range reaches 2.6e11 before scaling, as it does on gas11.
+  ///
+  /// Not optional, on either path, and they do different jobs:
+  ///
+  ///   normal equations   Theta^-1 <- max(Theta^-1, delta_p)   then invert
+  ///                      (A Theta A' + D_s + delta_d I) dy = rhs
+  ///
+  ///   augmented KKT      [ -(Q + Theta^-1 + delta_p I)        A'          ]
+  ///                      [        A                  (D_s + delta_d I)    ]
+  ///
+  /// On the augmented path `Theta^-1` is never inverted, so the floor does not
+  /// apply -- `delta_p` replaces it. Both remain mandatory there: `Q` is only
+  /// positive SEMIdefinite, so a free column where `Q` is zero leaves the (1,1)
+  /// block with a zero row; and `D_s` is zero on every EQUALITY row by
+  /// construction, so the (2,2) block is singular across the whole equality
+  /// block before rank deficiency in `A` is even considered. Netlib gas11 is
+  /// 459 of 459 equality rows.
+  ///
+  /// Together they make the matrix quasi-definite, which is what guarantees an
+  /// LDL' factorization for ANY symmetric permutation -- the property that lets
+  /// the ordering be fixed from the sparsity pattern once and reused with no
+  /// numerical pivoting.
+  Real primal_regularization_floor = 1e-8;
+  Real dual_regularization_floor = 1e-8;
+
+  /// Escalation on breakdown, and decay back toward the floor on success:
+  ///
+  ///     breakdown    delta <- min(delta * escalation, delta_max), refactor
+  ///     clean solve  delta <- max(delta / decay, floor)
+  ///
+  /// The decay is not optional. A pure ratchet leaves every later iteration
+  /// solving a system perturbed more than it needs, and iterative refinement
+  /// pays for it in extra passes. At `delta_max` with a still-failing
+  /// factorization the direction is too perturbed to be a Newton step, so the
+  /// solve reports NumericalError rather than escalating further.
+  Real regularization_escalation = 100.0;
+  Real regularization_decay = 10.0;
+  Real delta_max = 1e-2;
 
   /// Maximum iterative-refinement passes per linear solve.
+  ///
+  /// Refinement is measured against the UNREGULARIZED residual: the regularized
+  /// system is a nearby problem, and refining against its own residual
+  /// converges accurately to the wrong one.
   int max_refinement_steps = 3;
 };
 
@@ -75,7 +112,14 @@ struct Limits {
   double time_limit_seconds = 3600.0;
 
   /// Consecutive iterations without meaningful progress before declaring a
-  /// stall. On stall the **best iterate seen** is returned, not the last one.
+  /// stall.
+  ///
+  /// Consumed by the convergence checker, which on stall returns the BEST
+  /// ITERATE seen -- not the last one -- with `MaxIterations` or
+  /// `NotConverged`, and **never** `Infeasible`. Stagnation is evidence that
+  /// this run stopped improving, not evidence about the model; a positive
+  /// infeasibility verdict comes only from the canonicalizer finding an
+  /// inconsistent empty row or a crossed bound pair.
   std::size_t stall_iterations = 10;
 };
 
