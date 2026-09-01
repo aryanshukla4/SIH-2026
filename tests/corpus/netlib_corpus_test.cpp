@@ -127,12 +127,20 @@ void check_structure(const fs::path& path, std::size_t& parsed) {
   CHECK(!a.has_invalid_values);
   CHECK_EQ(a.nnz, p.nnz());
 
+  // How many free columns are singletons -- hand-written slacks a presolver
+  // substitutes out exactly, as opposed to genuine free variables whose zero
+  // entry of Theta^-1 the KKT builder has to floor.
+  const auto fcs = analysis::free_column_singletons(p.A, p.col_lower.span(),
+                                                    p.col_upper.span());
+  CHECK(fcs.size() <= cb.free_count);
+  CHECK(fcs.size() <= a.by_column.singleton_count);
+
   std::printf("  %-12s %5zu x %5zu  nnz %7zu  %-4s  disc %4zu  dense-col %zu  "
-              "free %4zu  fixed %4zu  empty-row %zu\n",
+              "free %4zu (%4zu singleton)  fixed %4zu  empty-row %zu\n",
               path.stem().string().c_str(), p.num_rows(), p.num_cols(), p.nnz(),
               p.has_discrete() ? "MILP" : "LP", p.num_discrete(),
-              a.dense_columns.size(), cb.free_count, cb.fixed_count,
-              a.empty_rows.size());
+              a.dense_columns.size(), cb.free_count, fcs.size(),
+              cb.fixed_count, a.empty_rows.size());
 }
 
 void test_reparse_is_deterministic() {

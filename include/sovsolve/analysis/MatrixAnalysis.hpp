@@ -141,6 +141,24 @@ struct BoundClassification {
 [[nodiscard]] BoundClassification classify_bounds(
     core::HostSpan<const Real> lower, core::HostSpan<const Real> upper) noexcept;
 
+/// Columns that are FREE and appear in exactly ONE row.
+///
+/// These are almost always slacks the modeller wrote out by hand -- `Ax - s = 0`
+/// with `s` free instead of a ranged row -- and they substitute out exactly:
+/// the single row determines the column's value, so both disappear together.
+///
+/// This is the cheapest way to remove free-variable pressure, and it removes it
+/// at the source rather than regularizing around it downstream. Every free
+/// column left after this one runs is a genuine free variable whose zero entry
+/// of `Theta^-1` the KKT builder must floor.
+///
+/// Needs the matrix AND the bounds, which is why it is neither part of
+/// `analyze()` (matrix only) nor `classify_bounds()` (bounds only). Returns the
+/// indices rather than a count, so the presolver can act on them directly.
+[[nodiscard]] std::vector<Index> free_column_singletons(
+    const core::SparseMatrixPair<>& matrix, core::HostSpan<const Real> lower,
+    core::HostSpan<const Real> upper);
+
 struct AnalysisOptions {
   /// Multiplier k in the `k * sqrt(rows)` dense-column rule.
   double dense_column_factor = 2.0;
