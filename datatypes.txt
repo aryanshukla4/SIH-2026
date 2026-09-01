@@ -1,0 +1,234 @@
+# CUDA LP/QP Solver — Final Core Data Types (v3)
+
+**Status: LOCKED (v3, 2026-09-01).** Changes require team agreement.
+
+
+Goal: a small shared data model supporting LP/QP, bounded variables, Dense/CSR/CSC matrices,
+CPU/GPU memory and future MILP.
+
+## Changes from v2
+- `precision` removed from Vector and Matrix; it becomes a template parameter.
+- Options gains the regularization floors and refinement controls.
+- Diagnostics gains theta_floor_activations and refinement_passes.
+- SolverState notes that fixed variables and empty rows are already gone, so a strict
+  interior is guaranteed to exist.
+- TransformRecord: RemoveFixedVariable and RemoveEmptyRow are produced by the Canonicalizer
+  as well as the Presolver.
+- TransformRecord: ranged rows add a bounded RANGE column that must be recorded.
+- Scalar stays `double` even when Vector<float> arrives; it is not an array element type.
+- Options gains delta_max and regularization_decay_factor.
+- stall_iterations named its consumer (Module 18).
+- No separate slack-dual vector; w_s = -y_I with a helper for readability.
+
+## 1. Scalar
+```text
+using Scalar = double;
+```
+Initial precision: FP64.
+
+**Scalar deliberately does NOT follow Vector's element type.** mu, mu_aff, sigma,
+alpha_primal, alpha_dual, every tolerance and every residual norm are compared against
+thresholds and decide branching. They are O(1) values, not arrays, so narrowing them buys
+no bandwidth and can change a convergence decision. When the Vector<float> mixed-precision
+path arrives it is the ARRAY element type that changes; these control-flow scalars stay
+double.
+
+## 2. Vector
+Contains:
+```text
+size
+data pointer
+memory location: CPU or GPU
+```
+Dense initially. Used for x,s,y,z,v; directions; b,c; bounds; residuals; RHS. `v` is the
+upper-bound dual. The inequality slack dual is NOT stored — it is `-y_I`, exposed through
+`slack_dual(y) = -y` so tests read positively without a redundant vector that can drift from
+`-y_I` under rounding.
+
+**Element precision is a template parameter, not a runtime field.** A runtime `precision`
+tag puts a branch inside every element operation — in the innermost loop of the whole solver.
+Mixed precision, when it arrives, is a second instantiation, not a second code path:
+```text
+Vector<double>   // default
+Vector<float>    // mixed-precision refinement path, later
+```
+
+## 3. Matrix
+Contains:
+```text
+rows
+columns
+format: Dense / CSR / CSC
+memory location: CPU / GPU
+data
+```
+Dense: values. CSR: values, column_indices, row_offsets. CSC: values, row_indices,
+column_offsets. One public Matrix type; no separate DenseMatrix/CSRMatrix/CSCMatrix classes.
+
+Element precision and index type are template parameters, for the same reason as Vector.
+Index type defaults to int32 (half the index bandwidth of int64, and cuSPARSE's preferred
+path), with an overflow check at load time.
+
+Sparse index invariant: column indices within a CSR row, and row indices within a CSC column,
+are SORTED and duplicate-free. cuSPARSE requires this and gives wrong results silently
+without it.
+
+## 4. Problem
+Faithful model before canonicalization. Contains:
+```text
+problem_type: LP / QP
+A
+Q (optional for LP)
+c
+row_lower
+row_upper
+col_lower
+col_upper
+objective_sense
+objective_constant
+integrality_flags
+names/identifiers where needed
+```
+`row_lower/row_upper` represent `l_r <= A_i x <= u_r`. Integrality flags are stored but
+unused until MILP is implemented.
+
+## 5. SolverState
+Contains:
+```text
+x s y z v
+
+dx_aff ds_aff dy_aff dz_aff dv_aff
+dx_cor ds_cor dy_cor dz_cor dv_cor
+
+alpha_primal alpha_dual
+mu mu_aff sigma
+iteration status
+```
+`z` is the lower-bound dual; `v` is the upper-bound dual. Equality-row y is unrestricted.
+Strict interiority:
+```text
+x-l > 0
+u-x > 0
+s > 0
+z > 0
+v > 0
+slack_dual(y_I) > 0        // i.e. -y_I > 0
+```
+
+These conditions are satisfiable because the Canonicalizer has already removed fixed
+variables (l == u makes x-l > 0 and u-x > 0 jointly impossible) and empty rows. A
+SolverState is never constructed over a model that has either.
+
+Also carries a best-iterate snapshot: IPMs commonly stall near convergence, and the returned
+point should be the best one seen, not the last one.
+
+## 6. Diagnostics
+Contains aggregate timing/status fields and iteration history. Each IterationRecord contains:
+```text
+iteration
+objective
+primal_residual_inf
+dual_residual_inf
+xz_complementarity
+uv_complementarity
+sy_complementarity
+aggregate_complementarity
+mu
+mu_aff
+sigma
+alpha_primal
+alpha_dual
+symbolic_time
+factorization_time
+solve_time
+refinement_time
+gpu_transfer_time
+regularization_events
+theta_floor_activations
+refinement_passes
+iteration_time
+status
+```
+`theta_floor_activations` counts diagonal entries clamped to delta_p this iteration;
+`refinement_passes` counts iterative-refinement steps taken. Together with
+`regularization_events` these are the measured evidence for any numerical-robustness claim
+in the submission, so they are first-class fields rather than log lines.
+
+Support CSV/JSON export: benchmarking ~98 Netlib instances plus a MIPLIB subset against a
+reference solver cannot be done from printf output.
+
+## 7. MatrixAnalysis
+Contains:
+```text
+rows columns nnz density symmetry format memory_location
+dense_columns
+free_columns fixed_columns
+empty_rows empty_columns
+singleton_rows singleton_columns
+value_min_abs value_max_abs dynamic_range
+```
+Metadata only; it does not duplicate matrix storage.
+
+`dense_columns`: one dense column a_j contributes theta_j*a_j*a_j^T, a full rank-1 dense
+m x m update that makes A*Theta*A^T dense however sparse A is. Netlib israel has 19.
+
+`free_columns`: input to the Module 9 reduction choice. `fixed_columns` and `empty_rows`:
+input to Modules 2 and 4. `dynamic_range`: reaches 2.6e11 on gas11, which is why
+regularization parameters must be scale-aware.
+
+## 8. TransformRecord
+Stores reversible transformations from Canonicalizer, Presolver and Scaler. Must preserve
+enough information to reconstruct original variables, bounds, rows, slack additions,
+fixed-variable substitutions, empty-row removals, presolve eliminations, scaling and
+objective transformations. Keep transformations ordered for reverse application.
+
+Note that RemoveFixedVariable and RemoveEmptyRow are emitted by the CANONICALIZER as well as
+the Presolver — the Canonicalizer must emit them even when presolve is disabled, because the
+IPM cannot start otherwise.
+
+Note that the canonical model may carry RANGE columns beyond the original
+variables: a ranged row `lo <= a'x <= hi` becomes an equality plus one bounded
+column `0 <= t <= hi - lo`. They are ordinary bounded columns in every respect,
+so no type changes for them -- which is the reason that treatment was chosen over
+a two-sided slack. `TransformRecord` must record which column belongs to which
+row so the Reconstructor can drop it.
+
+## 9. ReductionDescriptor
+Contains conceptually:
+```text
+reduction_type
+system/factorization type
+recovery information
+active bound/slack structure
+reason for the chosen reduction
+```
+Examples: `LP_NORMAL_EQUATIONS_DY`, `QP_AUGMENTED_KKT`, `QP_SCHUR_DY`. It prevents downstream
+modules from assuming dy is always the solved direction. The `reason` field records why the
+path was chosen (non-diagonal Q, high free-column share, dense columns), so a slow or
+inaccurate solve can be traced back to the decision that produced it.
+
+## 10. Options
+```text
+tolerances:  primal_feasibility, dual_feasibility, relative_gap,
+             matrix_zero, bound_violation           (all relative, infinity norm)
+ipm:         eta (step safety factor), sigma, predictor_corrector,
+             delta_p_floor, delta_d_floor, delta_max,
+             regularization_escalation_factor, regularization_decay_factor,
+             max_refinement_steps
+limits:      max_iterations, time_limit_seconds, stall_iterations
+reader:      format detection and ambiguous-bound policy
+log:         verbosity, history collection
+```
+delta_p_floor and delta_d_floor are FLOORS on scale-derived values, not the values
+themselves: the actual deltas are computed relative to scaled data magnitudes after the
+Scaler runs. `regularization_decay_factor` and `delta_max` bound the other end: Module 11
+escalates on breakdown and decays back toward the floor on clean solves, and gives up with
+NUMERICAL_FAILURE at delta_max.
+
+`stall_iterations` is consumed by Module 18: that many consecutive iterations without
+meaningful progress terminates the solve and returns the BEST ITERATE, never INFEASIBLE.
+
+## Memory rule
+Vector and Matrix explicitly track CPU/GPU location. Do not create
+CPUVector/GPUVector/DenseMatrix/SparseMatrix/CSCMatrix as separate public mathematical types.
+Element precision and index type are template parameters, not runtime fields.

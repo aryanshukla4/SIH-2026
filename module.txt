@@ -1,0 +1,369 @@
+# CUDA LP/QP Solver — Final Module Specification (v3)
+
+**Status: LOCKED (v3, 2026-09-01).** Changes require team agreement.
+
+
+Each module has one job and uses the shared project types.
+
+## Changes from v2
+- Module 1: `.mps` is implemented; `.lp` is next, then a model writer, then QPLIB.
+- Module 2: new contract — output is IPM-startable or a definite infeasibility verdict.
+  Gains fixed-variable removal, empty-row resolution, a prohibition on free splitting,
+  ranged rows as an equality plus a bounded column, and a maximization negating c, Q and
+  the objective constant.
+- Module 4: free column singleton substitution; re-checks empty rows, which it creates.
+- Module 6: verifies the startability contract before building a SolverState.
+- Module 9: owns the unconditional Theta^-1 floor and dual regularization.
+- Module 11: escalation only; it does NOT own the floor.
+- Module 12: refinement is against the UNREGULARIZED residual.
+- Module 17: no global dual sign flip — verified the convention already matches HiGHS.
+- Module 3: re-runnable, and MUST be re-run after presolve.
+- Module 9: augmented path puts delta_p on the primal block, delta_d on the dual block.
+- Module 11: escalation must DECAY back toward the floor, not ratchet.
+- Module 17: drops the RANGE column added for a ranged row.
+- Module 18: owns stall detection; returns the best iterate, never INFEASIBLE.
+- Module 19: records floor activations and refinement passes.
+
+## 1. Input / Problem Loader
+Input: filepath. Output: Problem. Implement `Problem loadProblem(const std::string& filepath);`
+Preserve objective, objective sense/constant, row/column bounds, names and integrality flags.
+Do not canonicalize, presolve, scale or solve. Return useful parse/validation errors with
+line and column.
+
+Format order:
+1. `.mps` — IMPLEMENTED and verified on 19 Netlib instances (9 dimension-exact). Every
+   benchmark the problem statement names ships as MPS.
+2. `.lp` — next. CPLEX dialect as the base, accepting Gurobi's superset. Human-readable,
+   which matters for demonstration.
+3. model writer — dumps any Problem back to MPS. Buys the round-trip test and lets one
+   module owner hand another a dumped canonical/presolved model to debug in isolation,
+   instead of running the whole upstream pipeline.
+4. QPLIB — named in the problem statement, has its own format. MPS-QP (QUADOBJ/QMATRIX)
+   already works.
+
+## 2. Canonicalizer
+Input: Problem. Output: canonical Problem + TransformRecord.
+
+Use the bounded-variable form: equality rows have no slack; inequality rows get `s>=0`;
+finite variable bounds remain native. Never convert an upper bound into a row. All
+transformations reversible.
+
+**Contract: the output is startable by the IPM, or a definite infeasibility verdict.** This
+must not depend on the Presolver, which can be switched off. Three duties enforce it.
+
+**Remove fixed variables (l_j == u_j).** The IPM needs x-l > 0 AND u-x > 0; their sum is
+u-l = 0, so with l = u no strictly interior point exists and the method cannot start. Fixed
+variables are constants:
+```text
+b_E := b_E - A_E[:,j]*l_j
+b_I := b_I - A_I[:,j]*l_j
+c   := c   + Q[:,j]*l_j                (remaining columns)
+objective_constant += c_j*l_j + 1/2*Q_jj*l_j^2
+column j deleted
+```
+Record RemoveFixedVariable(j, l_j). Invert by reinstating x_j = l_j and computing its reduced
+cost from the recovered duals. 1067 fixed columns across 8 of 19 corpus instances.
+
+**Resolve empty rows.** An all-zero row makes that row and column of A*Theta*A^T identically
+zero for every Theta — an exact zero pivot.
+```text
+0 = 0  (within tolerance)  -> drop, record RemoveEmptyRow
+0 = b, b != 0              -> return INFEASIBLE
+```
+Never regularize the second case away: that converts a provable infeasibility into
+NUMERICAL_FAILURE. 25 empty rows in 80bau3b, 3 in greenbea.
+
+**Do not split free variables.** x = xp - xm is prohibited: it doubles columns, makes the
+pair structurally dependent, and converges poorly in IPMs. Free variables stay free and are
+handled by the Module 9 floor.
+
+**Ranged rows become an equality plus a bounded column.** `lo <= a'x <= hi` is not
+expressible in the one-sided form `A_I x + s = b_I, s >= 0`. Emit instead
+```text
+a'x + t = hi,      0 <= t <= hi - lo
+```
+so `s` stays strictly one-sided everywhere and `rsy = -s.*y_I - mu*1` remains
+correct as written. Giving `s` a finite upper bound instead would make it
+two-sided, needing a second dual plus matching residual, step-length test and mu
+term across Modules 6, 7, 8, 9, 14 and 16. Splitting the row into `a'x <= hi` and
+`-a'x <= -lo` is worse still: the two rows are negatives, so their 2x2 block in
+`A*Theta*A^T` is singular, held together only by a slack diagonal that vanishes
+exactly at convergence.
+
+**Negate BOTH c and Q for a maximization.** The canonical form is a minimization.
+A concave maximization arrives with Q NEGATIVE semidefinite, and
+`max c'x + 1/2 x'Qx` equals `min (-c)'x + 1/2 x'(-Q)x`, so `-Q` is the PSD matrix
+the stated scope promises. Negating `c` alone leaves the factorization facing an
+indefinite matrix it was told it would never see. Record `NegateObjective`; the
+objective constant is negated with them and Module 17 inverts it.
+
+## 3. Matrix Analyzer
+**Re-runnable, and it must be re-run.** MatrixAnalysis is a pure function of the matrix
+given to it, and goes stale the moment a stage changes that matrix. Module 4 changes
+free_columns directly (free column singleton substitution exists to reduce it), and
+dense_columns and empty_rows with it. Module 9 must consume the analysis of the model it
+will actually factorize -- after presolve and scaling -- not the ingestion-time one.
+
+Input Matrix -> MatrixAnalysis. Compute rows, columns, nnz, density, symmetry, dense columns,
+free/fixed column counts, empty rows/columns, singleton rows/columns, value dynamic range,
+format and storage information. Support Dense/CSR/CSC. No universal density threshold.
+
+free_columns feeds the Module 9 path choice; fixed_columns and empty_rows feed Modules 2
+and 4.
+
+## 4. Presolver
+Input Problem -> simplified Problem + TransformRecord. Safe reversible reductions: empty
+rows/columns, fixed variables, simple redundant rows, bound tightening, obvious infeasibility.
+Preserve reconstruction information.
+
+**Free column singleton substitution.** A free variable appearing in exactly one row is an
+explicitly-written slack and substitutes out exactly. This is the cheapest way to remove
+free-variable pressure at the source rather than regularizing around it. gas11 has 375 free
+columns and 351 singleton columns, which strongly suggests most of them are this pattern.
+
+**Re-check empty rows after every reduction pass.** This module GENERATES them: fixing a
+variable or eliminating a singleton can leave a row with no entries. Module 2 cleared the
+model on entry, so any empty row present on exit was created here, and it must be resolved
+(dropped, or reported INFEASIBLE) before the model moves on.
+
+The Presolver reduces work; it is not what makes the model solvable. That is Module 2, with
+Module 6 verifying.
+
+## 5. Scaler
+Input Problem -> scaled Problem + TransformRecord. Scale A,Q,c,row bounds and column bounds
+consistently. Preserve inverse scaling. Runs BEFORE regularization parameters are chosen —
+delta_p and delta_d are relative to scaled magnitudes.
+
+## 6. Initializer
+Input Problem -> SolverState. Initialize x,s,y,z,v strictly inside all active bounds/slacks.
+Maintain `x-l>0`, `u-x>0`, `s>0`, `z>0`, `v>0`, `slack_dual(y_I)>0`; equality-row y is
+unrestricted. Initialize all Mehrotra fields.
+
+**This module also VERIFIES the startability contract before building a SolverState.** An
+O(m+n) scan:
+```text
+no column with col_lower[j] == col_upper[j]      -> else NUMERICAL_FAILURE, naming column j
+no row of A entirely zero                        -> else NUMERICAL_FAILURE, naming row i
+```
+Module 2 establishes the contract and Module 4 re-establishes it, but neither is the last
+module to touch the model, and ANY stage that removes a column can create an empty row by
+taking away the last entry some row had.
+
+Measured on our corpus, inside Module 2 itself, one stage before the Presolver runs:
+
+```text
+instance    empty rows BEFORE    rows dropped AFTER    created by substitution
+gas11               0                    2                      2
+80bau3b            25                   27                      2
+standata            0                    1                      1
+```
+
+Three instances had NO empty row before fixed columns were substituted out. A check made
+before the substitution rather than after would have passed a singular model on.
+
+Module 6 is the right owner because it is the module that cannot do its job when the contract
+is broken: it is asked to place a point strictly inside every bound, which is impossible for a
+fixed column. Fail here, loudly, naming the offending index — not twenty minutes later as an
+unexplained factorization breakdown. The scan also catches a violation introduced by any
+upstream module, not only the two anticipated.
+
+## 7. Residual Calculator
+Input Problem + SolverState. Compute:
+```text
+rp_E=A_E*x-b_E
+rp_I=A_I*x+s-b_I
+rd=Q*x+c-A^T*y-z+v
+rxz=(x-l).*z-mu*1
+ruv=(u-x).*v-mu*1
+rsy=-s.*y_I-mu*1
+```
+Omit pairs for infinite bounds. Return vectors and infinity norms.
+
+## 8. Predictor-Corrector Controller
+Implement Mehrotra: affine solve, affine primal/dual steps, mu_aff,
+`sigma=clamp((mu_aff/mu)^3,0,1)`, corrector RHS including cross terms for lower/upper/slack
+pairs, corrector solve, final directions and separate primal/dual step lengths. Reuse
+structure where valid.
+
+## 9. KKT / Newton System Builder
+Build the bounded-variable Newton system. Return Matrix + rhs + ReductionDescriptor. Never
+hardcode dy universally.
+
+**Build Theta^-1, never Theta.** Inverting a diagonal that can contain zero gives inf, then
+NaN through the whole matrix, and NaN compares false against every convergence threshold —
+the solve fails silently and reports MAX_ITERATIONS on a solvable problem.
+```text
+Theta^-1 = X_L^-1 Z + (U-X)^-1 V         term omitted where the bound is infinite
+Theta^-1 <- max(Theta^-1, delta_p)       elementwise, WHOLE diagonal, every iteration
+Theta    <- (Theta^-1)^-1
+```
+The floor is applied to the whole diagonal, not only to free columns. A free variable's entry
+is zero at iteration 0; the entry of any variable that ends strictly inside its bounds at the
+optimum goes to zero as well, since z_j -> 0 and v_j -> 0 there. Same failure, later arrival.
+
+**Dual regularization is separate and equally mandatory:**
+```text
+(A Theta A^T + D_s + delta_d I) dy = rhs
+```
+delta_p bounds Theta from above; it cannot help when A is rank deficient, since then
+A*Theta*A^T is singular for every Theta.
+
+**In the augmented path, both deltas move into the blocks:**
+```text
+[ -(Q + Theta^-1 + delta_p I)          A^T           ]
+[            A                 (D_s + delta_d I)     ]
+```
+There Theta^-1 is never inverted, so the floor does not apply -- delta_p replaces it, and
+is still mandatory: Q is only positive SEMIdefinite, so a free column where Q is zero gives
+the (1,1) block an entirely zero row. delta_d is mandatory for a structural reason of its
+own: D_s is zero on every EQUALITY row by construction, so the (2,2) block is singular
+across the whole equality block before rank deficiency is even considered. gas11 is 459 of
+459 equality rows.
+
+Both together make the matrix quasi-definite, which is what guarantees an LDL^T
+factorization exists for ANY symmetric permutation -- and that is exactly what lets Module
+10 fix an ordering from the sparsity pattern once and reuse it with no numerical pivoting.
+Without them the matrix is only symmetric indefinite and a fixed ordering is unsafe.
+
+LP Q=0: eliminate diagonal complementarity variables and form SPD normal equations in dy.
+General non-diagonal QP: augmented/quasi-definite symmetric KKT for LDL^T. Diagonal or
+cheaply invertible Q may use dy reduction when advantageous.
+
+**A high free-column share selects the augmented path.** There a zero entry of Theta^-1 is
+exact and harmless; the zero only hurts when dx is eliminated. Record the reason in the
+ReductionDescriptor.
+
+## 10. Ordering / Symbolic Factorization
+Own fill-reducing ordering and symbolic analysis for the reference path; prepare elimination
+tree/supernodes where useful. Reuse when the sparsity pattern is unchanged. If the chosen
+sparse backend owns analysis/reordering, avoid duplicate work.
+
+## 11. Regularization
+Owns ESCALATION only. Detect numerical breakdown, raise delta_p/delta_d above the Module 9
+floor when it occurs, return regularization metadata and event counts, provide refinement
+hooks.
+
+**This module does NOT own the Module 9 floor.** That floor covers a structural condition
+known before iteration 0, which no detector can see: a free variable produces inf/NaN before
+any condition estimate exists. Detection is the wrong mechanism for it.
+
+Parameters are scale-aware — set relative to scaled data magnitudes, with configurable floors
+in Options. The matrix dynamic range reaches 2.6e11 on gas11 before scaling, so an absolute
+constant is meaningless.
+
+**Escalation must decay.** The handoff between this module and Module 9 is:
+```text
+on breakdown:     delta <- min(delta * escalation_factor, delta_max)  then refactor
+on a clean solve: delta <- max(delta / decay_factor, delta_floor)
+```
+A pure ratchet is wrong: once escalated, every later iteration solves a system perturbed
+more than it needs and refinement pays for it in extra passes. If delta reaches delta_max
+and the factorization still fails, return NUMERICAL_FAILURE -- past that the direction is
+too perturbed to be a Newton step. Record escalations and decays in Diagnostics.
+
+## 12. Linear Solver
+Input Matrix + rhs + ReductionDescriptor + symbolic information. LP: SPD/Cholesky-type path.
+General QP: symmetric-indefinite LDL^T path. Provide CPU reference, GPU implementation,
+residual verification, failure detection and iterative refinement. Use CUDA numerical
+libraries only as primitives.
+
+**Refinement is against the UNREGULARIZED residual.** The regularized system is a nearby
+problem, not the intended one; refining against the regularized residual converges accurately
+to the wrong system. Report the number of passes.
+
+## 13. Newton Direction Recovery
+Use ReductionDescriptor. LP normal equations: recover dy, then dx,ds,dz,dv. Augmented QP:
+recover/use complete direction set. Never assume dy is always solved. Verify all recovered
+directions against the Newton equations.
+
+## 14. Step-Length Calculator
+Compute separate `alpha_primal` and `alpha_dual`. Enforce:
+```text
+lower < x+ap*dx < upper
+s+ap*ds > 0
+z+ad*dz > 0
+v+ad*dv > 0
+slack_dual(y_I+ad*dy_I) > 0            // slack_dual(y) = -y
+```
+Do not constrain equality-row y. Handle infinite bounds and use a safety factor. Use the
+slack_dual helper rather than writing the negation inline — a `-y > 0` test is easy to write
+backwards.
+
+## 15. State Updater
+Update:
+```text
+x <- x + ap*dx
+s <- s + ap*ds
+y <- y + ad*dy
+z <- z + ad*dz
+v <- v + ad*dv
+```
+Preserve affine/corrector information until Diagnostics records the iteration.
+
+## 16. Mu / Barrier Controller
+Compute:
+```text
+mu = [sum((x-l).*z)+sum((u-x).*v)+sum((-s).*y_I)] / active_pair_count
+```
+Omit infinite-bound pairs. Compute mu_aff with affine steps and then
+`sigma=clamp((mu_aff/mu)^3,0,1)`. Include safeguards.
+
+## 17. Solution Reconstructor
+Input canonical solution + TransformRecord. Reverse scaling, presolve and canonicalization in
+reverse order. Three canonicalization records to undo, not two:
+
+- `RemoveFixedVariable` — reinstate x_j = l_j and derive its reduced cost from the duals.
+- `RemoveEmptyRow` — the row carries a zero dual.
+- `BoundedSlack` — the RANGE column added for a ranged row is DROPPED. It is not an
+  original variable and has no place in the reported solution. The row's reported slack is
+  recomputed from the original activity, not read from that column, so nothing is lost by
+  discarding it. Datatypes section 8 assigns TransformRecord the job of recording which
+  column belongs to which row; this is the module that consumes it.
+
+Return original variables, original objective and original-space feasibility information.
+
+**Do NOT apply a global dual sign normalization here.** Verified against HiGHS: for a
+minimization it reports a NEGATIVE dual for a `<=` row and a POSITIVE one for a `>=` row, and
+a positive reduced cost for a variable at its lower bound. That is already this solver's
+convention, so no normalization is needed at the exit.
+
+The only sign work is local and already implied by the transform stack: the Canonicalizer
+negates `>=` rows, so NegateRow records must flip those duals back during reconstruction.
+That flip is what yields the positive `>=` dual. A second, global flip on top would invert
+every inequality dual, silently: the duals stay plausible and are simply all backwards
+against any reference solver.
+
+## 18. Convergence Checker
+**Stall detection has a consumer.** After `stall_iterations` consecutive iterations with no
+meaningful progress in the convergence measures, terminate and return the BEST ITERATE
+seen, with status MAX_ITERATIONS or NOT_CONVERGED — never INFEASIBLE. Stagnation is
+evidence that this run stopped improving, not evidence about the model. That is the whole
+of what "do not infer infeasibility from stagnation" leaves room for, and without it
+`stall_iterations` is a knob with nothing reading it.
+
+Use relative, scale-aware infinity norms for primal feasibility, dual feasibility and
+complementarity/duality gap. Check iteration limit and numerical failure. Do not declare
+infeasibility from stagnation — INFEASIBLE comes only from a definite verdict (Module 2).
+
+Guard every comparison against NaN explicitly. `NaN < tol` is false, so a poisoned solve
+silently runs to the iteration limit and reports MAX_ITERATIONS on a solvable problem.
+Detect non-finite residuals and report NUMERICAL_FAILURE instead.
+
+## 19. Diagnostics
+Record residual norms, lower/upper/slack complementarity, mu, mu_aff, sigma, both step
+lengths, timings, GPU transfers, regularization events, **theta floor activations**,
+**refinement passes**, and status. The floor-activation and refinement counts are the
+evidence for any numerical-robustness claim in the submission.
+
+## 20. Logging
+Provide concise human-readable iteration output. Keep logging independent from Diagnostics
+and mathematics.
+
+## 21. Options / Parameters
+Centralize primal/dual/complementarity tolerances, max iterations, `delta_p_floor`,
+`delta_d_floor`, `regularization_escalation_factor`, `max_refinement_steps`, safety factor,
+ordering policy, linear solver policy, presolve/scaling policy and GPU settings.
+
+## Module Independence
+No module silently implements another module's job. All modules use frozen shared types and
+interfaces.
