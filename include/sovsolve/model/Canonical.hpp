@@ -92,15 +92,32 @@ struct CanonicalProblem {
   RealVector col_lower;
   RealVector col_upper;
 
-  /// Upper bounds on the inequality slacks, length num_inequality_rows().
+  /// Number of trailing columns that are RANGE columns rather than original
+  /// variables. They occupy `[num_cols() - num_range, num_cols())`.
   ///
-  /// `INF` for an ordinary one-sided row. Finite only for a RANGED row
-  /// `lo <= a'x <= hi`, which becomes `a'x + s = hi` with `0 <= s <= hi-lo`.
-  /// A bounded slack needs the same two-sided complementarity treatment as a
-  /// boxed variable, which the handoff residual `rsy = -s.*y_I - mu` does not
-  /// yet cover. No instance in our corpus has a ranged row, so this path is
-  /// implemented and unit-tested but not exercised by the benchmark set.
-  RealVector slack_upper;
+  /// A ranged row `lo <= a'x <= hi` becomes an EQUALITY plus one bounded
+  /// column:
+  ///
+  ///     a'x + t = hi,     0 <= t <= hi - lo
+  ///
+  /// which is exactly `lo <= a'x <= hi`. The alternative -- keeping the row an
+  /// inequality and giving its slack a finite upper bound -- looks cheaper but
+  /// is not: `s` would then need a second dual, an extra complementarity
+  /// residual, an extra step-length test and an extra term in `mu`, touching
+  /// the initializer, residual calculator, predictor-corrector, KKT builder,
+  /// step-length calculator and barrier controller. A bounded column needs
+  /// none of that, because `l <= x <= u` is already the form every variable is
+  /// in. One column against six modules.
+  ///
+  /// The other textbook option, splitting the row into `a'x <= hi` and
+  /// `-a'x <= -lo`, is worse than both: the two rows are negatives, so their
+  /// 2x2 contribution to `A*Theta*A'` has determinant `t^2 - t^2 = 0` and the
+  /// system is singular except for the slack diagonal -- which vanishes exactly
+  /// at convergence, when a satisfied range makes both sides tight.
+  ///
+  /// No instance in our corpus has a ranged row, so this path is unit-tested
+  /// but not exercised by the benchmark set.
+  std::size_t num_range = 0;
 
   /// Row layout: equalities first, then inequalities.
   /// `A_E` is rows `[0, num_equality)`; `A_I` is rows `[num_equality, m)`.
