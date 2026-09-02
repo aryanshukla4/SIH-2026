@@ -31,3 +31,9 @@ bench/results/*.csv
 tests/oracle/*.json
 __pycache__/
 *.pyc
+
+# Team handover / explainer pages. Generated for onboarding and shared as a
+# link; the repo's own docs/ directory is the tracked source of truth.
+*.handover.html
+handover/
+docs/handover/
