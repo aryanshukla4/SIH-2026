@@ -16,5 +16,27 @@
 #include "sovsolve/model/Transform.hpp"
 #include "sovsolve/analysis/MatrixAnalysis.hpp"
 #include "sovsolve/io/Load.hpp"
+#include "sovsolve/solver/ConvergenceChecker.hpp"
+#include "sovsolve/solver/Diagnostics.hpp"
+#include "sovsolve/solver/Initializer.hpp"
+#include "sovsolve/solver/KktSystem.hpp"
+#include "sovsolve/solver/Logging.hpp"
+#include "sovsolve/solver/PredictorCorrector.hpp"
+#include "sovsolve/solver/Regularization.hpp"
+#include "sovsolve/solver/Residuals.hpp"
+#include "sovsolve/solver/Scaler.hpp"
+#include "sovsolve/solver/SolutionReconstructor.hpp"
+#include "sovsolve/solver/SolverState.hpp"
+// GPU-boundary headers: plain C++ declarations (no CUDA-specific syntax), so
+// they compile under any C++ compiler even though their .cu bodies only
+// build under SOVSOLVE_ENABLE_CUDA.
+#include "sovsolve/solver/gpu/KktBuilder.hpp"
+#include "sovsolve/solver/gpu/LinearSolver.hpp"
+#include "sovsolve/solver/gpu/MuController.hpp"
+#include "sovsolve/solver/gpu/NewtonRecovery.hpp"
+#include "sovsolve/solver/gpu/Ordering.hpp"
+#include "sovsolve/solver/gpu/ResidualCalculator.hpp"
+#include "sovsolve/solver/gpu/StateUpdate.hpp"
+#include "sovsolve/solver/gpu/StepLength.hpp"
 
 int main() { return 0; }

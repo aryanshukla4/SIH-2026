@@ -21,6 +21,28 @@ option(SOVSOLVE_BUILD_TESTS  "Build tests"      ON)
 option(SOVSOLVE_BUILD_BENCH  "Build benchmarks" ON)
 option(SOVSOLVE_BUILD_TOOLS  "Build CLI tools"  ON)
 
+# The GPU solver core (src/solver/gpu). Off by default: it needs the CUDA
+# toolkit and, on Windows, nvcc requires MSVC as its host compiler -- so the
+# intended path is WSL2 + the Linux CUDA toolkit, via the "cuda" preset. The
+# host-only build (release/debug/asan) never needs this on.
+option(SOVSOLVE_ENABLE_CUDA "Build the CUDA solver core (needs the CUDA toolkit)" OFF)
+
+if(SOVSOLVE_ENABLE_CUDA)
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+
+  # cuDSS is not part of the stock CUDA toolkit apt package -- degrade to a
+  # message rather than a hard configure failure, same spirit as the zlib
+  # message in src/io/CMakeLists.txt.
+  find_library(SOVSOLVE_CUDSS_LIBRARY NAMES cudss)
+  if(SOVSOLVE_CUDSS_LIBRARY)
+    message(STATUS "cuDSS found: sparse-direct GPU path enabled")
+  else()
+    message(STATUS "cuDSS NOT found: sparse-direct GPU path unavailable "
+                    "(install it separately -- it does not ship with the CUDA toolkit)")
+  endif()
+endif()
+
 # --------------------------------------------------------------------------
 # Module targets.
 #
@@ -28,6 +50,7 @@ option(SOVSOLVE_BUILD_TOOLS  "Build CLI tools"  ON)
 #     core     -> (nothing)
 #     model    -> core
 #     analysis -> core
+#     solver   -> core, model, analysis
 #     io       -> core, model
 #
 # The handoff docs claim the modules are independent; nothing enforced it.
@@ -41,11 +64,12 @@ option(SOVSOLVE_BUILD_TOOLS  "Build CLI tools"  ON)
 add_subdirectory(src/core)
 add_subdirectory(src/model)
 add_subdirectory(src/analysis)
+add_subdirectory(src/solver)
 add_subdirectory(src/io)
 
 add_library(sovsolve INTERFACE)
 target_link_libraries(sovsolve INTERFACE
-  sovsolve_core sovsolve_model sovsolve_analysis sovsolve_io)
+  sovsolve_core sovsolve_model sovsolve_analysis sovsolve_solver sovsolve_io)
 
 # Tools come BEFORE tests: the oracle test runs `modeldump`, and a
 # `if(TARGET modeldump)` guard is evaluated at configure time, so a test

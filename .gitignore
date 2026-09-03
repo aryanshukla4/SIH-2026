@@ -11,6 +11,11 @@ compile_commands.json
 *.so
 *.dll
 *.pdb
+
+# CUDA build artifacts (src/solver/gpu, built only under SOVSOLVE_ENABLE_CUDA).
+*.ptx
+*.cubin
+*.fatbin
 .vs/
 .vscode/
 .idea/

@@ -29,6 +29,7 @@ ALLOWED: dict[str, set[str]] = {
     "core": set(),
     "model": {"core"},
     "analysis": {"core"},
+    "solver": {"core", "model", "analysis"},
     "io": {"core", "model"},
 }
 
