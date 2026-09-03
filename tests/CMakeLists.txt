@@ -18,6 +18,14 @@ sovsolve_add_test(core_types_test      unit/core_types_test.cpp)
 sovsolve_add_test(mps_reader_test      unit/mps_reader_test.cpp)
 sovsolve_add_test(lp_reader_test       unit/lp_reader_test.cpp)
 sovsolve_add_test(qplib_reader_test    unit/qplib_reader_test.cpp)
+sovsolve_add_test(solver_types_test    unit/solver_types_test.cpp)
+
+# gpu::compute_residuals lives in sovsolve_solver_gpu, which only exists
+# under SOVSOLVE_ENABLE_CUDA (see src/solver/CMakeLists.txt) -- registering
+# this test unconditionally would fail to link on a host-only build.
+if(SOVSOLVE_ENABLE_CUDA)
+  sovsolve_add_test(solver_gpu_algorithms_test unit/solver_gpu_algorithms_test.cpp)
+endif()
 
 # Corpus tests read real files, so they need an absolute data path -- ctest
 # runs them from the build tree, not the source tree.

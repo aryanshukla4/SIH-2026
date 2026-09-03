@@ -47,13 +47,38 @@ Status inflate_gzip(std::string_view compressed, std::vector<char>& out) {
   zs.avail_in = static_cast<uInt>(compressed.size());
 
   // Text compresses ~4x, so this usually avoids any regrowth at all.
+  //
+  // GCC 13 at -O3 reports a false-positive -Wstringop-overflow on these two
+  // vector<char>::resize() calls (widely reported against GCC 12/13, e.g.
+  // gcc.gnu.org PR108129): it claims a "size 0" destination for a buffer
+  // whose size is a runtime value, not actually zero. This code only
+  // compiles when zlib is present (SOVSOLVE_WITH_ZLIB), so it was never
+  // built under GCC until now -- MinGW/Windows builds without zlib never hit
+  // this path. Suppressed locally, around only these two calls, rather than
+  // for the whole file.
+#if defined(__GNUC__) && !defined(__clang__)
+#define SOVSOLVE_IGNORE_STRINGOP_OVERFLOW_BEGIN \
+  _Pragma("GCC diagnostic push")                \
+  _Pragma("GCC diagnostic ignored \"-Wstringop-overflow\"")
+#define SOVSOLVE_IGNORE_STRINGOP_OVERFLOW_END _Pragma("GCC diagnostic pop")
+#else
+#define SOVSOLVE_IGNORE_STRINGOP_OVERFLOW_BEGIN
+#define SOVSOLVE_IGNORE_STRINGOP_OVERFLOW_END
+#endif
+
   out.clear();
+  SOVSOLVE_IGNORE_STRINGOP_OVERFLOW_BEGIN
   out.resize(compressed.size() * 4 + 1024);
+  SOVSOLVE_IGNORE_STRINGOP_OVERFLOW_END
 
   std::size_t written = 0;
   int rc = Z_OK;
   do {
-    if (written == out.size()) out.resize(out.size() * 2);
+    if (written == out.size()) {
+      SOVSOLVE_IGNORE_STRINGOP_OVERFLOW_BEGIN
+      out.resize(out.size() * 2);
+      SOVSOLVE_IGNORE_STRINGOP_OVERFLOW_END
+    }
     zs.next_out = reinterpret_cast<Bytef*>(out.data() + written);
     zs.avail_out = static_cast<uInt>(out.size() - written);
     rc = inflate(&zs, Z_NO_FLUSH);
@@ -64,6 +89,9 @@ Status inflate_gzip(std::string_view compressed, std::vector<char>& out) {
     }
     written = out.size() - zs.avail_out;
   } while (rc != Z_STREAM_END);
+
+#undef SOVSOLVE_IGNORE_STRINGOP_OVERFLOW_BEGIN
+#undef SOVSOLVE_IGNORE_STRINGOP_OVERFLOW_END
 
   inflateEnd(&zs);
   out.resize(written);

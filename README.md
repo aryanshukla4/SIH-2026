@@ -213,6 +213,47 @@ every module exposes the same `include/` root.
 
 ---
 
+## Solver core (Modules 5-20)
+
+The interior-point solver itself -- Scaler, Initializer, KKT builder, linear
+solver, predictor-corrector loop, and everything downstream of it -- lives
+under `include/sovsolve/solver/` and `src/solver/`. It is currently a
+**skeleton**: types and module boundaries exist and compile, and a few
+modules have real algorithm code -- `Initializer` (Module 6, a bound-midpoint
+strictly-interior starting point), `gpu::compute_residuals` (Module 7, the
+six Newton-system residuals -- currently host-executed, see the header
+comment on `gpu/ResidualCalculator.hpp` for why), `Regularization`
+(escalate/decay bookkeeping), `Diagnostics` (CSV/JSON export) and `Logging`.
+Everything else -- KKT assembly, the linear solver, Newton recovery, step
+length, state update, mu control, the predictor-corrector loop itself --
+still returns `ErrorCode::NotImplemented`.
+
+The GPU-boundary modules (`src/solver/gpu/*.cu` -- residuals, KKT assembly,
+ordering, linear solve, Newton recovery, step length, state update, mu
+control) are written directly as CUDA C++ from the start, per
+`architecture.txt`'s GPU-boundary text. They only build under
+`SOVSOLVE_ENABLE_CUDA=ON` (the `cuda` CMake preset, targeting WSL2 + the
+Linux CUDA toolkit -- `nvcc` on native Windows needs MSVC as its host
+compiler, which this project avoids). The host-only build
+(`release`/`debug`/`asan` presets) stays fully self-contained without the
+CUDA toolkit present.
+
+```sh
+cmake --preset cuda && cmake --build build-cuda   # WSL2, CUDA toolkit installed
+```
+
+**Deviation from the locked v3 spec, recorded here rather than silently
+absorbed:** `module.txt` Module 12 requires *both* a CPU reference
+implementation and a GPU implementation for the linear solver, specifically
+so results can be cross-checked against each other. This build is CUDA-only
+-- there is no CPU reference path. That means a wrong answer from the linear
+solver has nothing independent to diff against except the external oracle
+(`scripts/oracle_check.py`, which validates the ingestion layer, not the IPM
+loop). Worth reconsidering if numerical bugs in the solver core turn out to
+be hard to isolate with only one implementation.
+
+---
+
 ## On the "from scratch" constraint
 
 PS 26119 requires that the solver "shall not be built upon any existing open

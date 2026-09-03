@@ -21,17 +21,30 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "SOVSOLVE_SANITIZE": "ON"
       }
+    },
+    {
+      "name": "cuda",
+      "generator": "Ninja",
+      "binaryDir": "build-cuda",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SOVSOLVE_ENABLE_CUDA": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "native"
+      }
     }
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "release" },
     { "name": "debug", "configurePreset": "debug" },
-    { "name": "asan", "configurePreset": "asan" }
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "cuda", "configurePreset": "cuda" }
   ],
   "testPresets": [
     { "name": "release", "configurePreset": "release",
       "output": { "outputOnFailure": true } },
     { "name": "asan", "configurePreset": "asan",
+      "output": { "outputOnFailure": true } },
+    { "name": "cuda", "configurePreset": "cuda",
       "output": { "outputOnFailure": true } }
   ]
 }
