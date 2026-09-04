@@ -21,7 +21,6 @@
 #include "sovsolve/solver/Initializer.hpp"
 #include "sovsolve/solver/KktSystem.hpp"
 #include "sovsolve/solver/Logging.hpp"
-#include "sovsolve/solver/PredictorCorrector.hpp"
 #include "sovsolve/solver/Regularization.hpp"
 #include "sovsolve/solver/Residuals.hpp"
 #include "sovsolve/solver/Scaler.hpp"
@@ -35,7 +34,9 @@
 #include "sovsolve/solver/gpu/MuController.hpp"
 #include "sovsolve/solver/gpu/NewtonRecovery.hpp"
 #include "sovsolve/solver/gpu/Ordering.hpp"
+#include "sovsolve/solver/gpu/PredictorCorrector.hpp"
 #include "sovsolve/solver/gpu/ResidualCalculator.hpp"
+#include "sovsolve/solver/gpu/Solve.hpp"
 #include "sovsolve/solver/gpu/StateUpdate.hpp"
 #include "sovsolve/solver/gpu/StepLength.hpp"
 

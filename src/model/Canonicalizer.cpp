@@ -480,6 +480,14 @@ core::Expected<Solution> recover_solution(const Problem& original,
   std::vector<Index> row_map(m0, kNone);
   std::vector<bool> row_negated(m0, false);
 
+  // Scaling (Scaler, Module 5) pushes onto this SAME stack, keyed by
+  // CANONICAL row/column index rather than original index -- it runs after
+  // canonicalization, on the canonicalized problem. Default 1.0 (identity)
+  // covers both a Scaler that never ran and a canonical index a record
+  // didn't reach.
+  std::vector<Real> col_scale(canonical.num_cols(), 1.0);
+  std::vector<Real> row_scale(canonical.num_rows(), 1.0);
+
   for (const auto& rec : transforms.records()) {
     if (rec.primary == kNone) continue;
     const auto k = static_cast<std::size_t>(rec.primary);
@@ -496,6 +504,12 @@ core::Expected<Solution> recover_solution(const Problem& original,
       case TransformKind::NegateRow:
         if (k < m0) row_negated[k] = true;
         break;
+      case TransformKind::ColumnScaling:
+        if (k < col_scale.size()) col_scale[k] = rec.value;
+        break;
+      case TransformKind::RowScaling:
+        if (k < row_scale.size()) row_scale[k] = rec.value;
+        break;
       default:
         break;
     }
@@ -508,10 +522,36 @@ core::Expected<Solution> recover_solution(const Problem& original,
   s.from_best_iterate = canonical_solution.from_best_iterate;
   s.quality = canonical_solution.quality;
 
-  const auto& xc = canonical_solution.x;
-  const auto& yc = canonical_solution.y;
-  const auto& zc = canonical_solution.z;
-  const auto& vc = canonical_solution.v;
+  // Unscale into true canonical-space values -- x = col_scale * x', y =
+  // row_scale * y', z = z'/col_scale, v = v'/col_scale (derived from
+  // stationarity in the scaled system matching stationarity in the
+  // unscaled one; see Scaler.hpp). All four stay the raw canonical_solution
+  // values when Scaler never ran, since col_scale/row_scale default to 1.0.
+  //
+  // The OBJECTIVE below deliberately uses canonical_solution.x directly
+  // (still scaled), not this unscaled xc: the objective is scale-invariant
+  // only for a MATCHED pair, and canonical.c/canonical.Q are the scaled
+  // coefficients Scaler left in place. Pairing scaled c/Q with unscaled x
+  // here would silently reintroduce the scale factor into the reported
+  // objective.
+  core::RealVector xc(canonical_solution.x.size());
+  for (std::size_t j = 0; j < xc.size(); ++j) {
+    xc[j] = canonical_solution.x[j] * (j < col_scale.size() ? col_scale[j] : 1.0);
+  }
+  core::RealVector yc(canonical_solution.y.size());
+  for (std::size_t i = 0; i < yc.size(); ++i) {
+    yc[i] = canonical_solution.y[i] * (i < row_scale.size() ? row_scale[i] : 1.0);
+  }
+  core::RealVector zc(canonical_solution.z.size());
+  for (std::size_t j = 0; j < zc.size(); ++j) {
+    const Real cs = j < col_scale.size() && col_scale[j] != 0.0 ? col_scale[j] : 1.0;
+    zc[j] = canonical_solution.z[j] / cs;
+  }
+  core::RealVector vc(canonical_solution.v.size());
+  for (std::size_t j = 0; j < vc.size(); ++j) {
+    const Real cs = j < col_scale.size() && col_scale[j] != 0.0 ? col_scale[j] : 1.0;
+    vc[j] = canonical_solution.v[j] / cs;
+  }
 
   const auto at = [](const core::RealVector& v, Index i) -> Real {
     if (i == kNone) return 0.0;
@@ -623,7 +663,8 @@ core::Expected<Solution> recover_solution(const Problem& original,
 
   // -- objective, back in the original sense -------------------------------
   {
-    Real obj = canonical.objective(xc.span());
+    // canonical_solution.x, NOT xc: see the comment where xc is built above.
+    Real obj = canonical.objective(canonical_solution.x.span());
     obj += canonical.obj_offset;
     if (canonical.objective_negated) obj = -obj;
     s.objective = obj + original.obj_constant;

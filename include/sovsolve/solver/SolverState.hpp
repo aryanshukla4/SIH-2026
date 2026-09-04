@@ -9,6 +9,7 @@
 #ifndef SOVSOLVE_SOLVER_SOLVER_STATE_HPP
 #define SOVSOLVE_SOLVER_SOLVER_STATE_HPP
 
+#include <algorithm>
 #include <cstddef>
 
 #include "sovsolve/core/Types.hpp"
@@ -53,6 +54,17 @@ struct SolverState {
 /// of `y` through this helper so a sign test always reads positively; writing
 /// `-y_i > 0` inline is easy to get backwards (module.txt Module 14).
 [[nodiscard]] inline Real slack_dual(Real y_i) noexcept { return -y_i; }
+
+/// Floors a complementarity gap (x-l, u-x, or -y_I) away from exact 0.0
+/// before it's used as a divisor (KktBuilder.cu, NewtonRecovery.cu). The
+/// ratio test keeps these strictly positive in exact arithmetic, but as mu
+/// approaches double precision's noise floor (confirmed on shell.mps: mu hit
+/// 9.66e-12 immediately before the crash), `x + alpha*dx` can round to
+/// EXACTLY the bound, turning z/(x-l) into a genuine 0/0 = NaN that silently
+/// poisons the whole KKT system. 1e-30 is far below any gap a well-scaled
+/// problem produces legitimately, so this only ever engages at the precision
+/// floor itself.
+[[nodiscard]] inline Real safe_gap(Real g) noexcept { return std::max(g, Real{1e-30}); }
 
 }  // namespace sovsolve::solver
 

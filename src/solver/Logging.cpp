@@ -6,8 +6,11 @@ void log_iteration(const IterationRecord& record, const LogOptions& options,
                     std::FILE* out) {
   if (options.level == LogOptions::Level::Silent) return;
 
-  std::fprintf(out, "iter %3zu  obj % .8e  mu % .3e  ap %.3f  ad %.3f\n",
-               record.iteration, record.objective, record.mu, record.alpha_primal,
+  std::fprintf(out,
+               "iter %3zu  obj % .8e  mu % .3e  mu_aff % .3e  sigma %.3f  rp %.3e  "
+               "rd %.3e  ap %.3f  ad %.3f\n",
+               record.iteration, record.objective, record.mu, record.mu_aff, record.sigma,
+               record.primal_residual_inf, record.dual_residual_inf, record.alpha_primal,
                record.alpha_dual);
 
   if (options.level == LogOptions::Level::Debug) {

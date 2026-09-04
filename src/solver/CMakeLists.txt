@@ -1,12 +1,13 @@
 add_library(sovsolve_solver STATIC
   Scaler.cpp
   Initializer.cpp
-  Regularization.cpp
-  PredictorCorrector.cpp
   SolutionReconstructor.cpp
   ConvergenceChecker.cpp
   Diagnostics.cpp
   Logging.cpp)
+# Regularization is header-only (see Regularization.hpp) and PredictorCorrector
+# lives under gpu/ -- it orchestrates GPU module calls, so it belongs in
+# sovsolve_solver_gpu, not here.
 
 target_include_directories(sovsolve_solver PUBLIC
   $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>)
@@ -28,13 +29,23 @@ if(SOVSOLVE_ENABLE_CUDA)
     gpu/NewtonRecovery.cu
     gpu/StepLength.cu
     gpu/StateUpdate.cu
-    gpu/MuController.cu)
+    gpu/MuController.cu
+    gpu/PredictorCorrector.cu
+    gpu/Solve.cu)
 
   target_include_directories(sovsolve_solver_gpu PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>)
   target_link_libraries(sovsolve_solver_gpu PUBLIC
-    sovsolve_core sovsolve_model sovsolve_analysis
+    sovsolve_core sovsolve_model sovsolve_analysis sovsolve_solver
     CUDA::cublas CUDA::cusparse CUDA::cusolver)
+  # This is a ONE-WAY edge: sovsolve_solver_gpu -> sovsolve_solver, needed
+  # because gpu/Solve.cu (the top-level solve_problem() entry point) calls
+  # host-only functions (canonicalize, initialize, ConvergenceChecker,
+  # reconstruct_solution) alongside gpu::run_iteration. It is safe exactly
+  # because it is one-way: sovsolve_solver does not, and must not, link
+  # back (see Regularization.hpp's header comment) -- and this library
+  # already requires the CUDA toolkit to exist at all, so depending on the
+  # always-available host library costs it nothing it doesn't already have.
   # Not CUDA_SEPARABLE_COMPILATION: these .cu files are plain host C++ so far
   # (see the GPU module headers' STUB notes) with no __global__/__device__
   # code calling across translation units, so relocatable device code buys
@@ -47,5 +58,8 @@ if(SOVSOLVE_ENABLE_CUDA)
     target_compile_definitions(sovsolve_solver_gpu PUBLIC SOVSOLVE_WITH_CUDSS)
   endif()
 
-  target_link_libraries(sovsolve_solver PUBLIC sovsolve_solver_gpu)
+  # Still no edge the OTHER way (sovsolve_solver -> sovsolve_solver_gpu):
+  # nothing in the host library calls a GPU function. Both PredictorCorrector
+  # and Solve (the top-level entry point) needed to, and both live in
+  # sovsolve_solver_gpu instead, for exactly this reason.
 endif()

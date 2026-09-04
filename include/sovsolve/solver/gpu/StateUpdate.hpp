@@ -12,7 +12,8 @@ namespace sovsolve::solver::gpu {
 
 using core::Status;
 
-/// STUB: signature only.
+/// Applies `state.alpha_primal`/`state.alpha_dual` (set by
+/// gpu::compute_step_lengths) to `state`'s direction fields in place.
 [[nodiscard]] Status apply_step(SolverState& state);
 
 }  // namespace sovsolve::solver::gpu

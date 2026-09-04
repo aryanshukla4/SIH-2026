@@ -222,11 +222,281 @@ under `include/sovsolve/solver/` and `src/solver/`. It is currently a
 modules have real algorithm code -- `Initializer` (Module 6, a bound-midpoint
 strictly-interior starting point), `gpu::compute_residuals` (Module 7, the
 six Newton-system residuals -- currently host-executed, see the header
-comment on `gpu/ResidualCalculator.hpp` for why), `Regularization`
-(escalate/decay bookkeeping), `Diagnostics` (CSV/JSON export) and `Logging`.
-Everything else -- KKT assembly, the linear solver, Newton recovery, step
-length, state update, mu control, the predictor-corrector loop itself --
-still returns `ErrorCode::NotImplemented`.
+comment on `gpu/ResidualCalculator.hpp` for why), `gpu::build_kkt` (Module 9,
+the augmented/quasi-definite KKT system derived from `FORMULATION.md`
+sections 7 and 10.2 -- assembly only, no factorization yet), `gpu::solve`
+(Module 12, an actual GPU factorization via `cusolverDnDgetrf`/`Dgetrs` --
+the first code in this project that runs real work on the GPU rather than
+just compiling under `nvcc`), `gpu::recover_newton_direction` (Module 13,
+un-eliminating `ds`/`dz`/`dv` from the augmented solve's `[dx; dy]`),
+`Regularization` (escalate/decay bookkeeping), `Diagnostics` (CSV/JSON
+export) and `Logging`. Everything else -- step length, state update, mu
+control, the predictor-corrector loop itself -- still returns
+`ErrorCode::NotImplemented`.
+
+`recover_newton_direction`'s test (`solver_gpu_algorithms_test.cpp`) verifies
+the recovered directions against the *original* six-block Newton system
+(`FORMULATION.md` 7), not just by re-deriving the same formulas the
+implementation uses. That surfaced a real, exactly-quantifiable gap: since
+`build_kkt` regularizes the (1,1)/(2,2) diagonal blocks with `delta_p`/
+`delta_d`, the solved `(dx, dy)` satisfy the *regularized* system, not the
+true one, by precisely `-delta_p * dx_j` (row 1) and `-delta_d * y_I * dy_I`
+(row 6) -- exactly the gap `FORMULATION.md` 10.1's iterative-refinement
+requirement exists to correct. The test asserts that exact relationship
+rather than a loosened tolerance.
+
+`gpu::compute_step_lengths` (Module 14, `FORMULATION.md` 8) and
+`gpu::apply_step` (Module 15) are also real -- the separate primal/dual
+ratio tests, the `eta` safety factor, and the equality-row `y` exclusion
+from the dual ratio test (an unrestricted-sign quantity has no ratio to
+test).
+
+**A full Mehrotra predictor-corrector iteration now runs**:
+`gpu::update_mu`/`gpu::compute_mu_at_trial_point` (Module 16) and
+`gpu::run_iteration` (Module 8, `include/sovsolve/solver/gpu/
+PredictorCorrector.hpp`) orchestrate every module above into one real IPM
+step -- affine solve, affine step lengths at `eta=1`, `mu_aff`, `sigma =
+clamp((mu_aff/mu)^3, 0, 1)`, the corrector residuals with Mehrotra's
+second-order cross terms folded in by hand, corrector solve, final step
+lengths at the real `eta`, state update. `solver_gpu_algorithms_test.cpp`
+checks this isn't just plumbing: it runs one full iteration on a small LP and
+confirms the primal residual actually shrinks afterward -- a real Newton
+step toward feasibility, not just a function that returns `Status::Ok()`.
+
+Two things worth knowing:
+- `PredictorCorrector` lives under `gpu/`, not `src/solver/` directly --
+  it calls GPU-boundary functions, so (like every other module that does)
+  it belongs in `sovsolve_solver_gpu`. `RegularizationController`
+  (`Regularization.hpp`) became header-only so this doesn't create a link
+  cycle between the host and GPU solver libraries; see that header's
+  comment for the full reasoning.
+- Module 8's "reuse structure where valid" (module.txt) -- reusing the
+  affine solve's factorization for the corrector solve -- is **not**
+  implemented. The dense cuSOLVER stopgap (`LinearSolver.hpp`) factorizes
+  from scratch both times; real reuse needs the sparse solver this project
+  does not have yet.
+
+**A real `solve_problem()` entry point now exists and returns correct
+answers.** `gpu::solve_problem` (`include/sovsolve/solver/gpu/Solve.hpp`) is
+the whole pipeline: `canonicalize -> scale -> initialize -> [run_iteration +
+ConvergenceChecker] -> reconstruct_solution`. `ConvergenceChecker` (Module
+18, `FORMULATION.md` 9) is real now too -- the three relative infinity-norm
+criteria, explicit NaN guards (a poisoned residual reports `NumericalError`
+directly rather than silently running to `MaxIterations`), and stall
+detection. On stall or the iteration limit the returned `Solution` is the
+best iterate seen, not the last one, with `from_best_iterate` set.
+
+**Solution mapping itself was not rebuilt here** -- it already existed,
+correct and tested, as part of the ingestion layer:
+`model::recover_solution()` (`Canonicalizer.cpp`) handles primal/dual
+recovery, the sign flips for negated rows, reduced-cost reconstruction for
+substituted columns, and bound-violation checking against the *original*
+problem, and `solver::reconstruct_solution()` is a thin wrapper over it. The
+only new piece was packaging a `SolverState` into a canonical-space
+`Solution` for that existing function to consume.
+
+`solver_gpu_algorithms_test.cpp`'s capstone test calls `solve_problem()` on
+a small LP (`min x1+x2` s.t. `x1+x2=10`, `0<=x1,x2<=8`) and checks the
+result reaches `SolverStatus::Optimal` with the correct objective and a
+feasible point -- the first test in this project that exercises the entire
+pipeline through the public entry point rather than one module at a time.
+
+Two more architecture notes from this pass:
+- `gpu::Solve` needed both host-only functions (`canonicalize`,
+  `initialize`, `ConvergenceChecker`, `reconstruct_solution`) and
+  `gpu::run_iteration`, so `sovsolve_solver_gpu` now links `sovsolve_solver`
+  -- a one-way edge (`src/solver/CMakeLists.txt` explains why it's safe and
+  `sovsolve_solver` must not link back).
+- What's left before this is a *complete* solver: the normal-equations LP
+  path (Module 9's cheaper alternative), a sparse (not dense) linear solver,
+  iterative refinement, and `Unbounded`/`Nonconvex` detection -- none of
+  which block a correct answer on a well-behaved small problem, all of
+  which matter for real Netlib/MIPLIB-sized instances.
+
+---
+
+## Running against real benchmarks -- status
+
+The pipeline had never been run on an actual Netlib instance before this
+pass (every earlier test was a hand-built toy problem). It doesn't converge
+yet. `tools/solve` (below) exists specifically to make this checkable.
+
+**`Scaler` (Module 5) is now real** -- alternating geometric-mean row/column
+scaling (`Scaler.hpp`/`.cpp`), applied to `A`, `Q`, `b`, `c`, and both bound
+vectors, with the inversion (`x = col_scale*x'`, `y = row_scale*y'`,
+`z = z'/col_scale`, `v = v'/col_scale`) implemented in
+`model::recover_solution()` itself -- not in a wrapper, per the
+`TransformStack`'s own original design (scaling records push onto the same
+stack canonicalization does, keyed by *canonical* index since scaling runs
+after canonicalization). The objective computation is scale-invariant only
+for a matched scaled/unscaled pair, which caught a real mismatch risk while
+writing it -- documented in the code where it's easy to reintroduce.
+Confirmed correct: the existing full-pipeline test (`min x1+x2` s.t.
+`x1+x2=10`) still reaches the exact right answer with real scaling now
+active, not the identity no-op it exercised before.
+
+**Scaling alone did not fix `afiro`** (the smallest Netlib LP, 27 rows, 32
+columns, all lower-bounded columns, a mild 22.7x coefficient range --
+structurally simple). `mu` exploded geometrically (iteration 9 reached
+`1e10`) and step lengths stayed pinned near zero. A synthetic problem mixing
+equality and inequality rows (something no earlier test did) converges
+perfectly with the same code, which ruled out a row-type indexing bug.
+
+**Root-caused, not guessed**: dumped the actual KKT matrix at two points and
+checked both against an independent `numpy` solve. At iteration 0 (affine
+solve), `cond(A) = 17` -- well-conditioned, and the GPU solution matched
+`numpy` to `1e-13`, confirming `KktBuilder`/`LinearSolver`/`NewtonRecovery`
+are all correct. At iteration 8's corrector solve, `cond(A) = 1.65e15` --
+past double precision's ~1e16 noise floor. `cusolverDnDgetrf` reported
+`info=0` (no error) the entire time; the returned "solution" (magnitude
+~1e11) was pure rounding noise, not signal, and that's exactly where `mu`
+jumped from `6e6` to `1.46e10`. Mechanism: `Theta^-1_j = z_j/(x_j-l_j)` grows
+legitimately as a bound-hugging variable's dual rises, and nothing
+counteracted it -- `RegularizationController.escalate()`/`.decay()` were
+tested in isolation but had zero call sites in `PredictorCorrector.cu` or
+`Solve.cu`; `delta_p`/`delta_d` sat at the `1e-8` floor for the whole solve.
+
+**Fixed**: `solve()` (`LinearSolver.cu`) now reports the Dgetrf factor's pivot
+growth ratio (`max|U_ii| / min|U_ii|`, read off the factor for free via a
+strided `cudaMemcpy2D` -- no extra solve) as `LinearSolveResult::pivot_ratio`.
+`solve_newton_system` (`PredictorCorrector.cu`) checks it against
+`Options::IpmOptions::max_pivot_ratio` (default `1e10`): over that, it calls
+`regularization.escalate()` and refactors with the larger delta (looping
+until clean or `escalate()` reports `delta_max` reached, at which point it
+reports `NumericalError`); under that, it calls `regularization.decay()`.
+`IterationRecord::regularization_events` is now wired to the count. Verified:
+all 13 tests still pass (including the 117-check GPU algorithms suite,
+unchanged), and on `afiro`, `mu` no longer explodes -- it plateaus around
+`1e5` instead of reaching `1e10`.
+
+**`afiro` didn't converge with escalation alone**, and that turned out to be a
+genuinely different, now-isolated problem: instrumented `compute_step_lengths`
+to report which variable/slack binds the primal ratio test each iteration.
+One inequality-row slack's ratio geometrically collapsed every iteration it
+bound (`s=1.25 -> 6.3e-3 -> 3.1e-5 -> 1.6e-7 -> ...`) while its Newton
+direction (`ds`) stayed large-negative (~-40 to -400) at every single step --
+the corrector kept trying to overshoot past that slack's bound, the ratio
+test correctly clipped it, but the step never settled near the boundary.
+`sigma` was pinned at `1.000` (full centering -- Mehrotra's heuristic
+correctly detecting the affine step was making things worse) for most of the
+run, so this wasn't a missing-centering bug; centering was already maximally
+conservative and it still wasn't enough.
+
+**Root cause, confirmed by instrumenting the actual cross-term values**: the
+Mehrotra second-order correction (`rxz/ruv/rsy += dx_aff .* dz_aff` etc.,
+`PredictorCorrector.cu`) is a Taylor-expansion remainder -- theoretically
+`o(mu)`, a small refinement on top of the `sigma*mu` target. With nothing
+bounding it, on a degenerate pair (the affine step itself already extreme --
+exactly what a crude `x_j=1` start produces) it can be 1-2+ orders of
+magnitude larger than `mu` itself and completely override the target instead
+of refining it. Confirmed on afiro: cross terms of `-5.2e3` against `mu=1.0`,
+and `1.0e6` against `mu=5.9e4`, at precisely the pair whose step length
+collapsed. **Fixed**: each cross term is now clamped to `[-mu, mu]` before
+being added -- keeps it a refinement, matches its theoretical role, doesn't
+touch the base `sigma*mu` target at all. `afiro` now reaches `Optimal` in 15
+iterations, `obj=-464.75314223` against the published `-464.75314286`.
+
+**Two more real bugs found by running the full 19-instance local Netlib set**
+(not just afiro) after the fix above, rather than assuming one fix cures
+everything:
+
+1. `Solve.cu`'s `dual_obj` was just `b'y`. Derived from the same six-block
+   system (substituting stationarity + primal feasibility into `c'x`): at
+   convergence `c'x -> b'y + l'z - u'v - x'Qx`, not `b'y` alone. Any problem
+   with a finite, active bound (nearly all of them) has a permanent,
+   unclosable "gap" with the old formula even at a truly optimal point --
+   `avgas`/`egout`/`rgn` all hit residuals at `~1e-12` yet reported
+   `NotConverged` purely because of this. Fixed: `dual_objective()` now
+   includes `l'z - u'v` (finite-bound terms only) and `-x'Qx` for QP.
+2. `PredictorCorrector.cu` treated "pivot ratio still high at `delta_max`" as
+   fatal (`NumericalError`), discarding the whole solve. But architecture.txt's
+   "at delta_max with factorization still failing" means exact singularity
+   (already a separate, hard `Expected` failure from `solve()`) -- a merely
+   still-elevated pivot ratio at `delta_max` is the *expected*, harmless
+   terminal-phase signature of a converging point (`Theta^-1` naturally spikes
+   for a tightly-bound variable right at the solution) far more often than a
+   real breakdown. `avgas`/`egout`/`rgn` were one iteration from `Optimal` and
+   got hard-aborted by this. Fixed: accept the direction instead of erroring;
+   the outer loop's best-iterate tracking is what actually guards against a
+   bad step doing damage. (Also fixed, same investigation: `Solve.cu` used to
+   discard the whole solve -- including an already-excellent best iterate --
+   the instant `run_iteration` returned any error. It now falls back to the
+   best iterate found so far, same philosophy the code already used for a
+   stall.)
+
+**A third, separate crash** turned up on `shell.mps` after the above:
+`mu_aff`/`sigma` went `NaN` at iteration 56, right as `mu` reached `9.66e-12`
+-- the edge of double precision for this problem's scale. Root cause: as a
+complementarity gap (`x-l`, `u-x`, or `-y_I`) shrinks toward that noise floor,
+`x + alpha*dx` can round to *exactly* the bound, turning `z/(x-l)` (or the
+analogous terms in `KktBuilder.cu`'s RHS and `NewtonRecovery.cu`'s `dz`/`dv`)
+into a genuine `0/0 = NaN` that silently poisons the whole KKT system --
+and NaN comparisons are false, so the step-length ratio test doesn't catch
+it either; it just poisons the state via the next `apply_step`. Fixed: a
+`safe_gap()` helper (`SolverState.hpp`, next to `slack_dual()`) floors these
+gaps at `1e-30` before they're used as a divisor -- far below any legitimate
+gap, so it only ever engages at the precision floor. `shell.mps` no longer
+crashes; it now reaches `Optimal` (with `--stall=40`) matching the published
+`1.2088253460e9`.
+
+**Current state, the full local 19-instance Netlib set** (default settings,
+`--max-iter=300`): **6 reach `Optimal`** (`afiro`, `avgas`, `chip`, `egout`,
+`flugpl`, `rgn`) -- `shell` makes 7 with a slightly relaxed `--stall`. Several
+more are essentially converged but plateau just above the `1e-8` tolerance
+even given 4x more iterations (`stair` gap `~7e-6`, `bell5` `~9e-5`,
+`etamacro`/`25fv47`/`standata` `~2-5e-4`) -- genuinely stuck, not just cut off
+early, so this is a different remaining gap, not yet root-caused.
+`adlittle`/`e226`/`gt2`/`israel` are still far from converged. `gas11`'s
+objective runs away to `-7.5e10` while staying nearly primal-feasible --
+looks like an undetected unbounded-dual direction (`SolverStatus::Unbounded`
+exists but `ConvergenceChecker` never returns it), an architectural gap, not
+a quick fix. `80bau3b`/`greenbea` time out -- almost certainly just the dense
+`O(dim^3)` stopgap being too slow for their size, not a correctness issue.
+
+### Tuning without rebuilding
+
+`tools/solve` now takes `--flag=value` overrides for every field on
+`Options` -- `--eta`, `--sigma`, `--predictor-corrector`, `--pfloor`/
+`--dfloor`, `--escalation`, `--decay`, `--delta-max`, `--max-pivot-ratio`,
+`--refine`, `--max-iter`, `--stall`, `--tol-primal`/`--tol-dual`/`--tol-gap`,
+`--time-limit`. Positional `max_iterations` still works for backward
+compatibility. `--help` prints the full list with defaults and the
+`Options.hpp` field each maps to. Output always ends with
+`solve_time_seconds=...`, meant to be the thing tuning is measured against.
+
+### `tools/solve` -- CLI entry point for testing against real files
+
+```sh
+./build-cuda/tools/solve/solve tests/data/netlib/afiro.mps [max_iterations]
+```
+
+Loads a model file, calls `solve_problem()`, and prints status/objective/
+iterations/quality in a form a benchmark script can parse. Only built under
+`SOVSOLVE_ENABLE_CUDA` (`solve_problem` needs the GPU library). Per-iteration
+diagnostics print by default (`LogOptions::Level::Iteration`, `Options`'s own
+default) -- `Logging.cpp`'s line now includes `mu`, `mu_aff`, `sigma`, and
+both residuals, which is what made the `afiro` trajectory above visible in
+the first place; `Level::Debug` additionally adds factor/solve/refine timing.
+
+`build_kkt` always selects the augmented path (`ReductionType::
+QpAugmentedKkt`); the normal-equations LP path (`FORMULATION.md` 10.1) needs
+a sparse `A * Theta * A^T` product this pass does not build, and is deferred.
+
+`gpu::solve` is a deliberate stopgap, documented in full in
+`gpu/LinearSolver.hpp`: it converts the sparse KKT matrix to **dense**
+(`O(dim^2)` memory, `O(dim^3)` time -- fine for small test problems, not for
+a real Netlib/MIPLIB instance) and factorizes with cuSOLVER's classic
+**general LU** rather than the symmetric-indefinite `LDL^T` the quasi-definite
+structure could exploit, because `getrf`/`getrs` are the most stable, longest-
+standing dense solve pair in cuSOLVER's API. No `cuDSS` is installed on the
+development machine, and a from-scratch sparse `LDL^T` factorization (fill-
+reducing ordering, elimination tree, numerical factorization) is separate,
+substantial work -- this stopgap exists so the rest of the pipeline has a
+real solve to build against in the meantime. Iterative refinement is not yet
+implemented (`refinement_passes` is always `0`): `FORMULATION.md` 10.3
+specifies refinement against the **unregularized** residual, which needs the
+true Newton system's residual, not just the factored (regularized) matrix's
+own residual -- deferred, not approximated.
 
 The GPU-boundary modules (`src/solver/gpu/*.cu` -- residuals, KKT assembly,
 ordering, linear solve, Newton recovery, step length, state update, mu
