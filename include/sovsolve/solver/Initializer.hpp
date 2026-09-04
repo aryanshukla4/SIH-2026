@@ -33,7 +33,11 @@ using model::Options;
 ///     upper-only        x_j = u_j - 1
 ///     free               x_j = 0
 ///     z_j = 1 where l_j finite, else 0; v_j = 1 where u_j finite, else 0
-///     s_k = 1 for every inequality row; y_i = 0 for every row
+///     s_k = 1 for every inequality row
+///     y_i = 0 on equality rows (unrestricted in sign); y_i = -1 on
+///           inequality rows -- FORMULATION.md 3 requires -y_I > 0 strictly,
+///           and 0 would also make the KKT builder's D_s = s/(-y_I) divide
+///           by zero on iteration 0
 ///
 /// This is strictly interior for any startable model (no fixed column, no
 /// all-zero row) but is not feasible -- `gpu::compute_residuals` on the

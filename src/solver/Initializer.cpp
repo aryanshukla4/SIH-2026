@@ -28,12 +28,18 @@ Expected<SolverState> initialize(const CanonicalProblem& problem, const Options&
   const std::size_t n = problem.num_cols();
   const std::size_t m_i = problem.num_inequality_rows();
   const std::size_t m = problem.num_rows();
+  const std::size_t m_e = problem.num_equality;
 
   state.x = core::RealVector(n);
   state.z = core::RealVector(n);
   state.v = core::RealVector(n);
   state.s = core::RealVector(m_i, 1.0);
   state.y = core::RealVector(m, 0.0);
+  // -y_I > 0 is a strict interiority requirement (FORMULATION.md 3), not
+  // just a convenience -- equality-row y is unrestricted and stays 0, but
+  // y_I = 0 both violates that contract and makes D_s = s/(-y_I) divide by
+  // zero the moment the KKT builder runs on iteration 0.
+  for (std::size_t i = m_e; i < m; ++i) state.y[i] = -1.0;
 
   Real sum_lower = 0.0;
   Real sum_upper = 0.0;
@@ -69,11 +75,16 @@ Expected<SolverState> initialize(const CanonicalProblem& problem, const Options&
   }
 
   // mu = [sum((x-l).*z) + sum((u-x).*v) + sum(-s.*y_I)] / active_pair_count
-  // (Module 16's formula, FORMULATION.md). The last term is 0 here since
-  // y is seeded at 0. Guards the degenerate case of a model with no bounds
-  // and no inequality rows at all -- unreachable in practice, but division
-  // by zero is not a graceful way to find out.
-  state.mu = active_pairs > 0 ? (sum_lower + sum_upper) / static_cast<Real>(active_pairs) : 1.0;
+  // (Module 16's formula, FORMULATION.md 6). Guards the degenerate case of a
+  // model with no bounds and no inequality rows at all -- unreachable in
+  // practice, but division by zero is not a graceful way to find out.
+  Real sum_slack = 0.0;
+  for (std::size_t k = 0; k < m_i; ++k) {
+    sum_slack += -state.s[k] * state.y[m_e + k];
+  }
+  state.mu = active_pairs > 0
+                 ? (sum_lower + sum_upper + sum_slack) / static_cast<Real>(active_pairs)
+                 : 1.0;
 
   return state;
 }

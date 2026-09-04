@@ -98,6 +98,20 @@ struct IpmOptions {
   Real regularization_decay = 10.0;
   Real delta_max = 1e-2;
 
+  /// Breakdown trigger for the dense LU path: the ratio of the factored
+  /// matrix's largest to smallest diagonal magnitude (the pivot growth
+  /// ratio -- read off the U factor for free, no extra solve). cuSOLVER's
+  /// `info` from Dgetrf only flags EXACT singularity; a quasi-definite KKT
+  /// matrix with Theta^-1 dominating one diagonal entry factors "successfully"
+  /// long before that, at a condition number past double precision's ~1e16
+  /// noise floor -- confirmed on afiro.mps, where the augmented matrix reached
+  /// cond(A) = 1.65e15 (pivot ratio in the same range) at iteration 8 while
+  /// Dgetrf's `info` stayed 0 throughout, and the returned direction was
+  /// numerically meaningless (magnitude ~1e11) from that point on. Above this
+  /// ratio, `solve_newton_system` (PredictorCorrector.cu) treats it as
+  /// breakdown: escalate and refactor, same as an exact-singular pivot.
+  Real max_pivot_ratio = 1e10;
+
   /// Maximum iterative-refinement passes per linear solve.
   ///
   /// Refinement is measured against the UNREGULARIZED residual: the regularized

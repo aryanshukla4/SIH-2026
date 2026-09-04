@@ -1,7 +1,7 @@
 // Behavioural tests for the new solver-facing types (SolverState,
 // ReductionDescriptor, KktSystem, Residuals, Diagnostics) and the host
 // modules that are fully implemented this pass (Initializer, Regularization,
-// ConvergenceChecker's iteration-limit check, Diagnostics export).
+// ConvergenceChecker, Diagnostics export).
 //
 // Most GPU-boundary modules have no algorithm bodies yet -- see the STUB
 // notes on each header -- so there is nothing to test behaviourally there;
@@ -12,6 +12,7 @@
 // instead, since that function only links in a CUDA-enabled build.
 
 #include <cstddef>
+#include <limits>
 #include <string>
 
 #include "sovsolve/core/SparseBuilder.hpp"
@@ -196,14 +197,61 @@ void test_initializer_rejects_non_startable_model() {
   CHECK(!state.has_value());
 }
 
-void test_convergence_checker_reports_max_iterations() {
+void test_convergence_checker_criteria() {
+  const auto problem = make_boxed_equality_problem();
+  auto canon = model::canonicalize(problem);
+  CHECK(canon.has_value());
+  if (!canon.has_value()) return;
+  const auto& canonical = canon->problem;
+
   model::Options options;
   options.limits.max_iterations = 5;
-  solver::ConvergenceChecker checker(options);
+  options.limits.stall_iterations = 3;
 
-  solver::Residuals r;
-  CHECK(checker.check(r, 0.0, 0.0, 3) == core::SolverStatus::NotConverged);
-  CHECK(checker.check(r, 0.0, 0.0, 5) == core::SolverStatus::MaxIterations);
+  {
+    solver::ConvergenceChecker checker(options, canonical);
+    solver::Residuals r;
+    r.rp_inf = 1.0;
+    r.rd_inf = 1.0;
+    CHECK(checker.check(r, 10.0, 0.0, 3) == core::SolverStatus::NotConverged);
+    CHECK(checker.check(r, 10.0, 0.0, 5) == core::SolverStatus::MaxIterations);
+  }
+
+  {
+    // rp = rd = 0, objective == dual_objective: every FORMULATION.md 9
+    // criterion is satisfied exactly.
+    solver::ConvergenceChecker checker(options, canonical);
+    solver::Residuals r;
+    r.rp_inf = 0.0;
+    r.rd_inf = 0.0;
+    CHECK(checker.check(r, 5.0, 5.0, 0) == core::SolverStatus::Optimal);
+  }
+
+  {
+    // NaN compares false against every threshold, so without the explicit
+    // isfinite guard this would silently read as "not yet converged"
+    // instead of the numerical failure it actually is.
+    solver::ConvergenceChecker checker(options, canonical);
+    solver::Residuals r;
+    r.rp_inf = std::numeric_limits<double>::quiet_NaN();
+    r.rd_inf = 0.0;
+    CHECK(checker.check(r, 5.0, 5.0, 0) == core::SolverStatus::NumericalError);
+  }
+
+  {
+    // A residual that never improves should trip is_stalled() once
+    // stall_iterations consecutive checks show no progress -- check()
+    // itself keeps returning NotConverged throughout (FORMULATION.md 11:
+    // NOT_CONVERGED covers both "still running" and "gave up, stalled").
+    solver::ConvergenceChecker checker(options, canonical);
+    solver::Residuals r;
+    r.rp_inf = 1.0;
+    r.rd_inf = 1.0;
+    for (std::size_t it = 0; it < options.limits.stall_iterations + 1; ++it) {
+      CHECK(checker.check(r, 10.0, 0.0, it) == core::SolverStatus::NotConverged);
+    }
+    CHECK(checker.is_stalled());
+  }
 }
 
 }  // namespace
@@ -218,6 +266,6 @@ int main() {
   test_regularization_escalate_and_decay();
   test_initializer_produces_interior_point();
   test_initializer_rejects_non_startable_model();
-  test_convergence_checker_reports_max_iterations();
+  test_convergence_checker_criteria();
   return sovsolve::test::report("solver_types");
 }

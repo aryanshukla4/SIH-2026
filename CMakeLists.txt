@@ -70,6 +70,14 @@ add_subdirectory(src/io)
 add_library(sovsolve INTERFACE)
 target_link_libraries(sovsolve INTERFACE
   sovsolve_core sovsolve_model sovsolve_analysis sovsolve_solver sovsolve_io)
+# sovsolve_solver_gpu is linked here, at the umbrella level, rather than from
+# sovsolve_solver itself -- src/solver/CMakeLists.txt explains why (nothing
+# in the host library calls a GPU function, and linking it there would risk
+# a cycle with a future caller). `sovsolve` is exactly the "third party
+# depending on both libraries" that comment describes.
+if(TARGET sovsolve_solver_gpu)
+  target_link_libraries(sovsolve INTERFACE sovsolve_solver_gpu)
+endif()
 
 # Tools come BEFORE tests: the oracle test runs `modeldump`, and a
 # `if(TARGET modeldump)` guard is evaluated at configure time, so a test
@@ -77,6 +85,7 @@ target_link_libraries(sovsolve INTERFACE
 if(SOVSOLVE_BUILD_TOOLS)
   add_subdirectory(tools/mpsinfo)
   add_subdirectory(tools/modeldump)
+  add_subdirectory(tools/solve)
 endif()
 
 if(SOVSOLVE_BUILD_TESTS)
