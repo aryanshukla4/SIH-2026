@@ -1,6 +1,6 @@
 import time, highspy
 h = highspy.Highs()
-h.readModel('tests/data/netlib/80bau3b.mps')
+h.readModel(r'D:\git hub projects\SIH 2026\tests\data\datt256.mps')
 t0 = time.time()
 h.run()
 print('status:', h.getModelStatus())

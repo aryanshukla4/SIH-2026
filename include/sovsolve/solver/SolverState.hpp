@@ -83,7 +83,7 @@ struct SolverState {
 /// orders above `safe_gap`'s divide-by-zero floor (1e-30) -- this engages
 /// long before a gap is small enough to need THAT protection, which is the
 /// point: it stops the runaway shrinkage `safe_gap` merely survives.
-inline constexpr Real kConvergedFloor = 1e-10;
+inline constexpr Real kConvergedFloor = 1e-12;
 
 }  // namespace sovsolve::solver
 

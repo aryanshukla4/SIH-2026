@@ -15,7 +15,8 @@
 //
 //     ||rp||inf / (1 + ||b||inf)    <  tol_primal
 //     ||rd||inf / (1 + ||c||inf)    <  tol_dual
-//     |c'x - b'y| / (1 + |c'x|)     <  tol_gap
+//     |c'x - b'y| / (1 + |c'x|)     <  tol_gap   (OR |c'x - b'y| < tol_abs_gap --
+//                                                 see Options.hpp's absolute_gap)
 //
 // `check()` returns NotConverged for BOTH "still running" and "gave up,
 // stalled" -- FORMULATION.md 11 documents NOT_CONVERGED as covering both
@@ -55,8 +56,11 @@ class ConvergenceChecker {
                                     Real dual_objective, std::size_t iteration);
 
   /// True once `stall_iterations` consecutive checks produced no
-  /// improvement in the worst of the three relative criteria. Only
-  /// meaningful to consult after `check()` has returned NotConverged.
+  /// improvement in the worse of primal_rel/dual_rel (NOT gap_rel -- the
+  /// duality gap is not a reliable monotone progress signal before y/z/v are
+  /// near dual-feasible; see ConvergenceChecker.cpp's doc comment on
+  /// `combined`). Only meaningful to consult after `check()` has returned
+  /// NotConverged.
   [[nodiscard]] bool is_stalled() const noexcept {
     return stall_count_ >= options_.limits.stall_iterations;
   }

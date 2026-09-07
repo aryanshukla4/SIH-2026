@@ -31,6 +31,16 @@ struct Tolerances {
   Real dual_feasibility = 1e-8;
   /// |c'x - b'y| / (1 + |c'x|)
   Real relative_gap = 1e-8;
+  /// |c'x - b'y|, checked as an OR alongside relative_gap -- when the true
+  /// optimum is at/near zero, relative_gap's `1 + |c'x|` denominator
+  /// collapses to ~1 and the "relative" test silently becomes an absolute
+  /// one anyway, capped at whatever noise floor the KKT solve's own
+  /// regularization leaves in mu (confirmed on markshare_4_0: primal/dual
+  /// residuals both < 1e-12, mu frozen at 2.4e-10, yet relative_gap sat at
+  /// 1.5e-8 -- just over the default tol -- and never moved regardless of
+  /// pfloor/dfloor). Every production solver (HiGHS, CPLEX, Gurobi) pairs a
+  /// relative gap tolerance with an absolute one for exactly this reason.
+  Real absolute_gap = 1e-8;
 
   /// Matrix entries below this magnitude are treated as structural zeros at
   /// load time.
