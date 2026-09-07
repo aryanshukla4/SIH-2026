@@ -46,6 +46,7 @@ void print_usage(const char* argv0) {
       "  --tol-primal=X        Tolerances::primal_feasibility (default 1e-8)\n"
       "  --tol-dual=X          Tolerances::dual_feasibility   (default 1e-8)\n"
       "  --tol-gap=X           Tolerances::relative_gap       (default 1e-8)\n"
+      "  --tol-abs-gap=X       Tolerances::absolute_gap       (default 1e-8)\n"
       "  --eta=X               IpmOptions::eta               (default 0.995)\n"
       "  --sigma=X             IpmOptions::sigma (fixed-sigma path only, default 0.1)\n"
       "  --predictor-corrector=0|1  IpmOptions::predictor_corrector (default 1)\n"
@@ -93,6 +94,8 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.tolerances.dual_feasibility = std::stod(val);
     } else if (key == "tol-gap") {
       options.tolerances.relative_gap = std::stod(val);
+    } else if (key == "tol-abs-gap") {
+      options.tolerances.absolute_gap = std::stod(val);
     } else if (key == "eta") {
       options.ipm.eta = std::stod(val);
     } else if (key == "sigma") {
