@@ -142,14 +142,18 @@ void test_residuals_on_inequality_free_var_problem() {
       solver::gpu::compute_residuals(canon->problem, *state, state->mu, residuals);
   CHECK(status.ok());
 
-  // x1=1, x2=0, s=1: rp = (1+0) + 1 - 5 = -3.
-  CHECK_NEAR(residuals.rp_inf, 3.0, 1e-12);
+  // x1=1, x2=0; s is now chosen (Initializer.cpp) to exactly satisfy the
+  // row given that x: s = b - (x1+x2) = 5 - 1 = 4, so rp = (1+0)+4-5 = 0.
+  CHECK_NEAR(residuals.rp_inf, 0.0, 1e-12);
   // y0 = -1 (interiority: -y_I > 0), so A'y = [-1,-1].
   // rd_0 = 1 - (-1) - z1 = 1+1-1 = 1 ; rd_1 = 2 - (-1) - 0 = 3.
   CHECK_NEAR(residuals.rd_inf, 3.0, 1e-12);
-  // mu0 = [(1-0)*1 + (-1*1*-1)] / 2 = (1+1)/2 = 1.0 -- seeded from exactly
-  // this point, so rxz_0 = 1-1 = 0 and rsy_0 = -1*(-1) - 1 = 0: exact again.
-  CHECK_NEAR(residuals.complementarity_inf, 0.0, 1e-12);
+  // mu0 = [(1-0)*1 + (-4*-1)] / 2 = (1+4)/2 = 2.5 -- seeded from exactly this
+  // point, but x1*z1=1 and -s*y=4 are no longer equal to each other (the old
+  // flat s=1 made every pair's own product coincidentally match mu; the
+  // slack-matching s here does not), so each pair's OWN residual against the
+  // shared average is nonzero: rxz_0 = 1-2.5 = -1.5, rsy_0 = 4-2.5 = 1.5.
+  CHECK_NEAR(residuals.complementarity_inf, 1.5, 1e-12);
 }
 
 /// Linear scan within one row's slice -- these test matrices are tiny (3x3),
@@ -205,17 +209,20 @@ void test_kkt_builder_augmented_system() {
   CHECK_NEAR(matrix_entry(csr, 2, 1), 1.0, 1e-12);
   CHECK_NEAR(matrix_entry(csr, 0, 2), 1.0, 1e-12);
   CHECK_NEAR(matrix_entry(csr, 1, 2), 1.0, 1e-12);
-  // Block (2,2): D_s = s/(-y_I) = 1/1 = 1.0 (m_e=0, so no equality-row
-  // entry) -> 1.0 + delta_d = 1.02.
-  CHECK_NEAR(matrix_entry(csr, 2, 2), 1.02, 1e-12);
+  // Block (2,2): D_s = s/(-y_I) = 4/1 = 4.0 (m_e=0, so no equality-row
+  // entry; s=4 -- see test_residuals_on_inequality_free_var_problem above
+  // for the slack-matching derivation) -> 4.0 + delta_d = 4.02.
+  CHECK_NEAR(matrix_entry(csr, 2, 2), 4.02, 1e-12);
 
-  // rhs1_j = rd_j + rxz_j/(x_j-l_j) - ruv_j/(u_j-x_j); mu was seeded from
-  // this exact point so rxz/ruv/rsy are all 0 here, leaving rhs1 = rd.
-  // rhs2 (one inequality row) = -(rp_0 + rsy_0/y_0) = -(-3 + 0) = 3.
+  // rhs1_j = rd_j + rxz_j/(x_j-l_j) - ruv_j/(u_j-x_j); rxz_0 = -1.5, x2 has
+  // no bounds so contributes nothing to rhs1_1.
+  // rhs1_0 = rd_0 + rxz_0/(x_0-l_0) = 1 + (-1.5)/(1-0) = -0.5.
+  // rhs1_1 = rd_1 = 3 (no bound terms at all for a free column).
+  // rhs2 (one inequality row) = -(rp_0 + rsy_0/y_0) = -(0 + 1.5/-1) = 1.5.
   CHECK_EQ(system.rhs.size(), std::size_t{3});
-  CHECK_NEAR(system.rhs[0], 1.0, 1e-12);
+  CHECK_NEAR(system.rhs[0], -0.5, 1e-12);
   CHECK_NEAR(system.rhs[1], 3.0, 1e-12);
-  CHECK_NEAR(system.rhs[2], 3.0, 1e-12);
+  CHECK_NEAR(system.rhs[2], 1.5, 1e-12);
 }
 
 void test_linear_solver_diagonal_system() {
@@ -239,7 +246,7 @@ void test_linear_solver_diagonal_system() {
   system.rhs[1] = 9.0;
   system.rhs[2] = 16.0;
 
-  auto result = solver::gpu::solve(system, nullptr, 0);
+  auto result = solver::gpu::solve_dense(system, nullptr, 0);
   CHECK(result.has_value());
   if (!result.has_value()) return;
 
@@ -270,7 +277,7 @@ void test_linear_solver_on_augmented_kkt_system() {
   CHECK(solver::gpu::build_kkt(canonical, *state, residuals, mat_analysis, 0.01, 0.02, system)
             .ok());
 
-  auto result = solver::gpu::solve(system, nullptr, 0);
+  auto result = solver::gpu::solve_dense(system, nullptr, 0);
   CHECK(result.has_value());
   if (!result.has_value()) return;
 
@@ -291,6 +298,96 @@ void test_linear_solver_on_augmented_kkt_system() {
     max_residual = std::max(max_residual, std::fabs(row_value - system.rhs[i]));
   }
   CHECK(max_residual < 1e-8);
+}
+
+void test_minres_matches_dense_on_augmented_kkt_system() {
+  // Direct correctness cross-check for solve_minres (LinearSolver.cu): no
+  // independent reference exists for the matrix-free Lanczos/Givens algebra
+  // otherwise, so this solves the SAME augmented system both ways and
+  // requires them to agree, the same discipline used for
+  // test_solve_problem_normal_equations_matches_augmented.
+  const auto problem = make_inequality_free_var_problem();
+  auto canon = model::canonicalize(problem);
+  CHECK(canon.has_value());
+  if (!canon.has_value()) return;
+  const auto& canonical = canon->problem;
+
+  model::Options options;
+  auto state = solver::initialize(canonical, options);
+  CHECK(state.has_value());
+  if (!state.has_value()) return;
+
+  solver::Residuals residuals;
+  CHECK(solver::gpu::compute_residuals(canonical, *state, state->mu, residuals).ok());
+
+  analysis::MatrixAnalysis mat_analysis;
+  solver::KktSystem system;
+  CHECK(solver::gpu::build_kkt(canonical, *state, residuals, mat_analysis, 0.01, 0.02, system)
+            .ok());
+
+  auto dense_result = solver::gpu::solve_dense(system, nullptr, 0);
+  CHECK(dense_result.has_value());
+  if (!dense_result.has_value()) return;
+
+  auto minres_result = solver::gpu::solve_minres(system, 1e-10, 500);
+  CHECK(minres_result.has_value());
+  if (!minres_result.has_value()) return;
+
+  CHECK_EQ(minres_result->solution.size(), dense_result->solution.size());
+  for (std::size_t i = 0; i < dense_result->solution.size(); ++i) {
+    CHECK_NEAR(minres_result->solution[i], dense_result->solution[i], 1e-6);
+  }
+
+  // Also check MINRES's own answer satisfies K*x == rhs directly, the same
+  // invariant test_linear_solver_on_augmented_kkt_system already applies to
+  // the dense solve -- agreement with solve_dense is necessary but this is
+  // the more fundamental check.
+  double max_residual = 0.0;
+  const auto& csr = system.matrix.csr;
+  for (std::size_t i = 0; i < system.matrix.rows(); ++i) {
+    double row_value = 0.0;
+    for (std::size_t k = csr.slice_begin(i); k < csr.slice_end(i); ++k) {
+      row_value +=
+          csr.values()[k] * minres_result->solution[static_cast<std::size_t>(csr.indices()[k])];
+    }
+    max_residual = std::max(max_residual, std::fabs(row_value - system.rhs[i]));
+  }
+  CHECK(max_residual < 1e-6);
+}
+
+void test_cg_matches_dense_on_normal_equations() {
+  // Same discipline as test_minres_matches_dense_on_augmented_kkt_system,
+  // for solve_spd_cg against solve_spd_dense.
+  const auto problem = make_inequality_free_var_problem();
+  auto canon = model::canonicalize(problem);
+  CHECK(canon.has_value());
+  if (!canon.has_value()) return;
+  const auto& canonical = canon->problem;
+
+  model::Options options;
+  auto state = solver::initialize(canonical, options);
+  CHECK(state.has_value());
+  if (!state.has_value()) return;
+
+  solver::Residuals residuals;
+  CHECK(solver::gpu::compute_residuals(canonical, *state, state->mu, residuals).ok());
+
+  solver::gpu::NormalEquationsSystem ne_system;
+  CHECK(solver::gpu::build_normal_equations(canonical, *state, residuals, 0.01, 0.02, ne_system)
+            .ok());
+
+  auto dense_result = solver::gpu::solve_spd_dense(ne_system);
+  CHECK(dense_result.has_value());
+  if (!dense_result.has_value()) return;
+
+  auto cg_result = solver::gpu::solve_spd_cg(ne_system, 1e-10, 500);
+  CHECK(cg_result.has_value());
+  if (!cg_result.has_value()) return;
+
+  CHECK_EQ(cg_result->solution.size(), dense_result->solution.size());
+  for (std::size_t i = 0; i < dense_result->solution.size(); ++i) {
+    CHECK_NEAR(cg_result->solution[i], dense_result->solution[i], 1e-6);
+  }
 }
 
 void test_newton_recovery_satisfies_newton_system() {
@@ -321,7 +418,7 @@ void test_newton_recovery_satisfies_newton_system() {
                                 system)
             .ok());
 
-  auto linear_result = solver::gpu::solve(system, nullptr, 0);
+  auto linear_result = solver::gpu::solve_dense(system, nullptr, 0);
   CHECK(linear_result.has_value());
   if (!linear_result.has_value()) return;
 
@@ -494,15 +591,20 @@ void test_step_length_rejects_mismatched_state_size() {
 
 void test_state_update_applies_step() {
   solver::SolverState state;
-  (void)make_step_length_test_state(state);  // reuse the same numbers
+  const auto problem = make_step_length_test_state(state);  // reuse the same numbers
   state.alpha_primal = 0.25;
   state.alpha_dual = 0.5;
 
-  CHECK(solver::gpu::apply_step(state).ok());
+  CHECK(solver::gpu::apply_step(problem, state).ok());
 
   CHECK_NEAR(state.x[0], 5.0 + 0.25 * -10.0, 1e-12);   // 2.5
   CHECK_NEAR(state.x[1], 0.0 + 0.25 * 5.0, 1e-12);     // 1.25
-  CHECK_NEAR(state.s[0], 2.0 + 0.25 * -8.0, 1e-12);    // 0.0
+  // s[0] lands EXACTLY on 0.0 (2.0 + 0.25*-8.0) -- below kConvergedFloor
+  // (SolverState.hpp), so apply_step clamps it back up rather than leaving
+  // a slack sitting exactly at its own bound (a real, not hypothetical,
+  // case: this is precisely what StepLength.cu's ratio test is designed to
+  // tolerate rather than let throttle every other coordinate's step).
+  CHECK_NEAR(state.s[0], solver::kConvergedFloor, 1e-12);
   CHECK_NEAR(state.z[0], 3.0 + 0.5 * -1.0, 1e-12);     // 2.5
   CHECK_NEAR(state.v[0], 1.0 + 0.5 * -0.5, 1e-12);     // 0.75
   CHECK_NEAR(state.y[0], 0.5 + 0.5 * 10.0, 1e-12);     // 5.5
@@ -510,11 +612,12 @@ void test_state_update_applies_step() {
 }
 
 void test_state_update_rejects_mismatched_direction_size() {
+  const model::CanonicalProblem problem;  // n=0, m=0 -- irrelevant, size check trips first
   solver::SolverState state;
   state.x = core::RealVector(2, 0.0);
   state.dx = core::RealVector(1, 0.0);  // mismatched
 
-  const auto status = solver::gpu::apply_step(state);
+  const auto status = solver::gpu::apply_step(problem, state);
   CHECK(!status.ok());
 }
 
@@ -612,6 +715,39 @@ void test_solve_problem_end_to_end() {
   CHECK(result->x[1] >= -1e-6 && result->x[1] <= 8.0 + 1e-6);
 }
 
+void test_solve_problem_normal_equations_matches_augmented() {
+  // Direct correctness cross-check for the normal-equations reduction
+  // (Options::IpmOptions::use_normal_equations, KktBuilder.cu's
+  // build_normal_equations + LinearSolver.cu's solve_spd): the derived
+  // Schur-complement RHS/dx formulas have no independent reference to check
+  // against otherwise, so this solves the SAME problem via both reductions
+  // and requires them to agree, rather than trusting the algebra blind.
+  const auto problem = make_boxed_equality_problem();
+
+  model::Options augmented_options;
+  auto augmented = solver::gpu::solve_problem(problem, augmented_options);
+  CHECK(augmented.has_value());
+  if (!augmented.has_value()) return;
+  CHECK(augmented->status == core::SolverStatus::Optimal);
+
+  model::Options normal_eq_options;
+  normal_eq_options.ipm.use_normal_equations = true;
+  auto normal_eq = solver::gpu::solve_problem(problem, normal_eq_options);
+  CHECK(normal_eq.has_value());
+  if (!normal_eq.has_value()) return;
+  CHECK(normal_eq->status == core::SolverStatus::Optimal);
+
+  CHECK_NEAR(normal_eq->objective, augmented->objective, 1e-6);
+  CHECK_EQ(normal_eq->x.size(), augmented->x.size());
+  for (std::size_t j = 0; j < augmented->x.size(); ++j) {
+    CHECK_NEAR(normal_eq->x[j], augmented->x[j], 1e-5);
+  }
+  CHECK_EQ(normal_eq->y.size(), augmented->y.size());
+  for (std::size_t i = 0; i < augmented->y.size(); ++i) {
+    CHECK_NEAR(normal_eq->y[i], augmented->y[i], 1e-5);
+  }
+}
+
 void test_residuals_rejects_mismatched_state_size() {
   const auto problem = make_boxed_equality_problem();
   auto canon = model::canonicalize(problem);
@@ -639,6 +775,8 @@ int main() {
   test_kkt_builder_augmented_system();
   test_linear_solver_diagonal_system();
   test_linear_solver_on_augmented_kkt_system();
+  test_minres_matches_dense_on_augmented_kkt_system();
+  test_cg_matches_dense_on_normal_equations();
   test_newton_recovery_satisfies_newton_system();
   test_step_length_ratio_test();
   test_step_length_rejects_mismatched_state_size();
@@ -647,6 +785,7 @@ int main() {
   test_predictor_corrector_run_iteration_reduces_primal_residual();
   test_predictor_corrector_fixed_sigma_path();
   test_solve_problem_end_to_end();
+  test_solve_problem_normal_equations_matches_augmented();
   test_residuals_rejects_mismatched_state_size();
   return sovsolve::test::report("solver_gpu_algorithms");
 }

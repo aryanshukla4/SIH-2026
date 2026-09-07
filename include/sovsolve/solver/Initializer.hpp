@@ -33,7 +33,10 @@ using model::Options;
 ///     upper-only        x_j = u_j - 1
 ///     free               x_j = 0
 ///     z_j = 1 where l_j finite, else 0; v_j = 1 where u_j finite, else 0
-///     s_k = 1 for every inequality row
+///     s_k = b_i - (Ax)_i where that's > 1 (exactly satisfies row `i` at the
+///           `x` just chosen, rather than a flat constant oblivious to the
+///           row's own scale/RHS); 1 otherwise (the row is already tight or
+///           violated at this `x` -- interiority wins over closeness)
 ///     y_i = 0 on equality rows (unrestricted in sign); y_i = -1 on
 ///           inequality rows -- FORMULATION.md 3 requires -y_I > 0 strictly,
 ///           and 0 would also make the KKT builder's D_s = s/(-y_I) divide

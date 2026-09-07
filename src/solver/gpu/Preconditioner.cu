@@ -1,0 +1,416 @@
+#include "sovsolve/solver/gpu/Preconditioner.hpp"
+
+#include <algorithm>
+#include <cstdint>
+#include <string>
+
+#include <cuda_runtime.h>
+#include <cusparse.h>
+
+namespace sovsolve::solver::gpu {
+
+namespace {
+
+Status cuda_check(cudaError_t err, const char* what) {
+  if (err != cudaSuccess) {
+    return core::make_error(core::ErrorCode::NumericalError,
+                            std::string(what) + ": " + cudaGetErrorString(err));
+  }
+  return Status::Ok();
+}
+
+Status cusparse_check(cusparseStatus_t st, const char* what) {
+  if (st != CUSPARSE_STATUS_SUCCESS) {
+    return core::make_error(core::ErrorCode::NumericalError,
+                            std::string(what) + " failed (cusparse status " +
+                                std::to_string(static_cast<int>(st)) + ")");
+  }
+  return Status::Ok();
+}
+
+/// Device state for the IC(0) factor and the two triangular-solve analyses
+/// built from it. Mirrors LinearSolver.cu's PersistentCgContext idiom: device
+/// allocation and the (expensive) symbolic pattern only redone when the
+/// problem's dimensions change; the numeric values, the factorization
+/// itself, and both solve analyses are redone every `ic0_build` call, since
+/// `theta`/`diag_add` change every Newton solve.
+///
+/// Two cuSPARSE API generations, deliberately: `cusparseDcsric02` (the
+/// incomplete-Cholesky factorization itself) has no generic-API equivalent,
+/// so it uses the legacy `cusparseMatDescr_t`/`csric02Info_t`. The
+/// triangular solves DO have a generic equivalent (`cusparseSpSV`) and, on
+/// the CUDA toolkit this builds against, the legacy `csrsv2` solve family is
+/// unavailable at link time -- confirmed by the build, not assumed -- so
+/// those two solves use `cusparseSpMatDescr_t`/`cusparseSpSVDescr_t` over
+/// the SAME underlying CSR device arrays `descr` describes.
+struct PersistentIc0Context {
+  cusparseHandle_t handle = nullptr;
+  cusparseMatDescr_t descr = nullptr;         // legacy: for cusparseDcsric02 only
+  cusparseSpMatDescr_t mat_generic = nullptr;  // generic: for the two SpSV solves
+  csric02Info_t ic0_info = nullptr;
+  cusparseSpSVDescr_t spsv_lower = nullptr;  // L y = r
+  cusparseSpSVDescr_t spsv_upper = nullptr;  // L^T z = y
+  // Dense-vector descriptors reused across every apply, per cuSPARSE's own
+  // recommended pattern for a fixed matrix solved against changing RHS:
+  // analysis binds these once, then `cusparseDnVecSetValues` repoints
+  // `vec_lower_x`/`vec_upper_y` to the CALLER's r/z pointers at apply time.
+  // `vec_lower_y`/`vec_upper_x` never move -- both are `scratch_y`.
+  cusparseDnVecDescr_t vec_lower_x = nullptr;
+  cusparseDnVecDescr_t vec_lower_y = nullptr;
+  cusparseDnVecDescr_t vec_upper_x = nullptr;
+  cusparseDnVecDescr_t vec_upper_y = nullptr;
+
+  int* offsets = nullptr;    // m+1
+  int* indices = nullptr;    // nnz_m
+  double* values = nullptr;  // nnz_m -- the CSR values, factored in place by csric02
+
+  void* ic0_buffer = nullptr;
+  void* spsv_lower_buffer = nullptr;
+  void* spsv_upper_buffer = nullptr;
+  double* scratch_y = nullptr;  // length m, intermediate between the two solves
+
+  std::size_t m = 0;
+  std::size_t nnz_m = 0;
+  bool ready = false;  // true once a successful ic0_build has run this call
+
+  void free_device_buffers() {
+    if (mat_generic) cusparseDestroySpMat(mat_generic);
+    mat_generic = nullptr;
+    if (vec_lower_x) cusparseDestroyDnVec(vec_lower_x);
+    if (vec_lower_y) cusparseDestroyDnVec(vec_lower_y);
+    if (vec_upper_x) cusparseDestroyDnVec(vec_upper_x);
+    if (vec_upper_y) cusparseDestroyDnVec(vec_upper_y);
+    vec_lower_x = vec_lower_y = vec_upper_x = vec_upper_y = nullptr;
+    if (offsets) cudaFree(offsets);
+    if (indices) cudaFree(indices);
+    if (values) cudaFree(values);
+    if (ic0_buffer) cudaFree(ic0_buffer);
+    if (spsv_lower_buffer) cudaFree(spsv_lower_buffer);
+    if (spsv_upper_buffer) cudaFree(spsv_upper_buffer);
+    if (scratch_y) cudaFree(scratch_y);
+    offsets = nullptr;
+    indices = nullptr;
+    values = nullptr;
+    ic0_buffer = spsv_lower_buffer = spsv_upper_buffer = nullptr;
+    scratch_y = nullptr;
+    m = nnz_m = 0;
+    ready = false;
+  }
+
+  ~PersistentIc0Context() {
+    free_device_buffers();
+    if (ic0_info) cusparseDestroyCsric02Info(ic0_info);
+    if (spsv_lower) cusparseSpSV_destroyDescr(spsv_lower);
+    if (spsv_upper) cusparseSpSV_destroyDescr(spsv_upper);
+    if (descr) cusparseDestroyMatDescr(descr);
+    if (handle) cusparseDestroy(handle);
+  }
+};
+
+PersistentIc0Context& ic0_context() {
+  static PersistentIc0Context ctx;
+  return ctx;
+}
+
+/// Host-side symbolic + numeric build of M_sparse's lower triangle (including
+/// the diagonal), in one pass -- see Preconditioner.hpp's doc comment for why
+/// this is O(sum over non-dense columns j of (rows touching j)^2), and why
+/// dense columns are excluded from the off-diagonal fill but not from the
+/// diagonal. A sparse-accumulator (SPA) pattern: `marker[i']` records the
+/// last row `i` that touched position `i'`, so `accum` needs no O(m) reset
+/// between rows.
+void build_host_pattern(const core::SparseMatrixPair<>& a, const RealVector& theta,
+                        const RealVector& diag_add, const std::vector<bool>& is_dense_column,
+                        std::vector<int>& offsets, std::vector<int>& indices,
+                        std::vector<double>& values) {
+  const std::size_t m = a.rows();
+  const auto& csr = a.csr;
+  const auto& csc = a.csc;
+
+  std::vector<core::Index> marker(m, -1);
+  std::vector<Real> accum(m, 0.0);
+  std::vector<core::Index> row_fill;
+
+  offsets.assign(m + 1, 0);
+  indices.clear();
+  values.clear();
+  indices.reserve(m * 4);  // a rough guess; grows as needed, never realloc-storms
+  values.reserve(m * 4);
+
+  for (std::size_t i = 0; i < m; ++i) {
+    row_fill.clear();
+    marker[i] = static_cast<core::Index>(i);
+    accum[i] = diag_add[i];
+    for (auto k = csr.slice_begin(i); k < csr.slice_end(i); ++k) {
+      const auto j = static_cast<std::size_t>(csr.indices()[k]);
+      if (!is_dense_column[j]) continue;
+      const Real aij = csr.values()[k];
+      accum[i] += theta[j] * aij * aij;
+    }
+    row_fill.push_back(static_cast<core::Index>(i));
+
+    for (auto k = csr.slice_begin(i); k < csr.slice_end(i); ++k) {
+      const auto j = static_cast<std::size_t>(csr.indices()[k]);
+      if (is_dense_column[j]) continue;
+      const Real aij = csr.values()[k];
+      const Real tj = theta[j];
+      for (auto k2 = csc.slice_begin(j); k2 < csc.slice_end(j); ++k2) {
+        const auto i2 = static_cast<std::size_t>(csc.indices()[k2]);
+        if (i2 > i) continue;  // lower triangle only
+        const Real ai2j = csc.values()[k2];
+        if (marker[i2] != static_cast<core::Index>(i)) {
+          marker[i2] = static_cast<core::Index>(i);
+          accum[i2] = 0.0;
+          row_fill.push_back(static_cast<core::Index>(i2));
+        }
+        accum[i2] += tj * aij * ai2j;
+      }
+    }
+
+    std::sort(row_fill.begin(), row_fill.end());
+    offsets[i + 1] = offsets[i] + static_cast<int>(row_fill.size());
+    for (const core::Index idx : row_fill) {
+      indices.push_back(static_cast<int>(idx));
+      values.push_back(accum[static_cast<std::size_t>(idx)]);
+    }
+  }
+}
+
+}  // namespace
+
+Status ic0_build(const core::SparseMatrixPair<>& a, const RealVector& theta,
+                 const RealVector& diag_add, const std::vector<bool>& is_dense_column) {
+  const std::size_t m = a.rows();
+  PersistentIc0Context& dev = ic0_context();
+  dev.ready = false;
+  if (m == 0) return Status::Ok();
+
+  Status st = Status::Ok();
+  if (!dev.handle) {
+    st = cusparse_check(cusparseCreate(&dev.handle), "cusparseCreate(ic0)");
+    if (!st.ok()) return st;
+  }
+  if (!dev.descr) {
+    st = cusparse_check(cusparseCreateMatDescr(&dev.descr), "cusparseCreateMatDescr");
+    if (!st.ok()) return st;
+    cusparseSetMatType(dev.descr, CUSPARSE_MATRIX_TYPE_GENERAL);
+    cusparseSetMatFillMode(dev.descr, CUSPARSE_FILL_MODE_LOWER);
+    cusparseSetMatDiagType(dev.descr, CUSPARSE_DIAG_TYPE_NON_UNIT);
+    cusparseSetMatIndexBase(dev.descr, CUSPARSE_INDEX_BASE_ZERO);
+  }
+  if (!dev.ic0_info) {
+    st = cusparse_check(cusparseCreateCsric02Info(&dev.ic0_info), "cusparseCreateCsric02Info");
+    if (!st.ok()) return st;
+  }
+  if (!dev.spsv_lower) {
+    st = cusparse_check(cusparseSpSV_createDescr(&dev.spsv_lower), "cusparseSpSV_createDescr(L)");
+    if (!st.ok()) return st;
+  }
+  if (!dev.spsv_upper) {
+    st = cusparse_check(cusparseSpSV_createDescr(&dev.spsv_upper), "cusparseSpSV_createDescr(U)");
+    if (!st.ok()) return st;
+  }
+
+  std::vector<int> host_offsets;
+  std::vector<int> host_indices;
+  std::vector<double> host_values;
+  build_host_pattern(a, theta, diag_add, is_dense_column, host_offsets, host_indices,
+                     host_values);
+  const std::size_t nnz_m = host_indices.size();
+
+  if (dev.m != m || dev.nnz_m != nnz_m) {
+    dev.free_device_buffers();
+
+    st = cuda_check(cudaMalloc(&dev.offsets, (m + 1) * sizeof(int)), "cudaMalloc(ic0 offsets)");
+    if (!st.ok()) return st;
+    st = cuda_check(cudaMalloc(&dev.indices, nnz_m * sizeof(int)), "cudaMalloc(ic0 indices)");
+    if (!st.ok()) return st;
+    st = cuda_check(cudaMalloc(&dev.values, nnz_m * sizeof(double)), "cudaMalloc(ic0 values)");
+    if (!st.ok()) return st;
+    st = cuda_check(cudaMalloc(&dev.scratch_y, m * sizeof(double)), "cudaMalloc(ic0 scratch_y)");
+    if (!st.ok()) return st;
+
+    // The generic descriptor binds to these exact device pointers, so it is
+    // rebuilt whenever they are (the factored VALUES change every call, but
+    // that's an in-place update through the same pointer -- no need to
+    // rebuild the descriptor for that, only when the pointers themselves do).
+    st = cusparse_check(
+        cusparseCreateCsr(&dev.mat_generic, static_cast<int64_t>(m), static_cast<int64_t>(m),
+                          static_cast<int64_t>(nnz_m), dev.offsets, dev.indices, dev.values,
+                          CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO,
+                          CUDA_R_64F),
+        "cusparseCreateCsr(ic0 generic)");
+    if (!st.ok()) return st;
+    cusparseFillMode_t fill_lower = CUSPARSE_FILL_MODE_LOWER;
+    st = cusparse_check(
+        cusparseSpMatSetAttribute(dev.mat_generic, CUSPARSE_SPMAT_FILL_MODE, &fill_lower,
+                                  sizeof(fill_lower)),
+        "cusparseSpMatSetAttribute(fill mode)");
+    if (!st.ok()) return st;
+    cusparseDiagType_t diag_non_unit = CUSPARSE_DIAG_TYPE_NON_UNIT;
+    st = cusparse_check(
+        cusparseSpMatSetAttribute(dev.mat_generic, CUSPARSE_SPMAT_DIAG_TYPE, &diag_non_unit,
+                                  sizeof(diag_non_unit)),
+        "cusparseSpMatSetAttribute(diag type)");
+    if (!st.ok()) return st;
+
+    // vec_lower_x/vec_upper_y start out pointing at scratch_y as a
+    // placeholder -- ic0_apply repoints them to the caller's r/z pointers
+    // via cusparseDnVecSetValues before every solve. vec_lower_y/vec_upper_x
+    // are scratch_y itself and never move.
+    const auto m_i64 = static_cast<int64_t>(m);
+    st = cusparse_check(cusparseCreateDnVec(&dev.vec_lower_x, m_i64, dev.scratch_y, CUDA_R_64F),
+                        "cusparseCreateDnVec(ic0 lower x)");
+    if (!st.ok()) return st;
+    st = cusparse_check(cusparseCreateDnVec(&dev.vec_lower_y, m_i64, dev.scratch_y, CUDA_R_64F),
+                        "cusparseCreateDnVec(ic0 lower y)");
+    if (!st.ok()) return st;
+    st = cusparse_check(cusparseCreateDnVec(&dev.vec_upper_x, m_i64, dev.scratch_y, CUDA_R_64F),
+                        "cusparseCreateDnVec(ic0 upper x)");
+    if (!st.ok()) return st;
+    st = cusparse_check(cusparseCreateDnVec(&dev.vec_upper_y, m_i64, dev.scratch_y, CUDA_R_64F),
+                        "cusparseCreateDnVec(ic0 upper y)");
+    if (!st.ok()) return st;
+
+    dev.m = m;
+    dev.nnz_m = nnz_m;
+  }
+
+  st = cuda_check(cudaMemcpy(dev.offsets, host_offsets.data(), (m + 1) * sizeof(int),
+                             cudaMemcpyHostToDevice),
+                  "cudaMemcpy(ic0 offsets, host->device)");
+  if (!st.ok()) return st;
+  st = cuda_check(cudaMemcpy(dev.indices, host_indices.data(), nnz_m * sizeof(int),
+                             cudaMemcpyHostToDevice),
+                  "cudaMemcpy(ic0 indices, host->device)");
+  if (!st.ok()) return st;
+  st = cuda_check(cudaMemcpy(dev.values, host_values.data(), nnz_m * sizeof(double),
+                             cudaMemcpyHostToDevice),
+                  "cudaMemcpy(ic0 values, host->device)");
+  if (!st.ok()) return st;
+
+  const int m_i = static_cast<int>(m);
+  const int nnz_i = static_cast<int>(nnz_m);
+
+  int ic0_buf = 0;
+  st = cusparse_check(cusparseDcsric02_bufferSize(dev.handle, m_i, nnz_i, dev.descr, dev.values,
+                                                  dev.offsets, dev.indices, dev.ic0_info,
+                                                  &ic0_buf),
+                      "cusparseDcsric02_bufferSize");
+  if (!st.ok()) return st;
+  const double sv_alpha = 1.0;
+  std::size_t lower_buf = 0;
+  st = cusparse_check(
+      cusparseSpSV_bufferSize(dev.handle, CUSPARSE_OPERATION_NON_TRANSPOSE, &sv_alpha,
+                              dev.mat_generic, dev.vec_lower_x, dev.vec_lower_y, CUDA_R_64F,
+                              CUSPARSE_SPSV_ALG_DEFAULT, dev.spsv_lower, &lower_buf),
+      "cusparseSpSV_bufferSize(L)");
+  if (!st.ok()) return st;
+  std::size_t upper_buf = 0;
+  st = cusparse_check(
+      cusparseSpSV_bufferSize(dev.handle, CUSPARSE_OPERATION_TRANSPOSE, &sv_alpha,
+                              dev.mat_generic, dev.vec_upper_x, dev.vec_upper_y, CUDA_R_64F,
+                              CUSPARSE_SPSV_ALG_DEFAULT, dev.spsv_upper, &upper_buf),
+      "cusparseSpSV_bufferSize(U)");
+  if (!st.ok()) return st;
+
+  const auto ensure_buffer = [](void*& buf, std::size_t& current_size,
+                                std::size_t needed) -> Status {
+    if (needed == 0) return Status::Ok();
+    if (needed <= current_size && buf != nullptr) return Status::Ok();
+    if (buf) cudaFree(buf);
+    buf = nullptr;
+    Status st2 = cuda_check(cudaMalloc(&buf, needed), "cudaMalloc(ic0/sv buffer)");
+    if (!st2.ok()) return st2;
+    current_size = needed;
+    return Status::Ok();
+  };
+  static thread_local std::size_t ic0_buf_size = 0;
+  static thread_local std::size_t lower_buf_size = 0;
+  static thread_local std::size_t upper_buf_size = 0;
+  st = ensure_buffer(dev.ic0_buffer, ic0_buf_size, static_cast<std::size_t>(ic0_buf));
+  if (!st.ok()) return st;
+  st = ensure_buffer(dev.spsv_lower_buffer, lower_buf_size, lower_buf);
+  if (!st.ok()) return st;
+  st = ensure_buffer(dev.spsv_upper_buffer, upper_buf_size, upper_buf);
+  if (!st.ok()) return st;
+
+  st = cusparse_check(
+      cusparseDcsric02_analysis(dev.handle, m_i, nnz_i, dev.descr, dev.values, dev.offsets,
+                                dev.indices, dev.ic0_info, CUSPARSE_SOLVE_POLICY_NO_LEVEL,
+                                dev.ic0_buffer),
+      "cusparseDcsric02_analysis");
+  if (!st.ok()) return st;
+
+  st = cusparse_check(cusparseDcsric02(dev.handle, m_i, nnz_i, dev.descr, dev.values, dev.offsets,
+                                       dev.indices, dev.ic0_info, CUSPARSE_SOLVE_POLICY_NO_LEVEL,
+                                       dev.ic0_buffer),
+                      "cusparseDcsric02");
+  if (!st.ok()) return st;
+
+  int zero_pivot = -1;
+  const cusparseStatus_t pivot_status =
+      cusparseXcsric02_zeroPivot(dev.handle, dev.ic0_info, &zero_pivot);
+  if (pivot_status == CUSPARSE_STATUS_ZERO_PIVOT) {
+    return core::make_error(core::ErrorCode::NumericalError,
+                            "ic0_build: IC(0) hit a structural zero pivot at row " +
+                                std::to_string(zero_pivot) +
+                                " -- falling back to Jacobi for this solve");
+  }
+  st = cusparse_check(pivot_status, "cusparseXcsric02_zeroPivot");
+  if (!st.ok()) return st;
+
+  st = cusparse_check(
+      cusparseSpSV_analysis(dev.handle, CUSPARSE_OPERATION_NON_TRANSPOSE, &sv_alpha,
+                            dev.mat_generic, dev.vec_lower_x, dev.vec_lower_y, CUDA_R_64F,
+                            CUSPARSE_SPSV_ALG_DEFAULT, dev.spsv_lower, dev.spsv_lower_buffer),
+      "cusparseSpSV_analysis(L)");
+  if (!st.ok()) return st;
+  st = cusparse_check(
+      cusparseSpSV_analysis(dev.handle, CUSPARSE_OPERATION_TRANSPOSE, &sv_alpha, dev.mat_generic,
+                            dev.vec_upper_x, dev.vec_upper_y, CUDA_R_64F,
+                            CUSPARSE_SPSV_ALG_DEFAULT, dev.spsv_upper, dev.spsv_upper_buffer),
+      "cusparseSpSV_analysis(U)");
+  if (!st.ok()) return st;
+
+  dev.ready = true;
+  return Status::Ok();
+}
+
+Status ic0_apply(const Real* r_device, Real* z_device, std::size_t m) {
+  PersistentIc0Context& dev = ic0_context();
+  if (!dev.ready || dev.m != m) {
+    return core::make_error(core::ErrorCode::NumericalError,
+                            "ic0_apply: called without a successful ic0_build for this size");
+  }
+
+  // cusparseSpSV_solve computes op(A)*y = alpha*x -- x is the given RHS,
+  // y is what gets solved for. Repoint the two ends that actually change
+  // call to call (the middle, scratch_y, never moves); analysis above ran
+  // once against these same descriptor OBJECTS, which is what matters, not
+  // against these exact pointer values.
+  Status st = cusparse_check(
+      cusparseDnVecSetValues(dev.vec_lower_x, const_cast<Real*>(r_device)),
+      "cusparseDnVecSetValues(lower x)");
+  if (!st.ok()) return st;
+  st = cusparse_check(cusparseDnVecSetValues(dev.vec_upper_y, z_device),
+                      "cusparseDnVecSetValues(upper y)");
+  if (!st.ok()) return st;
+
+  const double alpha = 1.0;
+  st = cusparse_check(
+      cusparseSpSV_solve(dev.handle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, dev.mat_generic,
+                        dev.vec_lower_x, dev.vec_lower_y, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT,
+                        dev.spsv_lower),
+      "cusparseSpSV_solve(L)");
+  if (!st.ok()) return st;
+
+  st = cusparse_check(
+      cusparseSpSV_solve(dev.handle, CUSPARSE_OPERATION_TRANSPOSE, &alpha, dev.mat_generic,
+                        dev.vec_upper_x, dev.vec_upper_y, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT,
+                        dev.spsv_upper),
+      "cusparseSpSV_solve(U)");
+  return st;
+}
+
+}  // namespace sovsolve::solver::gpu

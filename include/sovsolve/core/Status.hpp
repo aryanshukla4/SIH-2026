@@ -38,6 +38,13 @@ enum class ErrorCode : std::uint8_t {
   /// Reported here rather than handed to the solver, where it would surface as
   /// an unexplained factorization breakdown instead of an answer.
   PrimalInfeasible,
+  /// The model is unbounded by inspection -- a verdict, not a malfunction,
+  /// same spirit as `PrimalInfeasible`. Raised when the Presolver finds an
+  /// empty column (no entries in `A` or `Q`) with nonzero cost and an
+  /// infinite bound in its improving direction: a PROVABLE certificate
+  /// (moving that one variable improves the objective without limit, with
+  /// every other constraint untouched), not a heuristic.
+  Unbounded,
   UnsupportedFeature,   ///< e.g. SOS sets — recorded, never silently dropped
   IndexOverflow,        ///< nonzero count exceeds the Index type
   OutOfMemory,

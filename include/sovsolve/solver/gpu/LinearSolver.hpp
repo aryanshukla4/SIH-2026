@@ -1,33 +1,34 @@
 // Module 12. Solves the KktSystem Module 9 assembled.
 //
-// CURRENT IMPLEMENTATION: dense, via cuSOLVER's classic LU path
-// (cusolverDnDgetrf/Dgetrs) -- a deliberate stopgap, not the intended final
-// design. Two real gaps, both documented rather than hidden:
+// PRODUCTION IMPLEMENTATION: matrix-free Krylov methods, never factoring
+// anything. `solve_spd_cg` (Conjugate Gradient) handles the SPD
+// normal-equations reduction; `solve_minres` (MINRES) handles the symmetric
+// quasi-definite augmented KKT system. Both apply their matrix only as a
+// sequence of sparse operations (cuSPARSE SpMV + a couple of small
+// hand-written elementwise kernels, VectorOps.hpp) -- O(nnz) per Krylov
+// iteration, no O(k^2)/O(k^3) term anywhere. Chosen specifically because a
+// direct sparse factorization (the traditional alternative) needs ordering +
+// symbolic + numeric factorization machinery that duplicates most of what
+// cuDSS would provide, and PS 26119 rules out linking a solver library --
+// cuBLAS/cuSPARSE stay in bounds as primitive *operations* (see README.md's
+// "On the 'from scratch' constraint"), a complete sparse solver does not.
 //
-//   * Dense, not sparse. No cuDSS is installed on the development machine
-//     (README.md "Solver core"), and a from-scratch sparse LDL^T
-//     factorization (ordering, elimination tree, numerical factorization) is
-//     substantial separate work. Converting the (n+m)x(n+m) KKT matrix to a
-//     dense buffer costs O(dim^2) memory and O(dim^3) time per solve --
-//     fine for small hand-built test problems, prohibitive for a real
-//     Netlib/MIPLIB instance. `SymbolicFactorization` (Ordering.hpp) exists
-//     for the eventual sparse path and is accepted here as an optional,
-//     currently-ignored pointer rather than removed from the signature.
+// `solve_dense` (renamed from the original `solve`) and `solve_spd_dense`
+// (renamed from the original `solve_spd`) are KEPT, but only as correctness
+// oracles for `tests/unit/solver_gpu_algorithms_test.cpp` -- dense LU/Cholesky
+// factorization is verified-correct machinery with no iterative-convergence
+// question attached, which is exactly what makes it useful for checking that
+// the derived matrix-free algebra (dx-recovery, the reduced RHS, the operator
+// itself) is right. Neither is called from `PredictorCorrector.cu` anymore.
 //
-//   * General LU, not symmetric-indefinite LDL^T. The KKT matrix is
-//     symmetric quasi-definite (FORMULATION.md 10.2), which cusolverDnDsytrf
-//     could exploit for roughly half the factorization cost -- but
-//     cusolverDnDgetrf/Dgetrs are the longest-standing, most stable dense
-//     solve pair in cuSOLVER's classic API, which matters more than the 2x
-//     for a stopgap that is going to be replaced by a sparse factorization
-//     anyway.
-//
-// Iterative refinement is NOT implemented this pass (`refinement_passes` is
-// always 0): module.txt Module 12 / FORMULATION.md 10.3 specify refinement
-// against the UNREGULARIZED residual specifically, which needs the true
-// (non-regularized) Newton system's residual, not just the factored matrix's
-// own residual -- a real piece of design deferred along with the sparse
-// path, not silently approximated.
+// Iterative refinement is NOT implemented for any of the four paths
+// (`refinement_passes` is always 0): module.txt Module 12 / FORMULATION.md
+// 10.3 specify refinement against the UNREGULARIZED residual specifically,
+// which needs the true (non-regularized) Newton system's residual -- a real
+// piece of design deferred, not silently approximated. For the Krylov paths
+// this matters less than it did for the dense ones: CG/MINRES already
+// minimize the residual of whatever system they're handed, iteration by
+// iteration, which is a related but not identical guarantee.
 
 #ifndef SOVSOLVE_SOLVER_GPU_LINEAR_SOLVER_HPP
 #define SOVSOLVE_SOLVER_GPU_LINEAR_SOLVER_HPP
@@ -37,6 +38,7 @@
 #include "sovsolve/core/Status.hpp"
 #include "sovsolve/core/Vector.hpp"
 #include "sovsolve/solver/KktSystem.hpp"
+#include "sovsolve/solver/gpu/KktBuilder.hpp"
 #include "sovsolve/solver/gpu/Ordering.hpp"
 
 namespace sovsolve::solver::gpu {
@@ -50,20 +52,79 @@ struct LinearSolveResult {
   RealVector solution;
   std::size_t refinement_passes = 0;
 
-  /// max|U_ii| / min|U_ii| from the Dgetrf factor -- read off for free
-  /// (no extra solve), the standard cheap proxy for how ill-conditioned the
-  /// factorization was. cuSOLVER's `info` only catches exact singularity;
-  /// this catches the "solved without error but the answer is noise" case
-  /// (see the comment on Options::IpmOptions::max_pivot_ratio).
+  /// On the dense paths (`solve_dense`/`solve_spd_dense`): max|diag|/min|diag|
+  /// off the factor -- the standard cheap ill-conditioning proxy (see the
+  /// comment on `Options::IpmOptions::max_pivot_ratio`).
+  ///
+  /// On the Krylov paths (`solve_spd_cg`/`solve_minres`), which have no
+  /// factorization and therefore no pivot to read: `1.0` if the solve
+  /// converged within its tolerance, or `+infinity` if it hit its iteration
+  /// cap without converging. `+infinity` always exceeds `max_pivot_ratio`
+  /// regardless of its configured value, which is exactly the signal
+  /// `PredictorCorrector.cu`'s existing escalate/refactor loop already knows
+  /// how to act on -- "too ill-conditioned to solve at this regularization
+  /// level" reuses the same downstream handling whether it came from a bad
+  /// pivot or a non-converging Krylov solve.
   Real pivot_ratio = 1.0;
 };
 
-/// `symbolic` is accepted but unused by the current dense implementation --
-/// pass `nullptr` until the sparse path exists. `max_refinement_steps` is
-/// likewise unused (refinement is deferred, see the file comment).
-[[nodiscard]] Expected<LinearSolveResult> solve(const KktSystem& system,
-                                                  const SymbolicFactorization* symbolic,
-                                                  int max_refinement_steps);
+/// Dense LU (`cusolverDnDgetrf`/`Dgetrs`) solve of the full augmented KKT
+/// system. Test-only correctness oracle for `solve_minres` -- see the file
+/// comment. `symbolic` is accepted but unused; pass `nullptr`.
+[[nodiscard]] Expected<LinearSolveResult> solve_dense(const KktSystem& system,
+                                                       const SymbolicFactorization* symbolic,
+                                                       int max_refinement_steps);
+
+/// Dense Cholesky (`cusolverDnDpotrf`/`Dpotrs`) solve of the SPD
+/// normal-equations system. Test-only correctness oracle for `solve_spd_cg`
+/// -- see the file comment.
+[[nodiscard]] Expected<LinearSolveResult> solve_spd_dense(const NormalEquationsSystem& system);
+
+/// Matrix-free Conjugate Gradient solve of the SPD normal-equations system
+/// (`NormalEquationsSystem`, KktBuilder.hpp) -- dimension `m`, never formed
+/// as a matrix (dense or sparse). Applies `A T A^T + D_s + delta_d*I` as an
+/// operator: `A^T * p` (cuSPARSE SpMV on `system.a->csc`, used directly as
+/// CSR-of-`A^T`), elementwise-scaled by `theta` (VectorOps.hpp's `hadamard`),
+/// then `A * (...)` (cuSPARSE SpMV on `system.a->csr`), then the diagonal
+/// regularization folded in (`hadamard_add`) -- two sparse matrix-vector
+/// products and two elementwise kernels per CG iteration, `O(nnz)` total,
+/// zero `O(m^2)`/`O(m^3)` anywhere.
+///
+/// Preconditioned with Jacobi (diagonal): `diag_i = diag_add_i + sum_j
+/// A_ij^2 * theta_j`, built once per call from `system.a`'s CSR rows,
+/// `O(nnz)`. `LinearSolveResult::solution` is `dy` alone -- the caller
+/// (`PredictorCorrector.cu`) recovers `dx` from it before calling
+/// `recover_newton_direction`, same division of responsibility as the
+/// former dense path.
+///
+/// `cg_tolerance`/`cg_max_iterations` are `Options::IpmOptions`'s
+/// `cg_tolerance`/`cg_max_iterations` fields, passed as plain scalars rather
+/// than the whole `Options` object -- matches this file's existing
+/// minimal-parameter convention (`build_kkt` takes `delta_p`/`delta_d`
+/// individually the same way).
+[[nodiscard]] Expected<LinearSolveResult> solve_spd_cg(const NormalEquationsSystem& system,
+                                                        Real cg_tolerance, int cg_max_iterations);
+
+/// Matrix-free MINRES solve of the symmetric quasi-definite augmented KKT
+/// system (`KktSystem`, already sparse -- `build_kkt` never densifies it,
+/// only this function's dense predecessor `solve_dense` did). One cuSPARSE
+/// SpMV per iteration on `system.matrix.csr` directly: both triangles are
+/// stored explicitly (`build_kkt` inserts `(2,1)=A` and `(1,2)=A^T`
+/// separately), so a plain non-transposed SpMV over the whole stored matrix
+/// already computes the correct full product -- no operator composition
+/// needed here the way CG's rectangular `A` needs one.
+///
+/// Preconditioned with block-Jacobi, using `system.precond_diag` (built by
+/// `build_kkt` from the same `theta_inv`/`D_s` scalars it already computes
+/// for the matrix's own diagonal -- see that function's doc comment).
+///
+/// CG doesn't apply here: the matrix is indefinite (one block negative
+/// definite, one positive definite), not SPD. MINRES is CG's
+/// indefinite-safe sibling -- same per-iteration cost class (one SpMV, a
+/// handful of `Ddot`/`Daxpy` calls), different (Lanczos-based) recurrence.
+[[nodiscard]] Expected<LinearSolveResult> solve_minres(const KktSystem& system,
+                                                        Real minres_tolerance,
+                                                        int minres_max_iterations);
 
 }  // namespace sovsolve::solver::gpu
 

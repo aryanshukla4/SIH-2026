@@ -118,6 +118,79 @@ struct IpmOptions {
   /// system is a nearby problem, and refining against its own residual
   /// converges accurately to the wrong one.
   int max_refinement_steps = 3;
+
+  /// Use the normal-equations reduction (FORMULATION.md 10.1,
+  /// `ReductionType::LpNormalEquationsDy`, solved by matrix-free `solve_spd_cg`
+  /// in LinearSolver.cu) instead of the augmented KKT system (solved by
+  /// matrix-free `solve_minres`) for LP (`Q` empty) -- QP always uses the
+  /// augmented path regardless of this flag, since the reduction is only
+  /// valid for `Q = 0`. Neither production path factors anything anymore
+  /// (see `cg_tolerance`/`minres_tolerance` below); this flag chooses which
+  /// SYSTEM to solve, not whether to factor it.
+  ///
+  /// The reduced system is `m x m` instead of `(n+m) x (n+m)` and SPD, so it
+  /// needs only plain CG rather than MINRES. It also squares the system's
+  /// conditioning relative to the augmented path (`cond(A T A') ~ 1/mu^2` vs.
+  /// the quasi-definite augmented system's better-behaved conditioning near
+  /// convergence) -- a real, known tradeoff, confirmed on `gas11` (already
+  /// unbounded/undetected before any of this, but measurably worse under
+  /// this reduction) -- which is why this is not an unconditional win.
+  ///
+  /// Defaults ON (true) despite that, on MEASURED evidence: `solve_minres`
+  /// (the augmented path) is correct but, with only a diagonal (Jacobi)
+  /// preconditioner, needs thousands of iterations to converge on
+  /// indefinite systems at ordinary problem sizes -- confirmed on this
+  /// corpus (`egout` alone went from 0.3s to 24s under the augmented path
+  /// once `minres_max_iterations` was raised enough to stop it returning
+  /// silently wrong answers; several other instances did not finish within
+  /// a minute). `solve_spd_cg`'s SPD reduction converges fast under the same
+  /// Jacobi preconditioner because CG on an SPD system is simply a much
+  /// easier problem than MINRES on an indefinite one. Until the augmented
+  /// path has a real (non-diagonal) preconditioner, defaulting to the
+  /// normal-equations path is the faster AND more reliable choice for the
+  /// LP case it applies to -- QP is unaffected either way, since it always
+  /// uses the augmented path regardless of this flag.
+  bool use_normal_equations = true;
+
+  /// Relative-residual stopping tolerance for the matrix-free Conjugate
+  /// Gradient solve (`solve_spd_cg`, normal-equations path only). Tighter
+  /// than the outer `Tolerances::primal_feasibility`/`dual_feasibility`
+  /// (1e-8) because CG's own solve error propagates directly into the Newton
+  /// direction on top of whatever error the outer IPM iteration already
+  /// tolerates -- solving the linear system to the SAME tolerance as the
+  /// outer loop would add a comparable second source of error on top of it.
+  Real cg_tolerance = 1e-10;
+
+  /// Safety cap on Conjugate Gradient iterations per linear solve, so a
+  /// poorly preconditioned system (see the Jacobi-preconditioner doc comment
+  /// on `solve_spd_cg`) degrades to a slow-but-bounded solve rather than an
+  /// unbounded loop. Hitting this cap without reaching `cg_tolerance` is
+  /// reported via `LinearSolveResult::pivot_ratio` exceeding
+  /// `max_pivot_ratio` above -- the existing escalate/refactor loop
+  /// (`PredictorCorrector.cu`) already knows what to do with that signal.
+  int cg_max_iterations = 500;
+
+  /// Same role as `cg_tolerance`, for the augmented path's matrix-free MINRES
+  /// solve (`solve_minres`) -- see that function's doc comment.
+  Real minres_tolerance = 1e-10;
+
+  /// Same role as `cg_max_iterations`, for `solve_minres` -- but MEASURED
+  /// (not guessed) to need a much higher default than CG's. The indefinite
+  /// augmented system is materially harder for a plain diagonal (Jacobi)
+  /// preconditioner than the SPD normal-equations system CG solves: at the
+  /// original default of 500, `solve_minres` was hitting the cap without
+  /// converging on ordinary-sized instances (confirmed on `adlittle.mps`),
+  /// and "accept the direction anyway" -- correct for a merely-noisy-but-
+  /// exact LU/Cholesky factorization -- is NOT safe for a Krylov solve that
+  /// stopped without actually solving the system: unlike a factorization,
+  /// a capped-out Krylov iterate is not even approximately a solution, so
+  /// feeding it into the Newton step corrupts the whole IPM trajectory
+  /// (confirmed: adlittle's objective came back with the wrong SIGN at
+  /// iteration cap 500, and matched the correct answer at cap 5000). A
+  /// better (non-diagonal) preconditioner is the real fix and is not
+  /// attempted this pass -- see LinearSolver.cu's solve_minres doc comment;
+  /// this default is a measured, honest stopgap, not a tuned optimum.
+  int minres_max_iterations = 5000;
 };
 
 /// Termination limits.
@@ -170,6 +243,14 @@ struct LogOptions {
   bool collect_history = true;
 };
 
+/// Module 4 controls. Presolve is safe and reversible by construction (see
+/// solver/Presolver.hpp), but module.txt is explicit that startability
+/// (the canonicalizer's contract) "must not depend on the Presolver, which
+/// can be switched off" -- this is that switch.
+struct PresolveOptions {
+  bool enabled = true;
+};
+
 /// Everything, in one object.
 struct Options {
   Tolerances tolerances;
@@ -177,6 +258,7 @@ struct Options {
   Limits limits;
   ReaderOptions reader;
   LogOptions log;
+  PresolveOptions presolve;
 };
 
 }  // namespace sovsolve::model

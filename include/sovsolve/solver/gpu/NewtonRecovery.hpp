@@ -4,12 +4,16 @@
 // direction set comes out directly, and `dy` is not privileged (module.txt
 // Module 13: "never assume dy is always the solved direction").
 //
-// Only ReductionType::QpAugmentedKkt is implemented -- the only type
-// gpu::build_kkt currently produces. LpNormalEquationsDy/QpSchurDy return
-// NotImplemented, same scope narrowing as build_kkt itself.
+// QpAugmentedKkt (gpu::build_kkt) and LpNormalEquationsDy
+// (gpu::build_normal_equations, LP only) are implemented; QpSchurDy returns
+// NotImplemented, same scope narrowing as the KKT builders themselves.
 //
 // On the augmented path, `linear_solution` (length n+m) already IS
-// [dx; dy] -- Module 12 solved for both directly. Recovery here means
+// [dx; dy] -- Module 12 solved for both directly. On the normal-equations
+// path, PredictorCorrector.cu solves for `dy` alone, recovers `dx` from it
+// via Schur-complement back-substitution, and assembles the SAME [dx; dy]
+// shape before calling here -- so this function's own logic never needs to
+// know which reduction produced its input. Recovery here means
 // un-eliminating `ds`, `dz`, `dv` via the same three Newton-system rows
 // (FORMULATION.md 7) that build_kkt used to eliminate them:
 //

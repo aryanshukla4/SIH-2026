@@ -57,6 +57,14 @@ void print_usage(const char* argv0) {
       "  --max-pivot-ratio=X   IpmOptions::max_pivot_ratio            (default 1e10)\n"
       "  --refine=N            IpmOptions::max_refinement_steps       (default 3,\n"
       "                        currently unused -- refinement isn't implemented yet)\n"
+      "  --normal-eq=0|1       IpmOptions::use_normal_equations       (default 0,\n"
+      "                        LP only -- ignored for QP, see Options.hpp)\n"
+      "  --cg-tol=X            IpmOptions::cg_tolerance               (default 1e-10)\n"
+      "  --cg-max-iter=N       IpmOptions::cg_max_iterations          (default 500)\n"
+      "  --minres-tol=X        IpmOptions::minres_tolerance           (default 1e-10)\n"
+      "  --minres-max-iter=N   IpmOptions::minres_max_iterations      (default 5000 --\n"
+      "                        measured necessary, see Options.hpp)\n"
+      "  --presolve=0|1        PresolveOptions::enabled               (default 1)\n"
       "\n"
       "output is one `key=value` line per metric, ending with\n"
       "`solve_time_seconds=...` -- that's the number to optimize against.\n",
@@ -105,6 +113,18 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.ipm.max_pivot_ratio = std::stod(val);
     } else if (key == "refine") {
       options.ipm.max_refinement_steps = std::stoi(val);
+    } else if (key == "normal-eq") {
+      options.ipm.use_normal_equations = std::stoi(val) != 0;
+    } else if (key == "cg-tol") {
+      options.ipm.cg_tolerance = std::stod(val);
+    } else if (key == "cg-max-iter") {
+      options.ipm.cg_max_iterations = std::stoi(val);
+    } else if (key == "minres-tol") {
+      options.ipm.minres_tolerance = std::stod(val);
+    } else if (key == "minres-max-iter") {
+      options.ipm.minres_max_iterations = std::stoi(val);
+    } else if (key == "presolve") {
+      options.presolve.enabled = std::stoi(val) != 0;
     } else {
       std::fprintf(stderr, "unknown flag: --%s\n", key.c_str());
       return false;
@@ -119,6 +139,15 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Line-buffer stdout even when it's not a TTY (piped/redirected, the usual
+  // case for a benchmark sweep): libc otherwise fully buffers non-interactive
+  // stdout, so per-iteration diagnostics (Logging.cpp) accumulate silently
+  // and are LOST if the process is killed (e.g. by `timeout`) before it
+  // exits normally -- exactly the failure mode that made an earlier
+  // diagnostic run of this tool look like several instances produced no
+  // output at all, when they were actually still running.
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
   if (argc < 2) {
     print_usage(argv[0]);
     return 2;

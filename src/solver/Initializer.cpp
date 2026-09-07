@@ -33,7 +33,7 @@ Expected<SolverState> initialize(const CanonicalProblem& problem, const Options&
   state.x = core::RealVector(n);
   state.z = core::RealVector(n);
   state.v = core::RealVector(n);
-  state.s = core::RealVector(m_i, 1.0);
+  state.s = core::RealVector(m_i);
   state.y = core::RealVector(m, 0.0);
   // -y_I > 0 is a strict interiority requirement (FORMULATION.md 3), not
   // just a convenience -- equality-row y is unrestricted and stays 0, but
@@ -71,6 +71,30 @@ Expected<SolverState> initialize(const CanonicalProblem& problem, const Options&
     if (has_upper) {
       sum_upper += (hi - state.x[j]) * state.v[j];
       ++active_pairs;
+    }
+  }
+
+  // `s_k = b_i - (Ax)_i` -- the slack that makes row `i` EXACTLY satisfied by
+  // the x just chosen above, rather than a flat 1.0 oblivious to the row's
+  // own scale and RHS. On a large, tightly-coupled instance (80bau3b: 2262
+  // inequality rows, 9799 columns) a flat slack left the primal residual at
+  // ~4e5 from iteration 0 -- not because the bound-midpoint x was a
+  // uniformly bad guess, but because s never even tried to match what x
+  // already implied, so nearly every row started out "wrong" by whatever
+  // its own RHS happened to be. Falls back to the textbook 1.0 only when the
+  // implied slack isn't safely positive (the row is already tight or
+  // violated at this x) -- interiority must never be sacrificed for a
+  // closer-but-boundary-touching start.
+  {
+    const auto& csr = problem.A.csr;
+    for (std::size_t k = 0; k < m_i; ++k) {
+      const std::size_t i = m_e + k;
+      Real activity = 0.0;
+      for (auto t = csr.slice_begin(i); t < csr.slice_end(i); ++t) {
+        activity += csr.values()[t] * state.x[static_cast<std::size_t>(csr.indices()[t])];
+      }
+      const Real implied_slack = problem.b[i] - activity;
+      state.s[k] = implied_slack > kUnboundedOffset ? implied_slack : kUnboundedOffset;
     }
   }
 

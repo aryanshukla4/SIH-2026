@@ -23,4 +23,16 @@ void log_iteration(const IterationRecord& record, const LogOptions& options,
   }
 }
 
+void log_presolve_summary(std::size_t rows_before, std::size_t cols_before,
+                          std::size_t nnz_before, std::size_t rows_after,
+                          std::size_t cols_after, std::size_t nnz_after,
+                          const LogOptions& options, std::FILE* out) {
+  if (options.level == LogOptions::Level::Silent) return;
+
+  std::fprintf(out,
+               "presolve: rows %zu(-%zu)  cols %zu(-%zu)  nnz %zu(-%zu)\n",
+               rows_after, rows_before - rows_after, cols_after, cols_before - cols_after,
+               nnz_after, nnz_before - nnz_after);
+}
+
 }  // namespace sovsolve::solver

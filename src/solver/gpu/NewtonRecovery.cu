@@ -9,10 +9,17 @@ namespace sovsolve::solver::gpu {
 Status recover_newton_direction(const CanonicalProblem& problem, const KktSystem& system,
                                  const Residuals& residuals,
                                  const RealVector& linear_solution, SolverState& state) {
-  if (system.descriptor.type != ReductionType::QpAugmentedKkt) {
+  // QpAugmentedKkt's linear_solution already IS [dx;dy] (Module 12 solved for
+  // both directly). LpNormalEquationsDy's caller (PredictorCorrector.cu)
+  // assembles the identical [dx;dy] shape itself -- dx recovered from dy via
+  // the Schur-complement back-substitution -- before calling here, so the
+  // recovery formulas below (which read only x/z/v/dx and residuals, never
+  // how dx was produced) are correct for both unchanged.
+  if (system.descriptor.type != ReductionType::QpAugmentedKkt &&
+      system.descriptor.type != ReductionType::LpNormalEquationsDy) {
     return core::make_error(
         core::ErrorCode::NotImplemented,
-        "recover_newton_direction: only ReductionType::QpAugmentedKkt is implemented");
+        "recover_newton_direction: only QpAugmentedKkt/LpNormalEquationsDy are implemented");
   }
 
   const std::size_t n = problem.num_cols();
