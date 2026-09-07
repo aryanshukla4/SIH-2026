@@ -26,30 +26,94 @@ Real inf_norm(const core::RealVector& v) {
   return result;
 }
 
-/// One build_kkt + solve + recover_newton_direction round trip. Escalates and
-/// refactors on breakdown, decays on a clean solve -- see the doc comment on
-/// Options::IpmOptions::regularization_escalation. cuSOLVER's Dgetrf `info`
-/// only flags exact singularity (still a hard error below, via `solve()`'s
-/// own Expected failure); solve() additionally reports the pivot growth
-/// ratio, which is what catches a factorization that "succeeds" but is
-/// numerically noise (confirmed on afiro.mps: info stayed 0 while cond(A)
-/// reached 1.65e15 -- see Options::IpmOptions::max_pivot_ratio).
+/// Back out `dx` from the normal-equations solve's `dy` and hand the
+/// assembled `[dx;dy]` to the SAME `recover_newton_direction` the augmented
+/// path uses (NewtonRecovery.cu's dz/dv/ds formulas depend only on x/z/v/dx
+/// and residuals, never on how dx was produced -- see NewtonRecovery.hpp).
 ///
-/// At delta_max with the ratio still high, this does NOT report
+///     dx = T .* (A^T dy - rhs1)
+///
+/// (KktBuilder.hpp's `NormalEquationsSystem` doc comment has the derivation.)
+/// `A^T dy` is accumulated via `ne_system.a->csc` -- for column j, its CSC
+/// major slice IS `A^T`'s row j (SparseMatrix.hpp's header comment: CSC
+/// exists specifically so this needs no transpose) -- an O(nnz) host pass,
+/// not the O(m*n) dense loop the earlier dense-normal-equations pass used.
+Status recover_from_normal_equations(const CanonicalProblem& problem, const Residuals& residuals,
+                                      const NormalEquationsSystem& ne_system,
+                                      const core::RealVector& dy, SolverState& state) {
+  const std::size_t n = problem.num_cols();
+  const std::size_t m = problem.num_rows();
+
+  core::RealVector dxdy(n + m);
+  const auto& csc = ne_system.a->csc;
+  for (std::size_t j = 0; j < n; ++j) {
+    Real a_t_dy = 0.0;
+    for (std::size_t k = csc.slice_begin(j); k < csc.slice_end(j); ++k) {
+      a_t_dy += csc.values()[k] * dy[static_cast<std::size_t>(csc.indices()[k])];
+    }
+    dxdy[j] = ne_system.theta[j] * (a_t_dy - ne_system.rhs1[j]);
+  }
+  for (std::size_t i = 0; i < m; ++i) dxdy[n + i] = dy[i];
+
+  KktSystem descriptor_only;
+  descriptor_only.descriptor.type = ReductionType::LpNormalEquationsDy;
+  return recover_newton_direction(problem, descriptor_only, residuals, dxdy, state);
+}
+
+/// One build + solve + recover round trip, on whichever system this Newton
+/// solve uses. Escalates and refactors on breakdown, decays on a clean solve
+/// -- see the doc comment on Options::IpmOptions::regularization_escalation.
+/// Both `solve_spd_cg` and `solve_minres` report non-convergence as
+/// `pivot_ratio = +infinity` (LinearSolver.hpp's doc comment on
+/// `LinearSolveResult::pivot_ratio` explains why), which always exceeds
+/// `max_pivot_ratio` and so always triggers the SAME escalate/refactor path
+/// this loop already had for the dense LU/Cholesky solves it used to call --
+/// no new branching needed for "this Krylov solve didn't converge."
+///
+/// At delta_max with that signal still set, this does NOT report
 /// NumericalError -- architecture.txt's "at delta_max with factorization
-/// still failing, report NumericalError" means exact singularity (the
-/// Expected failure above), not "still somewhat ill-conditioned". A high
-/// pivot ratio at delta_max is the EXPECTED, harmless terminal-phase
-/// signature of a converging point (Theta^-1 legitimately spikes for a
-/// tightly-bound variable right near the solution) far more often than it's
-/// a genuine breakdown -- confirmed on avgas/egout/rgn, which were one
-/// iteration from Optimal and got hard-aborted by treating this as fatal.
-/// The direction is still accepted; the outer loop's best-iterate tracking
-/// (Solve.cu) is what actually protects against a bad step doing damage.
+/// still failing, report NumericalError" means exact singularity/breakdown,
+/// not "still somewhat ill-conditioned". A high pivot ratio (or a
+/// non-converged Krylov solve) at delta_max is the EXPECTED, harmless
+/// terminal-phase signature of a converging point (Theta^-1 legitimately
+/// spikes for a tightly-bound variable right near the solution) far more
+/// often than it's a genuine breakdown -- confirmed on avgas/egout/rgn, which
+/// were one iteration from Optimal and got hard-aborted by treating this as
+/// fatal. The direction is still accepted; the outer loop's best-iterate
+/// tracking (Solve.cu) is what actually protects against a bad step doing
+/// damage.
 Status solve_newton_system(const CanonicalProblem& problem, const Residuals& residuals,
                             RegularizationController& regularization,
                             const Options& options, SolverState& state) {
+  // FORMULATION.md 10.1 is explicit the reduction is only valid for Q=0, so
+  // QP always keeps using the augmented path (solve_minres) regardless of
+  // the option.
+  const bool use_normal_eq = options.ipm.use_normal_equations && problem.Q.empty();
+
   for (;;) {
+    if (use_normal_eq) {
+      NormalEquationsSystem ne_system;
+      Status st = build_normal_equations(problem, state, residuals, regularization.delta_p(),
+                                          regularization.delta_d(), ne_system);
+      if (!st.ok()) return st;
+
+      Expected<LinearSolveResult> linear =
+          solve_spd_cg(ne_system, options.ipm.cg_tolerance, options.ipm.cg_max_iterations);
+      if (!linear.has_value()) return linear.error();
+
+      if (linear->pivot_ratio > options.ipm.max_pivot_ratio) {
+        if (regularization.escalate()) continue;  // refactor with the larger delta
+        // delta_max reached and still ill-conditioned -- accept the direction
+        // anyway, same policy as the augmented path below.
+        return recover_from_normal_equations(problem, residuals, ne_system, linear->solution,
+                                              state);
+      }
+
+      regularization.decay();
+      return recover_from_normal_equations(problem, residuals, ne_system, linear->solution,
+                                            state);
+    }
+
     analysis::MatrixAnalysis mat_analysis;  // unused by build_kkt this pass -- see its header
     KktSystem system;
     Status st = build_kkt(problem, state, residuals, mat_analysis, regularization.delta_p(),
@@ -57,7 +121,7 @@ Status solve_newton_system(const CanonicalProblem& problem, const Residuals& res
     if (!st.ok()) return st;
 
     Expected<LinearSolveResult> linear =
-        solve(system, nullptr, options.ipm.max_refinement_steps);
+        solve_minres(system, options.ipm.minres_tolerance, options.ipm.minres_max_iterations);
     if (!linear.has_value()) return linear.error();
 
     if (linear->pivot_ratio > options.ipm.max_pivot_ratio) {
@@ -170,7 +234,7 @@ Status run_iteration(const CanonicalProblem& problem, const Options& options,
   state.alpha_primal = alpha_primal;
   state.alpha_dual = alpha_dual;
 
-  st = apply_step(state);
+  st = apply_step(problem, state);
   if (!st.ok()) return st;
 
   record.mu = state.mu;

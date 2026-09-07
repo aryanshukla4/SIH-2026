@@ -5,6 +5,10 @@
 
 namespace sovsolve::solver::gpu {
 
+// kConvergedFloor is defined in SolverState.hpp, alongside slack_dual/
+// safe_gap -- see its doc comment there for the full derivation (found via
+// direct tracing on 80bau3b) and how it pairs with apply_step's clamp.
+
 Status compute_step_lengths(const CanonicalProblem& problem, const SolverState& state,
                              Real eta, Real& alpha_primal, Real& alpha_dual) {
   const std::size_t n = problem.num_cols();
@@ -23,34 +27,37 @@ Status compute_step_lengths(const CanonicalProblem& problem, const SolverState& 
   Real alpha_p_max = 1.0;
   for (std::size_t j = 0; j < n; ++j) {
     if (state.dx[j] < 0.0 && core::is_finite_bound(problem.col_lower[j])) {
-      alpha_p_max = std::min(alpha_p_max,
-                              (state.x[j] - problem.col_lower[j]) / (-state.dx[j]));
+      const Real dist = state.x[j] - problem.col_lower[j];
+      if (dist > kConvergedFloor) alpha_p_max = std::min(alpha_p_max, dist / (-state.dx[j]));
     }
     if (state.dx[j] > 0.0 && core::is_finite_bound(problem.col_upper[j])) {
-      alpha_p_max =
-          std::min(alpha_p_max, (problem.col_upper[j] - state.x[j]) / state.dx[j]);
+      const Real dist = problem.col_upper[j] - state.x[j];
+      if (dist > kConvergedFloor) alpha_p_max = std::min(alpha_p_max, dist / state.dx[j]);
     }
   }
   for (std::size_t k = 0; k < m_i; ++k) {
-    if (state.ds[k] < 0.0) {
+    if (state.ds[k] < 0.0 && state.s[k] > kConvergedFloor) {
       alpha_p_max = std::min(alpha_p_max, state.s[k] / (-state.ds[k]));
     }
   }
 
   Real alpha_d_max = 1.0;
   for (std::size_t j = 0; j < n; ++j) {
-    if (state.dz[j] < 0.0 && core::is_finite_bound(problem.col_lower[j])) {
+    if (state.dz[j] < 0.0 && core::is_finite_bound(problem.col_lower[j]) &&
+        state.z[j] > kConvergedFloor) {
       alpha_d_max = std::min(alpha_d_max, state.z[j] / (-state.dz[j]));
     }
-    if (state.dv[j] < 0.0 && core::is_finite_bound(problem.col_upper[j])) {
+    if (state.dv[j] < 0.0 && core::is_finite_bound(problem.col_upper[j]) &&
+        state.v[j] > kConvergedFloor) {
       alpha_d_max = std::min(alpha_d_max, state.v[j] / (-state.dv[j]));
     }
   }
   // Inequality rows only -- equality-row y is never ratio-tested.
   for (std::size_t k = 0; k < m_i; ++k) {
     const std::size_t i = m_e + k;
-    if (state.dy[i] > 0.0) {
-      alpha_d_max = std::min(alpha_d_max, slack_dual(state.y[i]) / state.dy[i]);
+    const Real dist = slack_dual(state.y[i]);
+    if (state.dy[i] > 0.0 && dist > kConvergedFloor) {
+      alpha_d_max = std::min(alpha_d_max, dist / state.dy[i]);
     }
   }
 

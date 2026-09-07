@@ -32,6 +32,15 @@ struct KktSystem {
   SparseMatrixPair<> matrix;
   RealVector rhs;
   ReductionDescriptor descriptor;
+
+  /// Length `n+m`, filled only on the `QpAugmentedKkt` path (empty
+  /// otherwise): the matrix's own diagonal magnitude, block by block --
+  /// `|theta_inv_j + delta_p|` for the first `n` entries, `D_s_i + delta_d`
+  /// for the last `m`. A block-Jacobi preconditioner for `LinearSolver.cu`'s
+  /// matrix-free `solve_minres`, built from quantities `build_kkt` (gpu/
+  /// KktBuilder.cu) already computes for the matrix's own diagonal -- not a
+  /// second computation, just exposed instead of being thrown away.
+  RealVector precond_diag;
 };
 
 }  // namespace sovsolve::solver

@@ -66,6 +66,25 @@ struct SolverState {
 /// floor itself.
 [[nodiscard]] inline Real safe_gap(Real g) noexcept { return std::max(g, Real{1e-30}); }
 
+/// Below this distance from its own bound, a coordinate (`x-l`, `u-x`, `s`,
+/// `z`, `v`, or `slack_dual(y_I)`) is treated as already converged to it,
+/// not as still approaching it: StepLength.cu's ratio test excludes such a
+/// coordinate from constraining `alpha_{primal,dual}` (an already-converged
+/// coordinate has nothing left to contribute, and its own ratio would
+/// otherwise shrink toward the noise floor and throttle EVERY other
+/// coordinate's step right along with it -- found via direct tracing on
+/// `80bau3b`, where one row's slack decayed past 1e-100 over ~20 iterations
+/// while its dual kept growing sensibly, yet kept dragging `alpha_primal`
+/// down with it). `apply_step` (StateUpdate.cu) then clamps back up to this
+/// same floor, which is what makes excluding it from the ratio test safe: a
+/// larger step meant for everyone else can never push an already-parked
+/// coordinate past its bound. Two orders of magnitude under
+/// `Tolerances::bound_violation`'s default (1e-9, Options.hpp), and twenty
+/// orders above `safe_gap`'s divide-by-zero floor (1e-30) -- this engages
+/// long before a gap is small enough to need THAT protection, which is the
+/// point: it stops the runaway shrinkage `safe_gap` merely survives.
+inline constexpr Real kConvergedFloor = 1e-10;
+
 }  // namespace sovsolve::solver
 
 #endif  // SOVSOLVE_SOLVER_SOLVER_STATE_HPP

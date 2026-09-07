@@ -1,6 +1,7 @@
 add_library(sovsolve_solver STATIC
   Scaler.cpp
   Initializer.cpp
+  Presolver.cpp
   SolutionReconstructor.cpp
   ConvergenceChecker.cpp
   Diagnostics.cpp
@@ -25,6 +26,8 @@ if(SOVSOLVE_ENABLE_CUDA)
     gpu/ResidualCalculator.cu
     gpu/KktBuilder.cu
     gpu/Ordering.cu
+    gpu/VectorOps.cu
+    gpu/Preconditioner.cu
     gpu/LinearSolver.cu
     gpu/NewtonRecovery.cu
     gpu/StepLength.cu
