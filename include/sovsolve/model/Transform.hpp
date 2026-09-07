@@ -61,13 +61,30 @@ enum class TransformKind : std::uint8_t {
   RemoveEmptyRow,       ///< all-zero row over the kept columns, RHS consistent
   DropFreeRow,          ///< row with both bounds infinite; vacuous
 
-  // -- presolve (reserved; owned by the presolve module) -------------------
+  // -- presolve (owned by the presolve module, Presolver.cpp) --------------
   RemoveEmptyColumn,
   RemoveSingletonRow,
   RemoveRedundantRow,
   TightenBound,
   ShiftVariable,   ///< x' = x - t
   NegateVariable,  ///< x' = t - x
+
+  /// A FREE column that is a SINGLETON in row `primary` (`secondary` = the
+  /// column), substituted out exactly: the row determines the column's
+  /// value, so both disappear together. Not one of the six kinds above --
+  /// those each remove either a row or a column, never both at once. See
+  /// `Presolver.hpp`'s doc comment for the derivation, and
+  /// `Canonicalizer.cpp::recover_solution` for the dual/primal recovery.
+  RemoveFreeSingleton,
+
+  /// Two columns with an identical `A` pattern (same rows, same values) AND
+  /// identical cost were merged into one: `primary` = the DROPPED column
+  /// (original index), `secondary` = the SURVIVING column (original index),
+  /// whose bounds were widened to the Minkowski sum of the pair's own bounds.
+  /// See `Presolver.hpp`'s doc comment for the merge derivation, and
+  /// `Canonicalizer.cpp::recover_solution` for the primal split and shared-
+  /// stationarity dual recovery.
+  MergeDuplicateColumn,
 
   // -- scaling ------------------------------------------------------------
   RowScaling,

@@ -1,5 +1,6 @@
 #include "sovsolve/solver/gpu/KktBuilder.hpp"
 
+#include <cmath>
 #include <cstddef>
 
 #include "sovsolve/core/SparseBuilder.hpp"
@@ -138,6 +139,115 @@ Status build_kkt(const CanonicalProblem& problem, const SolverState& state,
   out.descriptor.reason =
       "augmented path selected unconditionally: LpNormalEquationsDy needs a "
       "sparse A*Theta*A^T product this pass does not implement";
+
+  // Block-Jacobi preconditioner diagonal for solve_minres (LinearSolver.cu)
+  // -- the SAME theta_inv/D_s scalars already computed above for the
+  // matrix's own diagonal, just exposed instead of only being folded into
+  // it. Magnitude, not signed value: the (1,1) block is negative definite,
+  // but a Jacobi preconditioner needs a positive scaling.
+  out.precond_diag = core::RealVector(dim);
+  for (std::size_t j = 0; j < n; ++j) {
+    out.precond_diag[j] = std::fabs(theta_inv[j] + delta_p);
+  }
+  for (std::size_t i = 0; i < m_e; ++i) {
+    out.precond_diag[n + i] = delta_d;
+  }
+  for (std::size_t k = 0; k < m_i; ++k) {
+    const std::size_t i = m_e + k;
+    out.precond_diag[n + i] = state.s[k] / safe_gap(-state.y[i]) + delta_d;
+  }
+
+  return Status::Ok();
+}
+
+Status build_normal_equations(const CanonicalProblem& problem, const SolverState& state,
+                               const Residuals& residuals, Real delta_p, Real delta_d,
+                               NormalEquationsSystem& out) {
+  const std::size_t n = problem.num_cols();
+  const std::size_t m = problem.num_rows();
+  const std::size_t m_e = problem.num_equality;
+  const std::size_t m_i = problem.num_inequality_rows();
+
+  if (state.x.size() != n || state.s.size() != m_i || state.y.size() != m ||
+      state.z.size() != n || state.v.size() != n || residuals.rp.size() != m ||
+      residuals.rd.size() != n) {
+    return core::make_error(
+        core::ErrorCode::DimensionMismatch,
+        "build_normal_equations: SolverState/Residuals size does not match problem");
+  }
+
+  // T^-1, floored THEN inverted -- unlike build_kkt's augmented path above,
+  // which never inverts it. FORMULATION.md 10.1.
+  out.theta = core::RealVector(n, 0.0);
+  std::size_t floor_activations = 0;
+  for (std::size_t j = 0; j < n; ++j) {
+    Real t_inv = 0.0;
+    if (core::is_finite_bound(problem.col_lower[j])) {
+      t_inv += state.z[j] / safe_gap(state.x[j] - problem.col_lower[j]);
+    }
+    if (core::is_finite_bound(problem.col_upper[j])) {
+      t_inv += state.v[j] / safe_gap(problem.col_upper[j] - state.x[j]);
+    }
+    if (t_inv < delta_p) {
+      t_inv = delta_p;
+      ++floor_activations;
+    }
+    out.theta[j] = 1.0 / t_inv;
+  }
+
+  // rhs1, identical formula to build_kkt's rhs1 above -- both reductions
+  // eliminate dz/dv/ds via the same six-block Newton system rows
+  // (FORMULATION.md 7), independent of which system dx/dy come out of.
+  out.rhs1 = core::RealVector(n, 0.0);
+  for (std::size_t j = 0; j < n; ++j) {
+    Real r1 = residuals.rd[j];
+    if (core::is_finite_bound(problem.col_lower[j])) {
+      r1 += residuals.rxz[j] / safe_gap(state.x[j] - problem.col_lower[j]);
+    }
+    if (core::is_finite_bound(problem.col_upper[j])) {
+      r1 -= residuals.ruv[j] / safe_gap(problem.col_upper[j] - state.x[j]);
+    }
+    out.rhs1[j] = r1;
+  }
+
+  // rhs2 and D_s + delta_d*I, identical formulas to build_kkt's above.
+  core::RealVector rhs2(m, 0.0);
+  out.diag_add = core::RealVector(m, 0.0);
+  for (std::size_t i = 0; i < m_e; ++i) {
+    rhs2[i] = -residuals.rp[i];
+    out.diag_add[i] = delta_d;
+  }
+  for (std::size_t k = 0; k < m_i; ++k) {
+    const std::size_t i = m_e + k;
+    rhs2[i] = -(residuals.rp[i] - residuals.rsy[k] / safe_gap(-state.y[i]));
+    out.diag_add[i] = state.s[k] / safe_gap(-state.y[i]) + delta_d;
+  }
+
+  // Non-owning reference to the ALREADY-sparse A -- solve_spd_cg
+  // (LinearSolver.cu) applies it via cuSPARSE SpMV, never densifies it. See
+  // NormalEquationsSystem::a's doc comment for the lifetime argument.
+  out.a = &problem.A;
+  const auto& A_csr = problem.A.csr;
+
+  // rhs = rhs2 + A*T*rhs1 (Schur-complement elimination of dx -- see
+  // NormalEquationsSystem's doc comment in KktBuilder.hpp for the derivation).
+  core::RealVector t_rhs1(n);
+  for (std::size_t j = 0; j < n; ++j) t_rhs1[j] = out.theta[j] * out.rhs1[j];
+
+  out.rhs = std::move(rhs2);
+  for (std::size_t i = 0; i < m; ++i) {
+    Real acc = 0.0;
+    for (std::size_t k = A_csr.slice_begin(i); k < A_csr.slice_end(i); ++k) {
+      acc += A_csr.values()[k] * t_rhs1[static_cast<std::size_t>(A_csr.indices()[k])];
+    }
+    out.rhs[i] += acc;
+  }
+
+  out.descriptor.type = ReductionType::LpNormalEquationsDy;
+  out.descriptor.theta_floor_activations = floor_activations;
+  out.descriptor.reason =
+      "LP (Q empty), Options::IpmOptions::use_normal_equations enabled: "
+      "matrix-free A*T*A^T reduction, solved by CG (FORMULATION.md 10.1)";
 
   return Status::Ok();
 }

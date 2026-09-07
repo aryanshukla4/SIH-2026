@@ -8,6 +8,7 @@
 #include "sovsolve/solver/ConvergenceChecker.hpp"
 #include "sovsolve/solver/Initializer.hpp"
 #include "sovsolve/solver/Logging.hpp"
+#include "sovsolve/solver/Presolver.hpp"
 #include "sovsolve/solver/Regularization.hpp"
 #include "sovsolve/solver/Residuals.hpp"
 #include "sovsolve/solver/Scaler.hpp"
@@ -64,7 +65,18 @@ Expected<Solution> solve_problem(const Problem& problem, const Options& options)
   auto canon = model::canonicalize(problem, options);
   if (!canon.has_value()) return canon.error();
 
-  core::Status st = scale(canon->problem, options, canon->transforms);
+  const std::size_t rows_before_presolve = canon->problem.num_rows();
+  const std::size_t cols_before_presolve = canon->problem.num_cols();
+  const std::size_t nnz_before_presolve = canon->problem.A.nnz();
+
+  core::Status st = presolve(canon->problem, options, canon->transforms);
+  if (!st.ok()) return st.error();
+
+  log_presolve_summary(rows_before_presolve, cols_before_presolve, nnz_before_presolve,
+                       canon->problem.num_rows(), canon->problem.num_cols(),
+                       canon->problem.A.nnz(), options.log);
+
+  st = scale(canon->problem, options, canon->transforms);
   if (!st.ok()) return st.error();
 
   auto state = initialize(canon->problem, options);

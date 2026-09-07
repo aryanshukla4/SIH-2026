@@ -480,6 +480,36 @@ core::Expected<Solution> recover_solution(const Problem& original,
   std::vector<Index> row_map(m0, kNone);
   std::vector<bool> row_negated(m0, false);
 
+  // Presolver's free-column-singleton substitution (Presolver.cpp): row
+  // `primary` and column `secondary` were removed TOGETHER, so neither ever
+  // receives a MapRow/KeepColumn record -- row_map/col_map stay kNone for
+  // both, same as any other dropped row/column. Recovered separately below,
+  // once every kept/fixed column's `x` is known. `is_free_singleton_col`
+  // marks the column side so the generic `any_fixed` bound-dual branch
+  // (below) skips it -- a free variable has z_j = v_j = 0 always, not the
+  // stationarity-derived split that branch computes for a genuinely FIXED
+  // column.
+  std::vector<Index> free_singleton_col_of_row(m0, kNone);
+  std::vector<bool> is_free_singleton_col(n0, false);
+
+  // Presolver's duplicate-column merge (Presolver.cpp): `k` (dropped) never
+  // gets a KeepColumn record either, same reasoning as a free singleton's
+  // column above, so `is_merged_dropped_col` marks it for the same kind of
+  // skip in the generic bound-dual branch below -- its dual is NOT the
+  // generic "must be at one of its two bounds" split that branch assumes,
+  // since a merged pair's survivor can land strictly inside its own box.
+  // `merge_pairs` (dropped `k`, surviving `j`, both ORIGINAL indices) drives
+  // the primal split and dual recovery further down.
+  std::vector<bool> is_merged_dropped_col(n0, false);
+  std::vector<std::pair<Index, Index>> merge_pairs;
+  // Which of {j at l_j, j at u_j, k at l_k, k at u_k, neither} the primal
+  // split below picked, in lockstep with `merge_pairs` -- computed once
+  // there and reused for the dual split further down, instead of
+  // re-deriving it from comparing floats (`x_j == l_j` is not reliably
+  // exact after `y - u_k`-style arithmetic; the branch taken IS exact).
+  enum class MergeBranch { kJLower, kJUpper, kKLower, kKUpper, kNeither };
+  std::vector<MergeBranch> merge_branch;
+
   // Scaling (Scaler, Module 5) pushes onto this SAME stack, keyed by
   // CANONICAL row/column index rather than original index -- it runs after
   // canonicalization, on the canonicalized problem. Default 1.0 (identity)
@@ -496,7 +526,19 @@ core::Expected<Solution> recover_solution(const Problem& original,
         if (k < n0) col_map[k] = rec.secondary;
         break;
       case TransformKind::RemoveFixedVariable:
-        if (k < n0) fixed_value[k] = rec.value;
+        // canonicalize() itself may have ALREADY pushed a KeepColumn record
+        // for this same original index (it keeps every column IT doesn't
+        // fix, with no way to know Presolver will fix this one later), and
+        // rebuild() never pushes a competing record for a column it drops --
+        // so without this, "last record wins" would leave col_map[k] at that
+        // STALE canonical index, which the dual-recovery loop below reads as
+        // "still a normal kept column" and pulls its z/v from whatever
+        // (unrelated) canonical column that stale index now names, instead
+        // of taking the stationarity-based path meant for a substituted one.
+        if (k < n0) {
+          fixed_value[k] = rec.value;
+          col_map[k] = kNone;
+        }
         break;
       case TransformKind::MapRow:
         if (k < m0) row_map[k] = rec.secondary;
@@ -509,6 +551,24 @@ core::Expected<Solution> recover_solution(const Problem& original,
         break;
       case TransformKind::RowScaling:
         if (k < row_scale.size()) row_scale[k] = rec.value;
+        break;
+      case TransformKind::RemoveFreeSingleton:
+        if (k < m0) free_singleton_col_of_row[k] = rec.secondary;
+        // Same stale-KeepColumn hazard as RemoveFixedVariable above, for the
+        // dropped free column (`rec.secondary`, not `k` -- `k` is the ROW).
+        if (rec.secondary != kNone && static_cast<std::size_t>(rec.secondary) < n0) {
+          is_free_singleton_col[static_cast<std::size_t>(rec.secondary)] = true;
+          col_map[static_cast<std::size_t>(rec.secondary)] = kNone;
+        }
+        break;
+      case TransformKind::MergeDuplicateColumn:
+        // `k` = rec.primary (dropped), `j` = rec.secondary (survivor). Same
+        // stale-KeepColumn hazard as RemoveFixedVariable above, for `k`.
+        if (k < n0) {
+          is_merged_dropped_col[k] = true;
+          col_map[k] = kNone;
+        }
+        if (rec.secondary != kNone) merge_pairs.emplace_back(rec.primary, rec.secondary);
         break;
       default:
         break;
@@ -565,6 +625,100 @@ core::Expected<Solution> recover_solution(const Problem& original,
     s.x[j] = col_map[j] == kNone ? fixed_value[j] : at(xc, col_map[j]);
   }
 
+  // -- duplicate-column primal split (Presolver.cpp) ------------------------
+  //
+  // `k` (dropped) and `j` (survivor) are ORIGINAL indices for a
+  // pattern-and-cost-identical pair Presolver merged into one column with
+  // Minkowski-summed bounds. `s.x[j]` above holds their COMBINED value `y`
+  // (the reduced problem's own answer for the widened column), not `j`'s
+  // true value -- split here, before anything downstream treats it as `j`'s
+  // own. Deterministically prefers `j`'s own lower bound, falling back to
+  // `j`'s upper, then to `k`'s bounds, and finally (only when EVERY one of
+  // the four bounds is infinite -- both columns fully free) an arbitrary
+  // even split -- so it always lands inside both original boxes without the
+  // `INF` sentinel ever entering arithmetic (`is_finite_bound()` guards every
+  // step).
+  for (const auto& [k_idx, j_idx] : merge_pairs) {
+    const auto k = static_cast<std::size_t>(k_idx);
+    const auto j = static_cast<std::size_t>(j_idx);
+    const Real y = s.x[j];
+    const Real l_j = original.col_lower[j];
+    const Real u_j = original.col_upper[j];
+    const Real l_k = original.col_lower[k];
+    const Real u_k = original.col_upper[k];
+
+    Real x_j;
+    MergeBranch branch;
+    if (is_finite_bound(l_j)) {
+      x_j = l_j;
+      branch = MergeBranch::kJLower;
+      if (is_finite_bound(u_k) && y - u_k > x_j) {
+        x_j = y - u_k;
+        branch = MergeBranch::kKUpper;
+      }
+    } else if (is_finite_bound(u_j)) {
+      x_j = u_j;
+      branch = MergeBranch::kJUpper;
+      if (is_finite_bound(l_k) && y - l_k < x_j) {
+        x_j = y - l_k;
+        branch = MergeBranch::kKLower;
+      }
+    } else if (is_finite_bound(l_k)) {
+      x_j = y - l_k;
+      branch = MergeBranch::kKLower;
+    } else if (is_finite_bound(u_k)) {
+      x_j = y - u_k;
+      branch = MergeBranch::kKUpper;
+    } else {
+      x_j = y / 2.0;  // both columns fully free: arbitrary split, no bound ever active
+      branch = MergeBranch::kNeither;
+    }
+    s.x[j] = x_j;
+    s.x[k] = y - x_j;
+    merge_branch.push_back(branch);
+  }
+
+  // -- free-column-singleton primal recovery (Presolver.cpp) ----------------
+  //
+  // Row `i` and column `j` were removed TOGETHER (`i`/`j` here are already
+  // ORIGINAL indices -- `free_singleton_col_of_row` is keyed that way, see
+  // the scan loop above): `x_j` was never solved by the reduced problem, so
+  // the primal loop just above left it at `fixed_value`'s default, 0.0 --
+  // wrong. Presolver restricts this transform to EQUALITY rows only (an
+  // inequality row's canonical form has an implicit slack this formula does
+  // not account for), so the ORIGINAL row's equation is exactly
+  // `row_lower[i] == row_upper[i] == sum_k a_ik*x_k` with no slack term,
+  // and solving it for the one unknown gives
+  //
+  //     x_j = (row_lower[i] - sum_{k!=j} a_ik*x_k) / a_ij
+  //
+  // using row i's OTHER coefficients against the x_k values already
+  // recovered above -- every other column in row i is necessarily kept or
+  // fixed (by canonicalize() OR by Presolver reusing RemoveFixedVariable),
+  // never another free singleton: row i is claimed by at most one such pair.
+  for (std::size_t i = 0; i < m0; ++i) {
+    if (free_singleton_col_of_row[i] == kNone) continue;
+    const auto j = static_cast<std::size_t>(free_singleton_col_of_row[i]);
+
+    const auto off = original.A.csr.offsets();
+    const auto idx = original.A.csr.indices();
+    const auto val = original.A.csr.values();
+
+    Real a_ij = 0.0;
+    Real other_terms = 0.0;
+    for (auto k = static_cast<std::size_t>(off[i]); k < static_cast<std::size_t>(off[i + 1]);
+         ++k) {
+      const auto col = static_cast<std::size_t>(idx[k]);
+      if (col == j) {
+        a_ij = val[k];
+      } else {
+        other_terms += val[k] * s.x[col];
+      }
+    }
+
+    s.x[j] = (original.row_lower[i] - other_terms) / a_ij;
+  }
+
   // -- row activity and slacks in original terms ---------------------------
   s.s = core::RealVector(m0, 0.0);
   {
@@ -599,6 +753,26 @@ core::Expected<Solution> recover_solution(const Problem& original,
   for (std::size_t i = 0; i < m0; ++i) {
     const Real raw = at(yc, row_map[i]);
     s.y[i] = row_negated[i] ? -raw : raw;
+  }
+
+  // A free-column-singleton row has no MapRow record (dropped, like any
+  // other removed row), so the loop above leaves it at 0 -- overwritten here
+  // via stationarity, `y_i = (c_j + (Qx)_j) / a_ij`. Presolver only ever
+  // emits this transform when column j has no entries in Q, so `(Qx)_j` is
+  // exactly 0 (guaranteed by the producer's precondition, not approximated
+  // here) -- see the primal-recovery comment above for `a_ij`.
+  for (std::size_t i = 0; i < m0; ++i) {
+    if (free_singleton_col_of_row[i] == kNone) continue;
+    const auto j = static_cast<std::size_t>(free_singleton_col_of_row[i]);
+    const auto& csr = original.A.csr;
+    Real a_ij = 0.0;
+    for (auto k = csr.slice_begin(i); k < csr.slice_end(i); ++k) {
+      if (static_cast<std::size_t>(csr.indices()[k]) == j) {
+        a_ij = csr.values()[k];
+        break;
+      }
+    }
+    s.y[i] = original.c[j] / a_ij;
   }
 
   // -- bound duals ---------------------------------------------------------
@@ -652,11 +826,57 @@ core::Expected<Solution> recover_solution(const Problem& original,
     }
     for (std::size_t j = 0; j < n0; ++j) {
       if (col_map[j] != kNone) continue;
+      // Free (unbounded) columns keep z_j = v_j = 0 -- there is no bound for
+      // either to be active against, unlike a genuinely FIXED column, which
+      // is what the stationarity split below assumes.
+      if (is_free_singleton_col[j]) continue;
+      // A merged pair's DROPPED column is handled below, off the SURVIVOR's
+      // stationarity value -- not this generic split, which assumes (unlike
+      // a merged pair) that landing off of ITS bound is impossible.
+      if (is_merged_dropped_col[j]) continue;
       const Real d = sense_sign * (original.c[j] + qx[j]) - aty[j];
       if (d >= 0.0) {
         s.z[j] = d;
       } else {
         s.v[j] = -d;
+      }
+    }
+
+    // -- duplicate-column dual split (Presolver.cpp) -----------------------
+    //
+    // `c_j == c_k` and `A_j == A_k` exactly (Presolver only merges confirmed
+    // duplicates), so the stationarity value is the SAME for both columns --
+    // computed once, from `j`'s own data, using the SAME `aty`/`qx` built
+    // above (survivor `j` is a normal kept column, so `aty[j]`/`qx[j]` were
+    // already accumulated over the full original matrix, not skipped by the
+    // `col_map[j] == kNone` guard above). What differs between the two is
+    // only WHICH bound (if either) each one's own split value actually
+    // landed on -- decided by `merge_branch`, in lockstep with `merge_pairs`,
+    // from the primal split above, not by re-comparing floats here.
+    for (std::size_t idx = 0; idx < merge_pairs.size(); ++idx) {
+      const auto k = static_cast<std::size_t>(merge_pairs[idx].first);
+      const auto j = static_cast<std::size_t>(merge_pairs[idx].second);
+      const Real d = sense_sign * (original.c[j] + qx[j]) - aty[j];
+
+      s.z[j] = 0.0;
+      s.v[j] = 0.0;
+      s.z[k] = 0.0;
+      s.v[k] = 0.0;
+      switch (merge_branch[idx]) {
+        case MergeBranch::kJLower:
+          s.z[j] = d >= 0.0 ? d : 0.0;
+          break;
+        case MergeBranch::kJUpper:
+          s.v[j] = d < 0.0 ? -d : 0.0;
+          break;
+        case MergeBranch::kKLower:
+          s.z[k] = d >= 0.0 ? d : 0.0;
+          break;
+        case MergeBranch::kKUpper:
+          s.v[k] = d < 0.0 ? -d : 0.0;
+          break;
+        case MergeBranch::kNeither:
+          break;  // neither column is at a bound of its own -- both stay 0
       }
     }
   }
