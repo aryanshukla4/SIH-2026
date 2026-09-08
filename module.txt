@@ -5,6 +5,27 @@
 
 Each module has one job and uses the shared project types.
 
+## Changes from v3 (post-lock)
+- Added Module 22: Branch-and-Bound (MILP). Not in v3's scope -- v3 covers LP/QP
+  only. Recorded as its own module, not folded into an existing one, per "no
+  module silently implements another module's job" below.
+- Module 22 extended: point-based warm start across nodes (new
+  `model::forward_map_to_canonical_hint`, the original-to-canonical-space
+  inverse of `recover_solution`), MILP-specific GCD/knapsack presolve
+  (`MilpPresolve.hpp`), and root-level knapsack cover cuts.
+- Module 22 further extended: equality-row absorbing-singleton elimination
+  (`eliminate_equality_row_absorbing_singletons`), needed because
+  markshare_4_0.mps's every row mixes one continuous "deviation" column
+  with otherwise-discrete columns, which silently blocked BOTH the GCD rule
+  and cover-cut separation (both require an all-discrete row). Caught and
+  fixed a real bug during development: the eliminated column's cost must be
+  ALGEBRAICALLY FOLDED into the remaining columns before it becomes a
+  zero-cost empty column, not left for the generic empty-column rule to fix
+  in isolation -- doing that wrong let the solver report a confidently
+  WRONG proof of optimality (objective 0.0, when the true optimum is
+  unreachable at that value) rather than an honest "still searching." A
+  confidently wrong answer is a worse failure than a slow correct one.
+
 ## Changes from v2
 - Module 1: `.mps` is implemented; `.lp` is next, then a model writer, then QPLIB.
 - Module 2: new contract — output is IPM-startable or a definite infeasibility verdict.
@@ -373,6 +394,113 @@ and mathematics.
 Centralize primal/dual/complementarity tolerances, max iterations, `delta_p_floor`,
 `delta_d_floor`, `regularization_escalation_factor`, `max_refinement_steps`, safety factor,
 ordering policy, linear solver policy, presolve/scaling policy and GPU settings.
+
+## 22. Branch-and-Bound (MILP)
+Input Problem with `has_discrete() == true` -> Solution over the discrete variables, or a
+definite Infeasible verdict, or the best incumbent found under a node/time limit (status
+NotConverged, never Infeasible -- same principle as Module 18: a limit is evidence the
+search stopped, not evidence about the model).
+
+**Reuses Module 1-20's entire pipeline UNCHANGED as the per-node relaxation engine.** A
+branch-and-bound node is the original Problem with tightened column bounds; solving it is
+exactly one call to `solve_problem`. This module adds no new IPM math -- only the search
+around it: best-first ordering by relaxation bound, most-fractional branching, and
+incumbent/pruning bookkeeping.
+
+Best-first search: pop the node with the most promising relaxation bound first. This is what
+lets termination double as a proof of optimality (up to `MilpOptions::gap_tolerance`) rather
+than a heuristic cutoff -- once the best remaining bound in the tree cannot beat the
+incumbent, none of the rest can either.
+
+A relaxation that returns anything other than `Optimal` (NotConverged, MaxIterations, ...) has
+its node PRUNED, not retried -- its bound cannot be trusted, and using an unreliable bound to
+cut a subtree risks discarding the true optimum. A relaxation reporting `PrimalInfeasible`
+prunes the node normally (an expected, common outcome, not a search failure).
+
+**Point-based warm start.** Each child node solves with a hint built from its immediate
+parent's own converged solution (Solve.hpp's `warm_start_x`, `Initializer.hpp`'s `warm_start`),
+not a cold bound-midpoint start every time. The real obstacle this had to clear: a child's own
+`canonicalize()`+`presolve()` run independently and can legitimately produce a DIFFERENT
+canonical shape than its parent's (branching a binary variable to `l==u` newly triggers
+`RemoveFixedVariable` for that one column, where it was a plain kept column in the parent) --
+so the parent's canonical-space point cannot be handed to the child directly. Solved with
+`model::forward_map_to_canonical_hint` (Canonicalizer.cpp): replays the child's OWN transform
+stack FORWARD (original space to canonical space -- the inverse direction of `recover_solution`,
+built by mirroring its cases so it cannot drift from what recovery actually does) to map the
+parent's ORIGINAL-space `x` into the child's own canonical space, one column at a time.
+Explicitly scoped to the four transform kinds that currently touch a column's existence or
+identity (`KeepColumn`, `RemoveFixedVariable`, `RemoveFreeSingleton`, `MergeDuplicateColumn`) --
+`TightenBound`/`ShiftVariable`/`NegateVariable` are declared in Transform.hpp but never pushed
+by the current Presolver. A column this cannot map safely is left unhinted (Initializer falls
+back to bound-midpoint for it alone) rather than guessed at. Only the PRIMAL point is
+warm-started this way -- `s`/`y`/`z`/`v` are still derived fresh from the warm-started `x` by
+Initializer's existing logic, not carried over themselves, since they depend on ROW structure
+too and the same shape-mismatch risk applies there with less payoff for the added risk.
+
+**MILP-specific presolve: GCD/knapsack row tightening** (`MilpPresolve.hpp`, run once on the
+root before the search begins). For a row where every nonzero column is discrete with an
+exact-integer coefficient, any integer combination is necessarily a multiple of
+`g = gcd(|a_j|)` -- a finite bound rounds to the nearest multiple of `g` with no integer point
+lost, and a bound that isn't itself a multiple of `g` on an equality row is a PROVABLE
+infeasibility, caught before a single relaxation is solved.
+
+**Knapsack cover cuts** (generated in `solve()`'s root cutting loop, "cut-and-branch": derived
+once against the root relaxation, then held fixed through the whole search -- not regenerated
+per node, which would be full branch-and-cut). Greedy separation (Wolsey's standard heuristic,
+not exact minimum-weight-cover separation, and the cut is not lifted): for a `<=` row over
+binary columns with positive coefficients, greedily builds a cover by adding columns in
+descending order of their current LP value until the coefficient sum exceeds the row's bound,
+then adds `sum x_j <= |cover|-1` if that inequality is actually violated by the relaxation's
+point. Every such cut is globally valid, so generating it once at the root is sound everywhere
+in the tree. Rows needing variable complementation (a negative coefficient) are skipped, not
+attempted.
+
+**Equality-row absorbing-singleton elimination** (`MilpPresolve.hpp`'s
+`eliminate_equality_row_absorbing_singletons`, run before GCD tightening). Both reductions
+above require EVERY column in a row to be discrete -- a real problem on markshare_4_0.mps,
+where every row mixes ~30 binary columns with one CONTINUOUS "deviation" column, blocking both
+rules on every single row. When that continuous column `x_j` is a SINGLETON (appears nowhere
+else) with exactly one finite bound, it can absorb any value in its open direction with no
+effect elsewhere, so the row `a_ij*x_j + R = b_i` is equivalent to a derived ONE-SIDED bound
+purely on `R`. This removes `x_j`'s entry from the row (turning it into an all-discrete
+inequality the two rules above can finally use) and replaces the row's equality bounds with the
+derived one-sided bound.
+
+`x_j`'s cost is NOT independent -- the row forces `x_j = (b_i-R)/a_ij`, so `c_j*x_j` is really a
+function of `R` -- and must be algebraically folded into the remaining columns' own costs and an
+objective constant (`c_j*b_i/a_ij - (c_j/a_ij)*R`) before `x_j` becomes a genuine zero-cost empty
+column for the EXISTING Presolver (Module 4) to fix arbitrarily. Leaving that fold out was a
+real, caught bug: the generic empty-column rule fixed `x_j` at whichever bound minimized ITS OWN
+isolated cost, ignoring the row entirely -- markshare_4_0.mps silently reported a confidently
+WRONG proof of optimality (`objective=0.0`, provably unreachable) instead of an honest "still
+searching." `x_j`'s TRUE value (from the row equation against the FINAL solution, not the
+empty-column rule's arbitrary pick) is recovered once at the very end, via
+`AbsorbingColumnElimination` records `BranchAndBound.cu` collects during elimination.
+
+Only ever removes one absorbing column per row, and only for a genuine equality (both bounds
+finite and equal) -- a ranged/one-sided row with an absorbing column is a separate, rarer case
+not attempted here.
+
+**Known, MEASURED limitation on markshare_4_0.mps: the LP bound does not tighten with search
+depth, at any node budget tested.** After the absorbing-singleton fix above, the search reports
+correctly (no longer a false proof) but still does not converge -- three independent runs at
+2,000 / 4,014 / 10,316 nodes (94s / 350s / 600s) all report `best_bound` within [-2.2e-6, -2.5e-8]
+of zero, no trend across a 5x range in nodes and 6x range in time. The incumbent DOES improve
+with more search (71.0 -> 52.0 across those same three runs, HiGHS's own true optimum is 1.0),
+so the search itself is productive -- it simply cannot PROVE any incumbent optimal, because the
+bound that would certify it never moves. This is a STRUCTURAL property of this instance (4
+constraints spread across 30 binary columns leaves enough freedom in the fractional relaxation
+that almost any partial assignment can still be "completed" to near-zero deviation), not a node-
+budget shortfall: the 10,316-node run took the full 600s (an average ~58ms/node, each a full GPU
+IPM relaxation solve), so reaching the node counts (often 100,000s+) that eventually crack
+instances like this would cost hours, on top of the bound needing a fundamentally different
+technique (cuts coupling all 4 rows simultaneously, not the per-row GCD/cover rules built here)
+to ever move at all. Left as an honestly-documented limitation, not attempted further this pass.
+
+Semi-continuous columns (`VarType::SemiContinuous`) are rejected with `UnsupportedFeature`: they
+need a different branching rule ("0, or within [l,u]") than the integer floor/ceil branching
+implemented here, and silently treating one as an ordinary bounded column would accept points
+the model does not allow.
 
 ## Module Independence
 No module silently implements another module's job. All modules use frozen shared types and

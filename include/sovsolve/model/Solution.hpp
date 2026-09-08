@@ -86,6 +86,20 @@ struct Solution {
   /// than the final iterate -- i.e. the solve stalled or hit a limit. Callers
   /// reporting results should say so.
   bool from_best_iterate = false;
+
+  /// Module 22 (branch-and-bound) only: 0 for a pure LP/QP solve. The number
+  /// of relaxation nodes explored -- diagnostic transparency for a search
+  /// that can legitimately take a long time on a hard instance (see
+  /// solver/gpu/BranchAndBound.hpp).
+  std::size_t nodes_explored = 0;
+
+  /// Module 22 only: the best (tightest) relaxation bound remaining anywhere
+  /// in the search tree when the search stopped. Equal to `objective` when
+  /// `status` is Optimal -- the incumbent and the bound met, which is what
+  /// proves optimality -- otherwise `|objective - best_bound|` is exactly
+  /// how far from a proof of optimality the reported incumbent is. Unset
+  /// (0.0) for a pure LP/QP solve.
+  Real best_bound = 0.0;
 };
 
 }  // namespace sovsolve::model

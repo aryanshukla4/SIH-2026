@@ -105,6 +105,20 @@ class SparseMatrix {
     return slice_end(i) - slice_begin(i);
   }
 
+  /// Explicit deep copy, host-only -- same rationale as Vector::clone(): an
+  /// implicit copy of a multi-million-entry matrix must never happen by
+  /// accident.
+  [[nodiscard]] SparseMatrix clone() const {
+    SparseMatrix out;
+    out.rows_ = rows_;
+    out.cols_ = cols_;
+    out.nnz_ = nnz_;
+    out.offsets_ = offsets_.clone();
+    out.indices_ = indices_.clone();
+    out.values_ = values_.clone();
+    return out;
+  }
+
   /// Verifies I1-I4. Debug builds and module boundaries; not a hot path.
   ///
   /// Defined inline rather than out-of-line so no explicit instantiation list
@@ -178,6 +192,9 @@ struct SparseMatrixPair {
   [[nodiscard]] std::size_t cols() const noexcept { return csr.cols(); }
   [[nodiscard]] std::size_t nnz() const noexcept { return csr.nnz(); }
   [[nodiscard]] bool empty() const noexcept { return csr.nnz() == 0; }
+
+  /// Explicit deep copy, host-only -- see SparseMatrix::clone().
+  [[nodiscard]] SparseMatrixPair clone() const { return SparseMatrixPair{csr.clone(), csc.clone()}; }
 };
 
 }  // namespace sovsolve::core

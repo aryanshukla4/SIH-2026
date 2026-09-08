@@ -2,6 +2,7 @@ add_library(sovsolve_solver STATIC
   Scaler.cpp
   Initializer.cpp
   Presolver.cpp
+  MilpPresolve.cpp
   SolutionReconstructor.cpp
   ConvergenceChecker.cpp
   Diagnostics.cpp
@@ -34,7 +35,8 @@ if(SOVSOLVE_ENABLE_CUDA)
     gpu/StateUpdate.cu
     gpu/MuController.cu
     gpu/PredictorCorrector.cu
-    gpu/Solve.cu)
+    gpu/Solve.cu
+    gpu/BranchAndBound.cu)
 
   target_include_directories(sovsolve_solver_gpu PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>)

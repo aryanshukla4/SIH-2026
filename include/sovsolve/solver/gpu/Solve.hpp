@@ -26,6 +26,7 @@
 #define SOVSOLVE_SOLVER_GPU_SOLVE_HPP
 
 #include "sovsolve/core/Status.hpp"
+#include "sovsolve/core/Vector.hpp"
 #include "sovsolve/model/Options.hpp"
 #include "sovsolve/model/Problem.hpp"
 #include "sovsolve/model/Solution.hpp"
@@ -37,6 +38,14 @@ using model::Options;
 using model::Problem;
 using model::Solution;
 
+/// `warm_start_x`, when non-null, is a point in the ORIGINAL problem's
+/// variable space (typically a previously reconstructed Solution's `x`) --
+/// forward-mapped internally (model::forward_map_to_canonical_hint) into
+/// this call's OWN freshly-canonicalized space before Initializer uses it.
+/// Module 22's branch-and-bound is the intended caller: it seeds a child
+/// node from its parent's solution instead of bound-midpoint everywhere.
+/// Ignored (nullptr) for an ordinary top-level solve.
+///
 /// Solves `problem` end to end. On stall or the iteration limit, the
 /// returned Solution is the best iterate seen (by the worst of the three
 /// FORMULATION.md 9 relative criteria), not the last one, with
@@ -44,7 +53,8 @@ using model::Solution;
 /// here (that verdict, when it happens, comes from model::canonicalize()
 /// failing before this function's loop ever starts).
 [[nodiscard]] Expected<Solution> solve_problem(const Problem& problem,
-                                                const Options& options = {});
+                                                const Options& options = {},
+                                                const core::RealVector* warm_start_x = nullptr);
 
 }  // namespace sovsolve::solver::gpu
 
