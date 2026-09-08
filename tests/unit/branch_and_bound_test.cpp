@@ -50,6 +50,35 @@ model::Problem make_tiny_knapsack() {
   return problem;
 }
 
+// Same knapsack, but tagged VarType::Integer with [0,1] bounds instead of
+// VarType::Binary -- exactly how an MPS file declares a 0/1 variable via
+// `INTORG ... UP bnd x 1` rather than the explicit `BV` bound type
+// (MpsReader.cpp; markshare_4_0.mps uses this exact declaration for all 30
+// of its variables). Cover-cut eligibility originally checked
+// `col_type == Binary` alone, which silently rejected every column here --
+// a real, caught bug (BranchAndBound.cu's `is_binary_like`) that meant
+// cover-cut separation never fired on markshare_4_0.mps at all.
+model::Problem make_tiny_knapsack_integer_typed() {
+  auto problem = make_tiny_knapsack();
+  problem.col_type = {core::VarType::Integer, core::VarType::Integer};
+  return problem;
+}
+
+void test_branch_and_bound_accepts_integer_typed_zero_one_columns() {
+  const auto problem = make_tiny_knapsack_integer_typed();
+
+  model::Options options;
+  auto result = solver::gpu::solve(problem, options);
+  CHECK(result.has_value());
+  if (!result.has_value()) return;
+
+  CHECK(result->status == core::SolverStatus::Optimal);
+  CHECK_NEAR(result->objective, -5.0, 1e-4);
+  CHECK_NEAR(result->best_bound, result->objective, 1e-4);
+  CHECK_NEAR(result->x[0], 1.0, 1e-4);
+  CHECK_NEAR(result->x[1], 0.0, 1e-4);
+}
+
 // x1 + x2 = 10, 0 <= x1,x2 <= 8, min x1 + x2 -- purely continuous, no
 // discrete columns. Same shape solve_gpu_algorithms_test's own boxed-
 // equality fixture uses, kept local so this file has no cross-file
@@ -252,6 +281,7 @@ void test_branch_and_bound_rejects_semi_continuous_columns() {
 }  // namespace
 
 int main() {
+  test_branch_and_bound_accepts_integer_typed_zero_one_columns();
   test_branch_and_bound_folds_absorbing_singleton_cost_correctly();
   test_branch_and_bound_warm_start_survives_two_branching_levels();
   test_branch_and_bound_solves_tiny_knapsack_to_proven_optimal();

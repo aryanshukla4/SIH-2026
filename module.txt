@@ -455,6 +455,37 @@ point. Every such cut is globally valid, so generating it once at the root is so
 in the tree. Rows needing variable complementation (a negative coefficient) are skipped, not
 attempted.
 
+Eligibility ("is this column effectively 0/1") checks `col_type == Binary` OR `col_type ==
+Integer with bounds exactly [0,1]` (`is_binary_like`, BranchAndBound.cu). Checking `== Binary`
+alone was a real, caught bug: MPS has no dedicated binary bound type outside the explicit `BV`
+marker (MpsReader.cpp) -- a column declared `INTORG ... UP bnd x 1` (integer, implicit lower 0,
+explicit upper 1) is tagged `Integer`, not `Binary`, even though it behaves as one. This is
+EXACTLY how markshare_4_0.mps declares all 30 of its variables, so the strict check silently
+rejected every row of it, and cover-cut separation never fired on that file at all until fixed.
+
+**Cross-row (aggregated) cutting.** A single row's own cover/GCD structure can be too weak to
+expose anything useful -- confirmed on markshare_4_0.mps, whose 4 knapsack rows over the SAME 30
+binary columns are each individually weak. A nonnegative (all-ones) combination of several valid
+`<=` rows is still a valid inequality, and the AGGREGATE can reveal a cover or GCD structure none
+of the individual rows shows alone -- a standard technique (surrogate/aggregated constraints) for
+exactly this instance family. Implemented as full power-set enumeration (size >= 2) over the
+ORIGINAL rows that pass the same eligibility check as a single-row cut, each combination tried
+against BOTH the cover-cut and the GCD-cut heuristic (`try_cover_cut_on_view`,
+`try_gcd_cut_on_view`); capped to instances with <= 12 eligible rows (2^12 subsets is still fast;
+this is not a general-purpose separation engine for models with many eligible rows).
+
+MEASURED, not just implemented: after the `is_binary_like` fix above (without it, ALL 4 rows were
+ineligible and aggregation never even ran), all 15 subsets of markshare_4_0.mps's 4 rows are
+tried every cutting round, and NONE ever produces a violated cover or GCD cut against the root
+relaxation's actual fractional point -- confirmed via direct instrumentation during development,
+and via an unchanged end-to-end result (`objective=51.999999997`, `best_bound~-2.5e-8`,
+~10,400 nodes in 600s) before and after the fix. This is a genuine heuristic-power limitation of
+greedy-by-LP-value cover separation, not a bug: the relaxation's actual point does not have
+"columns near 1, columns near 0" the greedy heuristic needs to find a violated cover, on any
+single row OR any aggregate of them. Closing this would need EXACT minimum-weight-cover
+separation (solving a small knapsack per candidate row/aggregate, not greedy) and/or lifting --
+both real, known, unbuilt improvements.
+
 **Equality-row absorbing-singleton elimination** (`MilpPresolve.hpp`'s
 `eliminate_equality_row_absorbing_singletons`, run before GCD tightening). Both reductions
 above require EVERY column in a row to be discrete -- a real problem on markshare_4_0.mps,
@@ -494,8 +525,18 @@ that almost any partial assignment can still be "completed" to near-zero deviati
 budget shortfall: the 10,316-node run took the full 600s (an average ~58ms/node, each a full GPU
 IPM relaxation solve), so reaching the node counts (often 100,000s+) that eventually crack
 instances like this would cost hours, on top of the bound needing a fundamentally different
-technique (cuts coupling all 4 rows simultaneously, not the per-row GCD/cover rules built here)
-to ever move at all. Left as an honestly-documented limitation, not attempted further this pass.
+technique to ever move at all.
+
+**Cross-row cutting (above) was built and tried specifically to close this, and confirmed NOT
+to.** With the `is_binary_like` fix in place (so all 4 rows are actually eligible this time, not
+silently rejected), a `600`-second re-run reports the SAME result as before the fix
+(`objective=51.999999997`, `best_bound~-2.5e-8`, ~10,400 nodes) -- the greedy cover/GCD
+separation, run against every single row AND all 15 row-combinations, finds zero violated cuts
+at the relaxation's actual point, on this instance. So the specific gap this pass closes is
+narrower than "cross-row cuts would fix it": what is actually missing is EXACT (not greedy)
+separation and lifting, or a fundamentally different bound (e.g. genuine lattice/Frobenius-type
+reasoning specific to the generalized-markshare family). Left as an honestly-documented
+limitation, not attempted further this pass.
 
 Semi-continuous columns (`VarType::SemiContinuous`) are rejected with `UnsupportedFeature`: they
 need a different branching rule ("0, or within [l,u]") than the integer floor/ceil branching
