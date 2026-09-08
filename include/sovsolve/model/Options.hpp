@@ -261,6 +261,32 @@ struct PresolveOptions {
   bool enabled = true;
 };
 
+/// Module 22 controls: branch-and-bound over the existing LP/QP relaxation
+/// solver (solve_problem, Solve.hpp), activated automatically whenever
+/// Problem::has_discrete() is true -- see solver/gpu/BranchAndBound.hpp.
+struct MilpOptions {
+  /// A column's relaxation value counts as integral once it is within this
+  /// distance of the nearest integer.
+  Real integer_tolerance = 1e-6;
+
+  /// Search stops once this many nodes have been explored, reporting the
+  /// best incumbent found so far (status NotConverged, never Infeasible --
+  /// same "stagnation is not a verdict about the model" principle Module 18
+  /// applies to the continuous solver's own stall detection) rather than a
+  /// proof of optimality.
+  std::size_t node_limit = 100000;
+
+  double time_limit_seconds = 3600.0;
+
+  /// Search stops early, reporting Optimal, once the gap between the best
+  /// integer-feasible solution found (the incumbent) and the best remaining
+  /// relaxation bound anywhere in the tree closes below this -- an accepted,
+  /// provably-bounded suboptimality, the same "mip gap" every production
+  /// MILP solver (CPLEX, Gurobi, HiGHS) exposes rather than insisting on an
+  /// exact zero gap, which is often not worth the remaining nodes it costs.
+  Real gap_tolerance = 1e-9;
+};
+
 /// Everything, in one object.
 struct Options {
   Tolerances tolerances;
@@ -269,6 +295,7 @@ struct Options {
   ReaderOptions reader;
   LogOptions log;
   PresolveOptions presolve;
+  MilpOptions milp;
 };
 
 }  // namespace sovsolve::model

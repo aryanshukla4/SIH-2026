@@ -905,4 +905,87 @@ core::Expected<Solution> recover_solution(const Problem& original,
   return s;
 }
 
+// ---------------------------------------------------------------------------
+
+core::RealVector forward_map_to_canonical_hint(const Problem& original,
+                                               const CanonicalProblem& canonical,
+                                               const TransformStack& transforms,
+                                               const core::RealVector& original_x_hint) {
+  const std::size_t n0 = original.num_cols();
+  core::RealVector hint(canonical.num_cols(), INF);
+  if (transforms.original_cols != n0 || original_x_hint.size() != n0) {
+    return hint;  // mismatched shape -- leave every entry unhinted, safe fallback
+  }
+
+  std::vector<Index> col_map(n0, kNone);
+  std::vector<Real> col_scale(canonical.num_cols(), 1.0);
+  // (dropped k, surviving j), same pairing recover_solution's merge_pairs
+  // tracks -- built here independently since this walks the stack forward
+  // for a DIFFERENT purpose (hinting, not recovering), not because the
+  // pairing itself could differ.
+  std::vector<std::pair<Index, Index>> merge_pairs;
+
+  for (const auto& rec : transforms.records()) {
+    if (rec.primary == kNone) continue;
+    const auto k = static_cast<std::size_t>(rec.primary);
+    switch (rec.kind) {
+      case TransformKind::KeepColumn:
+        if (k < n0) col_map[k] = rec.secondary;
+        break;
+      case TransformKind::RemoveFixedVariable:
+        // This canonical problem does not carry this column at all (it was
+        // fixed at canonicalize() time) -- no hint to give it, same as any
+        // other column this function does not know how to map.
+        if (k < n0) col_map[k] = kNone;
+        break;
+      case TransformKind::RemoveFreeSingleton:
+        if (rec.secondary != kNone && static_cast<std::size_t>(rec.secondary) < n0) {
+          col_map[static_cast<std::size_t>(rec.secondary)] = kNone;
+        }
+        break;
+      case TransformKind::MergeDuplicateColumn:
+        if (k < n0) col_map[k] = kNone;  // dropped column has no canonical counterpart
+        if (rec.secondary != kNone) merge_pairs.emplace_back(rec.primary, rec.secondary);
+        break;
+      case TransformKind::ColumnScaling:
+        if (k < col_scale.size()) col_scale[k] = rec.value;
+        break;
+      default:
+        break;
+    }
+  }
+
+  // Plain kept columns: canonical value = original value / its own scale --
+  // the exact inverse of recover_solution's `xc[j] = canonical_solution.x[j]
+  // * col_scale[j]`.
+  for (std::size_t j = 0; j < n0; ++j) {
+    if (col_map[j] == kNone) continue;
+    const auto c = static_cast<std::size_t>(col_map[j]);
+    if (c >= hint.size()) continue;
+    const Real scale = col_scale[c] != 0.0 ? col_scale[c] : 1.0;
+    hint[c] = original_x_hint[j] / scale;
+  }
+
+  // Duplicate-column survivor: its canonical value is the COMBINED sum of
+  // both original columns' hint values -- the exact inverse of
+  // recover_solution's split (`s.x[j] + s.x[k] == y`, the pre-split
+  // canonical value). Overwrites the plain-KeepColumn entry the loop above
+  // already set for `j` using only its own value, same ordering
+  // recover_solution itself uses (primal loop first, merge split second).
+  // If the survivor was ITSELF fixed by branching in this child (a
+  // different transform got there first), col_map[j] is already kNone here
+  // and this leaves it unhinted rather than guessing.
+  for (const auto& [k_idx, j_idx] : merge_pairs) {
+    const auto k = static_cast<std::size_t>(k_idx);
+    const auto j = static_cast<std::size_t>(j_idx);
+    if (col_map[j] == kNone) continue;
+    const auto c = static_cast<std::size_t>(col_map[j]);
+    if (c >= hint.size()) continue;
+    const Real scale = col_scale[c] != 0.0 ? col_scale[c] : 1.0;
+    hint[c] = (original_x_hint[j] + original_x_hint[k]) / scale;
+  }
+
+  return hint;
+}
+
 }  // namespace sovsolve::model

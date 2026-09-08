@@ -7,6 +7,7 @@
 #define SOVSOLVE_SOLVER_INITIALIZER_HPP
 
 #include "sovsolve/core/Status.hpp"
+#include "sovsolve/core/Vector.hpp"
 #include "sovsolve/model/Canonical.hpp"
 #include "sovsolve/model/Options.hpp"
 #include "sovsolve/solver/SolverState.hpp"
@@ -47,8 +48,18 @@ using model::Options;
 /// result will show nonzero `rp`. `mu` is seeded from the same point via the
 /// Module 16 formula (`FORMULATION.md`), so the first residual call has a
 /// real target rather than an arbitrary constant.
+/// `warm_start`, when non-null, is a per-canonical-column hint (see
+/// model::forward_map_to_canonical_hint) -- Module 22's branch-and-bound
+/// uses this to seed a child node from its parent's solution instead of
+/// bound-midpoint everywhere. An entry equal to `core::INF` means "no hint
+/// for this column," falling back to the textbook choice above; a real
+/// hint is clamped strictly inside the column's own bounds (never used
+/// as-is against a finite bound) so interiority is never sacrificed for a
+/// closer start, the same principle the slack initialization below already
+/// applies.
 [[nodiscard]] Expected<SolverState> initialize(const CanonicalProblem& problem,
-                                                const Options& options);
+                                                const Options& options,
+                                                const core::RealVector* warm_start = nullptr);
 
 }  // namespace sovsolve::solver
 

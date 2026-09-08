@@ -1,9 +1,11 @@
-// CLI entry point for gpu::solve_problem(): load a model file, solve it, and
-// print the result in a form a benchmark script can parse.
+// CLI entry point for gpu::solve(): load a model file, solve it, and print
+// the result in a form a benchmark script can parse. Dispatches to
+// solve_problem (continuous LP/QP) or branch-and-bound (Module 22) based on
+// whether the model has any discrete columns -- see BranchAndBound.hpp.
 //
 // Only built when SOVSOLVE_ENABLE_CUDA is on (see tools/solve/CMakeLists.txt)
-// -- solve_problem() lives in sovsolve_solver_gpu, which does not exist on a
-// host-only build.
+// -- both live in sovsolve_solver_gpu, which does not exist on a host-only
+// build.
 //
 // Every `--flag=value` below is a direct field on Options (Options.hpp) --
 // this file does not invent new parameters, it just exposes the existing
@@ -15,7 +17,7 @@
 
 #include "sovsolve/io/Load.hpp"
 #include "sovsolve/model/Options.hpp"
-#include "sovsolve/solver/gpu/Solve.hpp"
+#include "sovsolve/solver/gpu/BranchAndBound.hpp"
 
 namespace {
 
@@ -66,6 +68,11 @@ void print_usage(const char* argv0) {
       "  --minres-max-iter=N   IpmOptions::minres_max_iterations      (default 5000 --\n"
       "                        measured necessary, see Options.hpp)\n"
       "  --presolve=0|1        PresolveOptions::enabled               (default 1)\n"
+      "  --mip-int-tol=X       MilpOptions::integer_tolerance         (default 1e-6,\n"
+      "                        MILP only -- ignored for a pure LP/QP model)\n"
+      "  --mip-node-limit=N    MilpOptions::node_limit                (default 100000)\n"
+      "  --mip-time-limit=S    MilpOptions::time_limit_seconds        (default 3600)\n"
+      "  --mip-gap=X           MilpOptions::gap_tolerance             (default 1e-9)\n"
       "\n"
       "output is one `key=value` line per metric, ending with\n"
       "`solve_time_seconds=...` -- that's the number to optimize against.\n",
@@ -128,6 +135,14 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.ipm.minres_max_iterations = std::stoi(val);
     } else if (key == "presolve") {
       options.presolve.enabled = std::stoi(val) != 0;
+    } else if (key == "mip-int-tol") {
+      options.milp.integer_tolerance = std::stod(val);
+    } else if (key == "mip-node-limit") {
+      options.milp.node_limit = static_cast<std::size_t>(std::stoul(val));
+    } else if (key == "mip-time-limit") {
+      options.milp.time_limit_seconds = std::stod(val);
+    } else if (key == "mip-gap") {
+      options.milp.gap_tolerance = std::stod(val);
     } else {
       std::fprintf(stderr, "unknown flag: --%s\n", key.c_str());
       return false;
@@ -183,7 +198,8 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  auto solution = sovsolve::solver::gpu::solve_problem(*problem, options);
+  const bool is_milp = problem->has_discrete();
+  auto solution = sovsolve::solver::gpu::solve(*problem, options);
   if (!solution.has_value()) {
     std::fprintf(stderr, "solve failed: %s\n", solution.error().format().c_str());
     return 1;
@@ -199,6 +215,10 @@ int main(int argc, char** argv) {
   std::printf("max_bound_violation=%.6e\n", solution->quality.max_bound_violation);
   std::printf("from_best_iterate=%s\n", solution->from_best_iterate ? "true" : "false");
   std::printf("solve_time_seconds=%.6f\n", solution->solve_time_seconds);
+  if (is_milp) {
+    std::printf("nodes_explored=%zu\n", solution->nodes_explored);
+    std::printf("best_bound=%.10e\n", solution->best_bound);
+  }
 
   return solution->status == sovsolve::core::SolverStatus::Optimal ? 0 : 1;
 }

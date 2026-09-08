@@ -61,7 +61,8 @@ Real dual_objective(const CanonicalProblem& problem, const SolverState& state) {
 
 }  // namespace
 
-Expected<Solution> solve_problem(const Problem& problem, const Options& options) {
+Expected<Solution> solve_problem(const Problem& problem, const Options& options,
+                                  const core::RealVector* warm_start_x) {
   auto canon = model::canonicalize(problem, options);
   if (!canon.has_value()) return canon.error();
 
@@ -79,7 +80,20 @@ Expected<Solution> solve_problem(const Problem& problem, const Options& options)
   st = scale(canon->problem, options, canon->transforms);
   if (!st.ok()) return st.error();
 
-  auto state = initialize(canon->problem, options);
+  // Module 22 warm start: forward-map the parent's ORIGINAL-space point
+  // into THIS call's own freshly-built canonical space (transforms now
+  // includes the ColumnScaling records scale() just pushed, which the
+  // mapping needs). A null/absent hint is the ordinary path -- unaffected.
+  core::RealVector warm_start_canonical;
+  const core::RealVector* warm_start_canonical_ptr = nullptr;
+  if (warm_start_x != nullptr) {
+    warm_start_canonical =
+        model::forward_map_to_canonical_hint(problem, canon->problem, canon->transforms,
+                                             *warm_start_x);
+    warm_start_canonical_ptr = &warm_start_canonical;
+  }
+
+  auto state = initialize(canon->problem, options, warm_start_canonical_ptr);
   if (!state.has_value()) return state.error();
 
   ConvergenceChecker checker(options, canon->problem);

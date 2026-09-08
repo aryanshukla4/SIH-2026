@@ -129,6 +129,33 @@ struct Problem {
 
   [[nodiscard]] bool has_quadratic() const noexcept { return !Q.empty(); }
 
+  /// Explicit deep copy, host-only -- Problem is move-only (RealVector and
+  /// SparseMatrixPair members are) for the same reason Vector itself is: an
+  /// implicit copy of a multi-million-entry matrix must never happen by
+  /// accident. Module 22 (branch-and-bound) is the one caller that
+  /// genuinely needs an independent Problem per search -- one clone per
+  /// `solve()` call, with only the small `col_lower`/`col_upper` vectors
+  /// re-cloned per node, never `A`/`Q`/`c` again after this.
+  [[nodiscard]] Problem clone() const {
+    Problem out;
+    out.sense = sense;
+    out.obj_constant = obj_constant;
+    out.c = c.clone();
+    out.Q = Q.clone();
+    out.A = A.clone();
+    out.row_lower = row_lower.clone();
+    out.row_upper = row_upper.clone();
+    out.col_lower = col_lower.clone();
+    out.col_upper = col_upper.clone();
+    out.col_type = col_type;
+    out.problem_name = problem_name;
+    out.row_names = row_names;
+    out.col_names = col_names;
+    out.objective_row_name = objective_row_name;
+    out.sos_sets = sos_sets;
+    return out;
+  }
+
   [[nodiscard]] bool has_discrete() const noexcept {
     for (const auto t : col_type) {
       if (t != VarType::Continuous) return true;
