@@ -185,6 +185,38 @@ struct CanonicalResult {
     const Problem& original, const CanonicalProblem& canonical,
     const TransformStack& transforms, const Solution& canonical_solution);
 
+/// Module 22 (branch-and-bound) support: forward-maps an ORIGINAL-space
+/// point -- typically a previously reconstructed Solution's `x` from a
+/// PARENT node -- into a partial CANONICAL-space hint for warm-starting
+/// Initializer on a FRESH canonicalize()+presolve() run of a structurally
+/// similar Problem (a child node differs from its parent by exactly one
+/// column's bounds, but its own canonicalize()+presolve() can legitimately
+/// produce a different canonical shape -- e.g. branching a binary variable
+/// to `l==u` newly triggers RemoveFixedVariable for that one column, where
+/// it was a plain kept column in the parent).
+///
+/// This is the inverse direction of recover_solution -- original space to
+/// canonical space, not canonical to original -- built by replaying the
+/// SAME transform stack forward instead of in reverse, so it cannot drift
+/// from what recover_solution actually does to the columns it CAN map.
+///
+/// Returns a vector of length `canonical.num_cols()`, where each entry is
+/// either a genuine warm-start value or `core::INF` marking "no hint
+/// available for this canonical column" (Initializer falls back to its
+/// normal bound-midpoint choice there). Never fails: an original column
+/// this cannot map safely is simply left unhinted rather than guessed at.
+///
+/// Handles exactly the four transform kinds that currently touch a
+/// column's existence or identity -- KeepColumn, RemoveFixedVariable,
+/// RemoveFreeSingleton, MergeDuplicateColumn (see the .cpp for the case-by-
+/// case derivation); TightenBound/ShiftVariable/NegateVariable are declared
+/// in Transform.hpp but never pushed by the current Presolver, which writes
+/// tightened bounds directly (module.txt Module 4) rather than recording a
+/// separate transform for them.
+[[nodiscard]] core::RealVector forward_map_to_canonical_hint(
+    const Problem& original, const CanonicalProblem& canonical,
+    const TransformStack& transforms, const core::RealVector& original_x_hint);
+
 }  // namespace sovsolve::model
 
 #endif  // SOVSOLVE_MODEL_CANONICAL_HPP

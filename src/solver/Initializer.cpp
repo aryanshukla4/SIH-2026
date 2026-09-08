@@ -1,5 +1,6 @@
 #include "sovsolve/solver/Initializer.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <string>
 
@@ -14,7 +15,8 @@ constexpr Real kUnboundedOffset = 1.0;
 
 }  // namespace
 
-Expected<SolverState> initialize(const CanonicalProblem& problem, const Options& /*options*/) {
+Expected<SolverState> initialize(const CanonicalProblem& problem, const Options& /*options*/,
+                                  const core::RealVector* warm_start) {
   std::size_t bad_index = 0;
   bool bad_is_row = false;
   if (!problem.is_ipm_startable(&bad_index, &bad_is_row)) {
@@ -51,7 +53,25 @@ Expected<SolverState> initialize(const CanonicalProblem& problem, const Options&
     const bool has_lower = core::is_finite_bound(lo);
     const bool has_upper = core::is_finite_bound(hi);
 
-    if (has_lower && has_upper) {
+    const bool has_hint = warm_start != nullptr && j < warm_start->size() &&
+                          core::is_finite_bound((*warm_start)[j]);
+    if (has_hint) {
+      // A real hint is clamped strictly inside the column's own bounds --
+      // never used against a finite bound as-is -- the margin scales with
+      // the box's own width so a binary column's [0,1] box (extremely
+      // common in Module 22's branch-and-bound) is not distorted by a
+      // margin sized for a wide one.
+      Real x_hint = (*warm_start)[j];
+      if (has_lower && has_upper) {
+        const Real margin = std::min({1e-6, 0.001 * (hi - lo), 0.25 * (hi - lo)});
+        x_hint = std::min(std::max(x_hint, lo + margin), hi - margin);
+      } else if (has_lower) {
+        x_hint = std::max(x_hint, lo + kUnboundedOffset * 1e-6);
+      } else if (has_upper) {
+        x_hint = std::min(x_hint, hi - kUnboundedOffset * 1e-6);
+      }
+      state.x[j] = x_hint;
+    } else if (has_lower && has_upper) {
       state.x[j] = 0.5 * (lo + hi);
     } else if (has_lower) {
       state.x[j] = lo + kUnboundedOffset;
