@@ -315,6 +315,32 @@ void test_section_keyword_spellings() {
   }
 }
 
+void test_row_named_after_a_section_keyword_is_not_dropped() {
+  // Regression: peek_section() used to recognize "end" (and every other
+  // section keyword) at the START of a row label, not just as a bare header.
+  // parse_constraints()'s loop-exit check "peek_section(lex_) != Section::None"
+  // ran BEFORE the colon lookahead that decides whether the identifier is a
+  // label, so a row literally named `end` was misread as the file's End
+  // keyword: the loop broke immediately, silently dropping that row and
+  // everything after it in the file (here, the Integer section too). This is
+  // HiGHS's own regression fixture for exactly this case (check/instances/
+  // 1451.lp, "constraint named 'end' which tests code to permit keywords as
+  // constraint names") -- min x s.t. x - 1 >= 2, x integer, so x >= 3 must
+  // survive parsing and Integer must still register.
+  const auto p = lp(R"(Minimize
+  x
+Subject To
+ end: x - 1 >= 2
+Integer
+  x
+End
+)");
+  if (!shaped("row named end", p, 1, 1)) return;
+  CHECK(p.col_type[0] == model::VarType::Integer);
+  CHECK_NEAR(coeff(p, 0, 0), 1.0, 1e-12);
+  CHECK_NEAR(p.row_lower[0], 3.0, 1e-12);  // "- 1" folds into the RHS: x >= 3
+}
+
 void test_bounds_all_forms() {
   const auto p = lp(R"(Minimize
  obj: a + b + c + d + e + f
@@ -656,6 +682,7 @@ int main() {
   test_objective_constant_has_no_sign_trap();
   test_maximize();
   test_section_keyword_spellings();
+  test_row_named_after_a_section_keyword_is_not_dropped();
   test_bounds_all_forms();
   test_integrality();
   test_ranged_constraint_gurobi_form();
