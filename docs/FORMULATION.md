@@ -478,3 +478,178 @@ reason in the `ReductionDescriptor`.
 ```
 
 On stall or limit, return the **best iterate seen**, not the last one.
+
+---
+
+## 12. Simplex working form — **added 2026-09-13 (Module 23)**
+
+§§3–11 describe the interior-point path. This section describes the second
+engine, the revised simplex (`src/solver/simplex/`), which shares §1 and §2
+unchanged and diverges from §3 onward. Both engines consume the same
+`model::CanonicalProblem` and both produce a `model::Solution` that the same
+`recover_solution()` postsolve consumes — postsolve reads values, never a
+basis, so it needed no change.
+
+### 12.1 Augmented working form
+
+§2's canonical form is already bounded-variable:
+
+```
+    min c'x   s.t.   A_E x = b_E,   A_I x + s = b_I, s >= 0,   l <= x <= u
+```
+
+The simplex adds **one logical variable per row** so that a starting basis
+exists by inspection:
+
+```
+    w = (x, xi) in R^(n+m)          the working vector
+    Ahat = [ A | I_m ]              the working matrix
+    Ahat w = b
+    xi_i in [0, 0]                  for i <  num_equality   (fixed logical)
+    xi_i in [0, +INF)               for i >= num_equality   (this IS §2's slack s)
+    x_j  in [col_lower_j, col_upper_j]
+```
+
+`I_m` is **never materialized.** Working column `n+i` *is* `e_i`, and
+`AugmentedMatrix` (`Basis.hpp`) answers `for_each_in_column(n+i)` with a
+single implicit entry. This matches the canonicalizer's existing deliberate
+choice not to store the slack block, and lets `A.csc`/`A.csr` be used as-is.
+
+Range columns that the canonicalizer appends for ranged rows are ordinary
+bounded structurals here. No special case.
+
+### 12.2 Variable status
+
+```
+    enum class VarStatus : uint8_t { Basic, AtLower, AtUpper, Fixed, Free };
+```
+
+A `Basis` is `status` (length `n+m`, indexed by working index) plus `basic`
+(length `m`, the working index occupying each basic *slot*). Both are
+`std::vector`-backed and the struct is copyable, because branch-and-bound
+needs to hand a parent's basis to a child.
+
+`Basis::validate()` must check for a **duplicated** entry in `basic`, not
+merely that the number of `Basic` statuses equals `m`. Counting alone cannot
+catch it: `basic = [5, 5]` with both 5 and 7 marked `Basic` gives a matching
+count and a rank-deficient basis. This was a real bug.
+
+### 12.3 Index spaces — the primary bug class
+
+Two different maps are in play and confusing them is the single most common
+source of silent wrong answers here:
+
+```
+    ftran(v)  solves  B d = v         input indexed by ROW,  output by SLOT
+    btran(v)  solves  B' rho = v      input indexed by SLOT, output by ROW
+```
+
+`B`'s column `k` is `Ahat` column `basic[k]`. So an FTRAN result's component
+`k` belongs to basic *slot* `k` (hence to variable `basic[k]`), while a BTRAN
+result's component `i` belongs to *row* `i` (hence to dual `y_i`). Every
+routine in `detail/SimplexEngine` names its vectors accordingly.
+
+### 12.4 Dual signs — falls out of §4, no global flip
+
+With `y = B^-T c_B` and `d = c - Ahat' y`:
+
+An inequality row's logical has cost `0` and bounds `[0, +INF)`. At its lower
+bound, dual feasibility for a minimization requires `d >= 0`, and
+
+```
+    d_{xi_i}  =  0 - (e_i)' y  =  -y_i  >=  0     =>   y_i <= 0
+```
+
+which is exactly §4's `-y_I > 0` with **no negation applied anywhere.** Then
+
+```
+    z_j = max(d_j, 0),   v_j = max(-d_j, 0),   reduced_cost = z_j - v_j
+```
+
+§4's warning ("an earlier draft claimed the opposite... applying it would
+invert every inequality dual") applies here verbatim. This is asserted in
+`tests/unit/dual_simplex_test.cpp`, not assumed.
+
+### 12.5 The dual pivot, sigma-folded
+
+When basic variable `p` in slot `r` violates a bound, define
+
+```
+    sigma = +1  if  x_B[r] > u_p        (too high: must come down)
+    sigma = -1  if  x_B[r] < l_p        (too low:  must go up)
+    delta = sigma * (x_B[r] - (sigma > 0 ? u_p : l_p))     > 0
+```
+
+Folding `sigma` into the pivot row once, as `arow_j = sigma * alpha_j` where
+`alpha = rho_r' Ahat`, removes every later sign case:
+
+```
+    eligible at lower bound  iff  arow_j > 0
+    eligible at upper bound  iff  arow_j < 0
+    ratio_j = d_j / arow_j                       (>= 0 for any eligible j)
+    entering q = argmin ratio_j                  (bound-flipping may pass several)
+    primal step t     = delta / arow_q
+    dual   step theta = ratio_q
+    y += theta * sigma * rho_r
+```
+
+### 12.6 Termination certificates
+
+Each row is a proof obligation, not a heuristic:
+
+| Condition | `SolverStatus` |
+|---|---|
+| no primal infeasibility, dual feasible | `Optimal` |
+| infeasible row with no eligible entering column | `Infeasible` |
+| a variable rests on an **artificial** bound, and a constructed ray proves the model itself unbounded | `Unbounded` |
+| a variable rests on an artificial bound, no ray proves it, box escalation exhausted | `NotConverged` |
+| iteration / time budget exhausted | `MaxIterations` / `TimeLimit` |
+| LU breakdown that basis repair cannot fix | `NumericalError` |
+
+The `Unbounded` row is deliberately not the inference "the artificial bound
+kept growing, so it is probably unbounded." `ray_is_unbounded()` moves every
+offending column off its artificial bound simultaneously, each in its own
+objective-improving direction, FTRANs the aggregated column once, and checks
+that nothing along the ray ever meets a **true** bound. Testing each column
+alone is not enough: `min -x-y s.t. x-y<=1, -x+y<=1` is unbounded only along
+a joint direction. When no ray can be constructed the engine reports
+`NotConverged` rather than guessing, and the composite path hands the basis
+to the primal simplex, which has no artificial box to be trapped by.
+
+**An `Infeasible` reported while an artificial bound is active is not a
+verdict about the model** — it is a verdict about the artificially boxed
+problem. The engine escalates the box (`artificial_bound_growth`, up to
+`max_artificial_rounds`) and only reports `Infeasible` when no artificial
+bound was in play. Getting this wrong made `greenbea` report a confident,
+completely false `Infeasible`.
+
+### 12.7 Primal simplex blocking events
+
+The primal engine (`PrimalSimplex.cpp`) chooses an entering column first and
+a leaving one second, and the ratio test must consider **three** kinds of
+blocking event, not one:
+
+1. a basic variable reaches one of its own bounds;
+2. the **entering** variable reaches its own opposite bound before any basic
+   variable blocks (a bound flip — the basis does not change);
+3. in phase 1 only, an *infeasible* basic variable reaches the bound it was
+   violating and becomes feasible — this bounds the step even though the
+   variable is not leaving a feasible region.
+
+Phase 1 minimizes the sum of infeasibilities with `c1_j = -1` below lower,
+`+1` above upper, `0` otherwise, and `d1 = -Ahat' y1`. Phase 2 begins with no
+artificial variables to remove.
+
+Bland's smallest-index rule is an **escape from cycling, not a pricing
+rule.** It engages after a run of degenerate pivots and must be released the
+moment any pivot moves a positive distance. Latching it permanently left
+`greenbea` 1.7 away from feasible after 600,000 pivots; releasing it on the
+first real step solved the same instance in 112,421.
+
+### 12.8 Composite dual → primal
+
+`--primal-cleanup` (default on) hands the dual engine's final basis to the
+primal engine. That basis is already primal feasible for the true bounds,
+because the artificial box is a subset of the true bounds, so phase 1 is
+skipped entirely — `phase1_iterations == 0` is asserted in
+`tests/unit/primal_simplex_test.cpp`.
