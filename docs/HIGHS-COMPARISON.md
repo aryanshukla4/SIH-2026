@@ -20,26 +20,75 @@ Andersen's 1995 paper, used by HiGHS, CPLEX, Gurobi, and this project alike,
 each with its own independent implementation). What follows is where the
 actual architecture and algorithms genuinely differ.
 
-## 1. Different algorithm family, not just a different implementation
+## 1. Both algorithm families, each derived independently
 
-**HiGHS** defaults to **dual simplex** for LP (with its own IPM available as
-an option, plus a MIP branch-and-bound layer on top). Simplex moves between
-vertices of the feasible polytope one pivot at a time.
+*(Rewritten 2026-09-13. Until Module 23 this section said "there is no
+simplex code anywhere in this project." That was true when written and is
+not true now; the honest statement is below.)*
 
-**This solver** is a **primal-dual interior-point method (IPM)** exclusively
-— a predictor-corrector (Mehrotra-style) Newton iteration that moves through
-the *interior* of the feasible region, staying strictly inside every bound
-until convergence. There is no simplex code anywhere in this project. The
-two families have different iteration counts, different failure modes, and
-different reasons for needing presolve — none of that is shared code, it's a
-different mathematical approach entirely.
+**HiGHS** defaults to **dual simplex** for LP, with its own IPM available as
+an option and a MIP branch-and-bound layer on top.
 
-## 2. GPU-native, matrix-free by construction
+**This solver** now has both families too, and the overlap in *category* is
+worth stating plainly rather than hiding:
+
+- A **primal-dual interior-point method** (`src/solver/gpu/`), GPU-resident
+  and matrix-free — a predictor-corrector (Mehrotra-style) Newton iteration
+  moving through the *interior* of the feasible region.
+- A **revised simplex** engine (`src/solver/simplex/`, `module.txt` §23),
+  host-only, in both its **dual** and **primal** forms, sharing one
+  factorized-basis core (`detail/SimplexEngine`) and selected at the command
+  line with `--method=dual-simplex` / `--method=primal-simplex`.
+
+What matters for PS 26119 is not whether the *category* is shared — "revised
+simplex with a factorized basis" is a 1953 result (Dantzig–Orchard-Hays), and
+every solver that implements it produces code that rhymes — but whether the
+implementation was **derived or copied**. This project's was derived, and the
+derivation is written down where it can be checked:
+
+| Component | Textbook-level definition it was built from | Where this project's own derivation is written down |
+|---|---|---|
+| Sparse LU, Markowitz ordering + threshold partial pivoting | Markowitz's pivot-cost criterion `(r_i-1)(c_j-1)` | `src/solver/simplex/LuFactor.cpp` header comment, including the argument for why a stalled elimination can always be repaired with a logical |
+| Product-form basis update (PFI) | One elementary eta column per pivot | `LuFactor.cpp::update` |
+| Bounded-variable augmented working form | Derived here from this project's own canonical form | `docs/FORMULATION.md` §12 and `Basis.hpp` |
+| Dual ratio test, sigma-folded pivot row, bound flipping | The bounded-variable dual ratio test | the sign derivation in `DualSimplex.hpp`'s header, worked out symbol by symbol from `y = B^-T c_B` |
+| Dual phase 1 by artificial bounds | Bound the free directions, solve, escalate | `DualSimplex.cpp::restore_dual_feasibility` |
+| Primal phase 1 by sum of infeasibilities | Piecewise-linear composite objective | `PrimalSimplex.hpp` header |
+| Bland's rule as an anti-cycling escape | Bland's smallest-index rule | `PrimalSimplex.cpp::choose_entering` |
+
+These are the *definitions* — the mathematical statements you would find in
+any linear-programming text. The code that implements them here was written
+against those statements, not against another implementation of them.
+
+The vendored `HiGHS/` tree contains its own dual simplex at
+`HiGHS/highs/simplex/HEkkDual.*`. **It was not read while writing any of the
+above**, deliberately and for exactly this reason — the same standard §3
+below describes for the presolve rules. The evidence that this is an
+independent derivation is the shape of the bugs it produced, all recorded in
+`module.txt` §23: a sigma sign that had to be re-derived from scratch, a
+basis-validation check that counted statuses instead of detecting a
+duplicated slot, an artificial-bound escalation that was initially mistaken
+for a genuine `Infeasible` verdict, and a Bland's-rule latch that never
+released. Ported code does not fail that way.
+
+**What the second engine bought, measured:** the IPM reached `Optimal` on
+6–7 of the 19 local Netlib instances; both simplex engines reach `Optimal` on
+19/19 with objectives matching `scripts/oracle_check.py`'s published table.
+`SolverStatus::Infeasible` and `SolverStatus::Unbounded` became reachable
+from the solver for the first time — `gas11` now returns `Unbounded` as a
+certificate instead of running away to `-7.5e10`.
+
+## 2. A GPU-native, matrix-free *interior-point* path
 
 HiGHS is a CPU solver. Its linear algebra (sparse LU for simplex, or a
 sparse Cholesky/LDL^T for its own IPM option) factors matrices explicitly.
 
-This solver's linear algebra is **matrix-free and GPU-resident**
+This project's **simplex** path is also CPU and also factors explicitly — a
+sparse LU is what the method requires, and claiming otherwise would be
+dishonest. The difference described in this section is about the **IPM**
+path, which is GPU-resident and factors nothing.
+
+The IPM's linear algebra is **matrix-free and GPU-resident**
 (`src/solver/gpu/LinearSolver.cu`): every Newton system is solved by an
 iterative Krylov method that only ever *applies* the matrix as a sequence of
 sparse matrix-vector products (cuSPARSE SpMV) — the KKT matrix itself is

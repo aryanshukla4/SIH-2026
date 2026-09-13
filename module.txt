@@ -26,6 +26,15 @@ Each module has one job and uses the shared project types.
   unreachable at that value) rather than an honest "still searching." A
   confidently wrong answer is a worse failure than a slow correct one.
 
+- Added Module 23: Revised Simplex (2026-09-13). See the section below. Like
+  Module 22 it is recorded as its own module rather than folded into Module 12
+  (Linear Solver): Module 12 solves a Newton system for the IPM, Module 23 is a
+  second complete LP algorithm with its own basis, its own factorization and its
+  own termination certificates. This also makes `SolverStatus::Infeasible` and
+  `SolverStatus::Unbounded` reachable from the solver for the first time -- until
+  now `Infeasible` came only from the canonicalizer and `Unbounded` was never
+  returned at all.
+
 ## Changes from v2
 - Module 1: `.mps` is implemented; `.lp` is next, then a model writer, then QPLIB.
 - Module 2: new contract — output is IPM-startable or a definite infeasibility verdict.
@@ -542,6 +551,110 @@ Semi-continuous columns (`VarType::SemiContinuous`) are rejected with `Unsupport
 need a different branching rule ("0, or within [l,u]") than the integer floor/ceil branching
 implemented here, and silently treating one as an ordinary bounded column would accept points
 the model does not allow.
+
+## 23. Revised Simplex (LP) -- added 2026-09-13
+
+A second, independent LP engine. Host-only: it has no CUDA dependency, which is
+what finally makes `cmake --preset release` on native Windows produce a working
+`solve` binary and running solver tests. It reuses the existing
+canonicalize -> presolve -> scale -> reconstruct pipeline completely unchanged;
+`presolve()` and `scale()` are algorithm-agnostic and needed no edits, and
+postsolve consumes values rather than a basis, so `recover_solution()` needed
+none either.
+
+**Revised simplex is the implementation form; primal and dual are the two
+algorithms.** Both are implemented, both share one factorized-basis core
+(`src/solver/simplex/detail/SimplexEngine.{hpp,cpp}`), and they differ only in
+which variable they choose first:
+
+    dual   -- pick a primal-infeasible BASIC variable (row), then find the
+              entering column by a dual ratio test; stays dual feasible.
+    primal -- pick a dual-infeasible NONBASIC variable (column), then find the
+              leaving row by a primal ratio test; stays primal feasible.
+
+Selected with `--method=dual-simplex` / `--method=primal-simplex`
+(`--method=ipm` remains the default). `Options::simplex` holds the tolerances.
+
+Files:
+
+    include/sovsolve/solver/simplex/Basis.hpp          AugmentedMatrix, VarStatus, Basis
+    include/sovsolve/solver/simplex/LuFactor.hpp       Markowitz LU + PFI update
+    include/sovsolve/solver/simplex/DualSimplex.hpp    dual algorithm + sign derivation
+    include/sovsolve/solver/simplex/PrimalSimplex.hpp  primal algorithm
+    include/sovsolve/solver/simplex/SimplexResult.hpp  one result type for both
+    include/sovsolve/solver/simplex/SolveSimplex.hpp   dispatch + composite handoff
+    include/sovsolve/solver/simplex/SimplexSolution.hpp -> model::Solution
+    include/sovsolve/solver/LpSolve.hpp                host-only whole-pipeline entry
+    src/solver/simplex/detail/SimplexEngine.{hpp,cpp}  shared state and kernels
+
+The mathematics is in `docs/FORMULATION.md` section 12 (augmented working form,
+index spaces, the dual sign derivation, the sigma folding, the termination
+certificates) and is not repeated here.
+
+### Results
+
+19/19 local Netlib instances reach `Optimal` on BOTH engines with matching
+objectives, against 6-7/19 for the IPM. Every objective was cross-checked
+against `scripts/oracle_check.py`'s published table, including its two
+documented archive-drift entries: `80bau3b` (8.1e-6 drift) and `greenbea`,
+where our `-7.2555248130e+07` matches the LP DASA / HiGHS value rather than the
+1988 archive's `-7.2462405908e+07`. `gas11` returns `Unbounded` -- the archive
+has no ground truth for it and HiGHS also reports unbounded.
+
+Neither engine dominates: `stair` takes 569 primal pivots against 3357 dual;
+`80bau3b` takes 5546 dual against 19201 primal. That is the ordinary reason
+production solvers keep both, and it is why `--primal-cleanup` (default on)
+runs the dual first and hands its basis to the primal.
+
+### Bugs found and fixed during development, kept here because each was a real trap
+
+1. **`Basis::validate()` counted statuses instead of detecting duplicates.**
+   `basic = [5,5]` with 5 and 7 both marked `Basic` passes a count check and is
+   rank-deficient. Now uses a `seen` bitmap.
+2. **PFI drift made `greenbea`'s basis genuinely singular** at every
+   refactorization boundary -> `NumericalError`. Fixed with
+   `LuFactorization::factorize_repairing`, which on a stalled elimination puts a
+   stalled row's LOGICAL into a stalled slot. That logical provably cannot
+   already be basic: its column is `e_p`, so if it were basic its slot would be
+   a singleton in the active submatrix, Markowitz scores a singleton at zero
+   cost, and it would already have been pivoted.
+3. **`greenbea` then reported a confident, FALSE `Infeasible`.** An
+   infeasibility found inside the artificially-bounded phase-1 problem is a
+   verdict about the box, not about the model. Now escalates the box; only an
+   infeasibility with no artificial bound in play is a model verdict.
+4. **`stair` regressed `Optimal(3357)` -> `MaxIterations(-4.2e7)`** because
+   "restore dual feasibility at every refactorization" could install a NEW
+   artificial box mid-solve, jumping a nonbasic by 1e7. Split into
+   `reflip_dual_infeasible()` (refactorization; re-places only within bounds
+   that already exist) and `restore_dual_feasibility()` (phase 1 and after
+   repairs only).
+5. **Unboundedness needs a JOINT ray.** Testing one column at a time misses
+   `min -x-y s.t. x-y<=1, -x+y<=1`. `any_unbounded_ray()` tries the joint
+   direction first, then each column alone.
+6. **Bland's rule latched permanently**, leaving `greenbea` 1.7 away from
+   feasible after 600,000 phase-1 pivots. Bland's is an escape from cycling,
+   not a pricing rule to settle into: it is now released on any pivot that
+   moves a positive distance. Same instance then solved in 112,421 pivots.
+
+A seventh was a bug in the TEST, not the solver, and is documented in
+`tests/unit/primal_simplex_test.cpp` so it is not re-introduced: `min 4a+3b+5c`
+with those constraints has a CONSTANT objective (`-8b+3b+5b = 0`), so it cannot
+distinguish a correct solver from a broken one.
+
+### Not done in this pass, deliberately
+
+Dual steepest edge, Harris two-pass ratio test, Forrest-Tomlin update and
+hypersparse FTRAN/BTRAN are all known improvements over what is here (Dantzig
+pricing, a single-pass ratio test with a stability guard, PFI, dense working
+vectors with a nonzero list). They are left for a measured second pass, one
+technique per commit with before/after corpus numbers, per `docs/BENCHMARKS.md`.
+So is the GPU pricing offload for `alpha_r = rho_r' Ahat`, which is to be kept
+only if it is measured faster on this corpus.
+
+B&B warm starting (Stage 3 of the plan) is also not done: `BranchAndBound.cu`
+still re-runs canonicalize + presolve per node, which can change the canonical
+shape between parent and child, and a basis index space cannot survive that.
+`BranchAndBound.hpp`'s stated limitation therefore still stands as written.
 
 ## Module Independence
 No module silently implements another module's job. All modules use frozen shared types and

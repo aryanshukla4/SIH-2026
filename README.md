@@ -213,11 +213,31 @@ every module exposes the same `include/` root.
 
 ---
 
-## Solver core (Modules 5-20)
+## Solver core (Modules 5-20, 23)
+
+**There are two LP engines.**
+
+- **Interior point** (Modules 5-20, `src/solver/gpu/`) -- GPU-resident,
+  matrix-free, predictor-corrector. The default (`--method=ipm`), and the only
+  path that handles QP.
+- **Revised simplex** (Module 23, `src/solver/simplex/`) -- host-only, in both
+  its dual and primal forms, sharing one factorized-basis core.
+  `--method=dual-simplex` / `--method=primal-simplex`. LP only. Added
+  2026-09-13; see `module.txt` section 23 and `docs/FORMULATION.md` section 12.
+
+Because the simplex engine has no CUDA dependency, `cmake --preset release` on
+native Windows -- no WSL2, no CUDA toolkit -- now produces a working `solve`
+binary and runs 17 of the 19 test suites. That was not true before Module 23:
+`tools/solve` was hard-gated on `if(TARGET sovsolve_solver_gpu)`.
+
+### Interior-point path
 
 The interior-point solver itself -- Scaler, Initializer, KKT builder, linear
 solver, predictor-corrector loop, and everything downstream of it -- lives
-under `include/sovsolve/solver/` and `src/solver/`. It is currently a
+under `include/sovsolve/solver/` and `src/solver/`. *(The paragraph below
+describes an early state of this module and is kept for history; the linear
+solver in particular has since been replaced -- see the correction after it.)*
+It was at that point a
 **skeleton**: types and module boundaries exist and compile, and a few
 modules have real algorithm code -- `Initializer` (Module 6, a bound-midpoint
 strictly-interior starting point), `gpu::compute_residuals` (Module 7, the
@@ -439,8 +459,31 @@ gap, so it only ever engages at the precision floor. `shell.mps` no longer
 crashes; it now reaches `Optimal` (with `--stall=40`) matching the published
 `1.2088253460e9`.
 
-**Current state, the full local 19-instance Netlib set** (default settings,
-`--max-iter=300`): **6 reach `Optimal`** (`afiro`, `avgas`, `chip`, `egout`,
+**Current state, the full local 19-instance Netlib set.**
+
+*Simplex (Module 23, 2026-09-13): **19/19 reach `Optimal` on both engines**,
+with matching objectives.* Every objective was cross-checked against
+`scripts/oracle_check.py`'s published table, including its two documented
+archive-drift entries -- `80bau3b` (8.1e-6) and `greenbea`, where our
+`-7.2555248130e+07` matches the LP DASA / HiGHS value rather than the 1988
+archive's `-7.2462405908e+07`. `gas11` returns **`Unbounded`**: the archive has
+no ground truth for it and HiGHS also reports unbounded. This is the first time
+this solver has produced `Unbounded` at all -- see the IPM paragraph below,
+which called that "an architectural gap, not a quick fix," and was right.
+
+| | IPM | dual simplex | primal simplex |
+|---|---|---|---|
+| `Optimal` | 6-7 / 19 | **19 / 19** | **19 / 19** |
+| `Unbounded` detected | never | `gas11` | `gas11` |
+
+Neither simplex engine dominates the other: `stair` takes 569 primal pivots
+against 3357 dual, while `80bau3b` takes 5546 dual against 19201 primal. That
+is the ordinary reason production solvers keep both, and it is why
+`--primal-cleanup` (on by default) runs the dual and then hands its final basis
+to the primal.
+
+*IPM, for comparison* (default settings, `--max-iter=300`): **6 reach
+`Optimal`** (`afiro`, `avgas`, `chip`, `egout`,
 `flugpl`, `rgn`) -- `shell` makes 7 with a slightly relaxed `--stall`. Several
 more are essentially converged but plateau just above the `1e-8` tolerance
 even given 4x more iterations (`stair` gap `~7e-6`, `bell5` `~9e-5`,
@@ -467,12 +510,27 @@ compatibility. `--help` prints the full list with defaults and the
 ### `tools/solve` -- CLI entry point for testing against real files
 
 ```sh
+# host-only build, no CUDA toolkit needed (simplex engines)
+./build/tools/solve/solve tests/data/netlib/afiro.mps --method=dual-simplex
+./build/tools/solve/solve tests/data/netlib/afiro.mps --method=primal-simplex
+
+# CUDA build (adds the interior-point default)
 ./build-cuda/tools/solve/solve tests/data/netlib/afiro.mps [max_iterations]
 ```
 
-Loads a model file, calls `solve_problem()`, and prints status/objective/
-iterations/quality in a form a benchmark script can parse. Only built under
-`SOVSOLVE_ENABLE_CUDA` (`solve_problem` needs the GPU library). Per-iteration
+Loads a model file, solves it, and prints status/objective/iterations/quality
+in a form a benchmark script can parse.
+
+`--method=ipm|dual-simplex|primal-simplex` selects the engine; `ipm` is the
+default and is **compiled out** when `SOVSOLVE_ENABLE_CUDA` is off, since
+`solve_problem()` needs the GPU library. The simplex flags are
+`--simplex-max-iter`, `--pivot-tolerance`, `--pivot-floor`,
+`--refactor-interval`, `--artificial-bound`, `--primal-cleanup`,
+`--bound-flipping`, `--simplex-tol-primal`, `--simplex-tol-dual`.
+
+The tool is no longer gated on the GPU library existing -- it builds against
+`sovsolve_solver` alone and only links `sovsolve_solver_gpu` when that target
+is present. Per-iteration
 diagnostics print by default (`LogOptions::Level::Iteration`, `Options`'s own
 default) -- `Logging.cpp`'s line now includes `mu`, `mu_aff`, `sigma`, and
 both residuals, which is what made the `afiro` trajectory above visible in
@@ -482,7 +540,17 @@ the first place; `Level::Debug` additionally adds factor/solve/refine timing.
 QpAugmentedKkt`); the normal-equations LP path (`FORMULATION.md` 10.1) needs
 a sparse `A * Theta * A^T` product this pass does not build, and is deferred.
 
-`gpu::solve` is a deliberate stopgap, documented in full in
+**Correction (2026-09-13):** the paragraph below describes the dense cuSOLVER
+stopgap, which is no longer the production path. `src/solver/gpu/LinearSolver.cu`
+now implements matrix-free Krylov solves -- `solve_spd_cg` (CG on the normal
+equations, IC(0)-preconditioned) and `solve_minres` (MINRES on the augmented
+KKT) -- and those are what a solve actually uses. `solve_dense`/`solve_spd_dense`
+survive as the reference implementations the Krylov solvers' algebra is tested
+against, which is why they are still in the file. `docs/HIGHS-COMPARISON.md`
+section 2 describes the current design; this paragraph is the stale one. Kept
+here rather than deleted so the history is legible:
+
+`gpu::solve` was a deliberate stopgap, documented in full in
 `gpu/LinearSolver.hpp`: it converts the sparse KKT matrix to **dense**
 (`O(dim^2)` memory, `O(dim^3)` time -- fine for small test problems, not for
 a real Netlib/MIPLIB instance) and factorizes with cuSOLVER's classic

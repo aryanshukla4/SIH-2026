@@ -1,11 +1,14 @@
-// CLI entry point for gpu::solve(): load a model file, solve it, and print
-// the result in a form a benchmark script can parse. Dispatches to
-// solve_problem (continuous LP/QP) or branch-and-bound (Module 22) based on
-// whether the model has any discrete columns -- see BranchAndBound.hpp.
+// CLI entry point: load a model file, solve it, and print the result in a form
+// a benchmark script can parse.
 //
-// Only built when SOVSOLVE_ENABLE_CUDA is on (see tools/solve/CMakeLists.txt)
-// -- both live in sovsolve_solver_gpu, which does not exist on a host-only
-// build.
+// `--method` chooses the engine. The interior-point path (gpu::solve, which
+// also dispatches branch-and-bound for a model with discrete columns -- see
+// BranchAndBound.hpp) lives in sovsolve_solver_gpu and is compiled in only
+// under SOVSOLVE_ENABLE_CUDA. The two simplex paths (Module 23) are host-only,
+// so this tool now builds and runs without a CUDA toolkit at all -- before
+// Module 23 it was skipped entirely on a host-only build, which left
+// everything downstream of the canonicalizer unreachable from the default
+// `release` preset.
 //
 // Every `--flag=value` below is a direct field on Options (Options.hpp) --
 // this file does not invent new parameters, it just exposes the existing
@@ -17,7 +20,10 @@
 
 #include "sovsolve/io/Load.hpp"
 #include "sovsolve/model/Options.hpp"
+#include "sovsolve/solver/LpSolve.hpp"
+#ifdef SOVSOLVE_ENABLE_CUDA
 #include "sovsolve/solver/gpu/BranchAndBound.hpp"
+#endif
 
 namespace {
 
@@ -42,7 +48,24 @@ void print_usage(const char* argv0) {
       "\n"
       "tuning flags (each is a field on model::Options -- see Options.hpp\n"
       "for the full doc comment on why each default is what it is):\n"
-      "  --max-iter=N          Limits::max_iterations       (default 200)\n"
+      "\n"
+      "  --method=ipm|dual-simplex|primal-simplex   SimplexOptions::method\n"
+      "                        (default ipm; the two simplex paths are host-only,\n"
+      "                        and are the only engines a non-CUDA build has)\n"
+      "  --simplex-max-iter=N  SimplexOptions::max_iterations   (0 = auto)\n"
+      "  --pivot-tolerance=X   SimplexOptions::pivot_tolerance  (default 0.1)\n"
+      "  --pivot-floor=X       SimplexOptions::pivot_floor      (default 1e-9)\n"
+      "  --refactor-interval=N SimplexOptions::refactor_interval (default 100)\n"
+      "  --artificial-bound=X  SimplexOptions::artificial_bound  (default 1e7)\n"
+      "  --primal-cleanup=0|1  SimplexOptions::primal_cleanup    (default 1 --\n"
+      "                        finish a dual run that ended without a verdict\n"
+      "                        by handing its basis to the primal simplex)\n"
+      "  --bound-flipping=0|1  SimplexOptions::bound_flipping    (default 1)\n"
+      "  --simplex-tol-primal=X  SimplexOptions::primal_feasibility_tolerance\n"
+      "  --simplex-tol-dual=X    SimplexOptions::dual_feasibility_tolerance\n"
+      "\n"
+      "  --max-iter=N          Limits::max_iterations       (default 200,\n"
+      "                        interior-point only -- see --simplex-max-iter)\n"
       "  --time-limit=S        Limits::time_limit_seconds   (default 3600)\n"
       "  --stall=N             Limits::stall_iterations     (default 10)\n"
       "  --tol-primal=X        Tolerances::primal_feasibility (default 1e-8)\n"
@@ -89,7 +112,37 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
   const std::string val = flag.substr(eq + 1);
 
   try {
-    if (key == "max-iter") {
+    if (key == "method") {
+      if (val == "ipm" || val == "interior-point") {
+        options.simplex.method = sovsolve::model::Method::InteriorPoint;
+      } else if (val == "dual-simplex" || val == "simplex") {
+        options.simplex.method = sovsolve::model::Method::DualSimplex;
+      } else if (val == "primal-simplex" || val == "primal") {
+        options.simplex.method = sovsolve::model::Method::PrimalSimplex;
+      } else {
+        std::fprintf(stderr, "unknown --method: %s (ipm, dual-simplex or primal-simplex)\n",
+                     val.c_str());
+        return false;
+      }
+    } else if (key == "simplex-max-iter") {
+      options.simplex.max_iterations = static_cast<std::size_t>(std::stoul(val));
+    } else if (key == "pivot-tolerance") {
+      options.simplex.pivot_tolerance = std::stod(val);
+    } else if (key == "pivot-floor") {
+      options.simplex.pivot_floor = std::stod(val);
+    } else if (key == "refactor-interval") {
+      options.simplex.refactor_interval = static_cast<std::size_t>(std::stoul(val));
+    } else if (key == "artificial-bound") {
+      options.simplex.artificial_bound = std::stod(val);
+    } else if (key == "primal-cleanup") {
+      options.simplex.primal_cleanup = std::stoul(val) != 0;
+    } else if (key == "bound-flipping") {
+      options.simplex.bound_flipping = std::stoul(val) != 0;
+    } else if (key == "simplex-tol-primal") {
+      options.simplex.primal_feasibility_tolerance = std::stod(val);
+    } else if (key == "simplex-tol-dual") {
+      options.simplex.dual_feasibility_tolerance = std::stod(val);
+    } else if (key == "max-iter") {
       options.limits.max_iterations = static_cast<std::size_t>(std::stoul(val));
     } else if (key == "time-limit") {
       options.limits.time_limit_seconds = std::stod(val);
@@ -199,7 +252,27 @@ int main(int argc, char** argv) {
   }
 
   const bool is_milp = problem->has_discrete();
-  auto solution = sovsolve::solver::gpu::solve(*problem, options);
+  // Anything that is not the interior-point method is a simplex, and both of
+  // them enter through solver::solve_lp. Testing for DualSimplex alone silently
+  // routed --method=primal-simplex into the IPM branch.
+  const bool use_simplex =
+      options.simplex.method != sovsolve::model::Method::InteriorPoint;
+
+  // The dual simplex is host-only (src/solver/CMakeLists.txt), so this tool
+  // now builds and runs without the CUDA toolkit -- it previously could not be
+  // built at all outside WSL2, which left every stage downstream of the
+  // canonicalizer unreachable from the default `release` preset.
+  auto solution = use_simplex
+                      ? sovsolve::solver::solve_lp(*problem, options)
+#ifdef SOVSOLVE_ENABLE_CUDA
+                      : sovsolve::solver::gpu::solve(*problem, options);
+#else
+                      : sovsolve::core::Expected<sovsolve::model::Solution>(
+                            sovsolve::core::make_error(
+                                sovsolve::core::ErrorCode::NotImplemented,
+                                "this build has no CUDA, so the interior-point path is "
+                                "absent; pass --method=dual-simplex"));
+#endif
   if (!solution.has_value()) {
     std::fprintf(stderr, "solve failed: %s\n", solution.error().format().c_str());
     return 1;
