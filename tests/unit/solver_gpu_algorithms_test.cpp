@@ -19,6 +19,7 @@
 
 #include "sovsolve/analysis/MatrixAnalysis.hpp"
 #include "sovsolve/core/SparseBuilder.hpp"
+#include "sovsolve/io/Load.hpp"
 #include "sovsolve/model/Canonical.hpp"
 #include "sovsolve/model/Options.hpp"
 #include "sovsolve/model/Problem.hpp"
@@ -254,7 +255,12 @@ void test_linear_solver_diagonal_system() {
   CHECK_NEAR(result->solution[0], 2.0, 1e-9);
   CHECK_NEAR(result->solution[1], 3.0, 1e-9);
   CHECK_NEAR(result->solution[2], 4.0, 1e-9);
-  CHECK_EQ(result->refinement_passes, std::size_t{0});  // deferred this pass
+  // solve_dense itself never does refinement -- PredictorCorrector.cu's
+  // solve_newton_system now orchestrates it one layer up, as repeated
+  // solve_minres calls against the unregularized residual (see
+  // unregularized_residual()'s doc comment there), not inside the linear
+  // solver functions themselves.
+  CHECK_EQ(result->refinement_passes, std::size_t{0});
 }
 
 void test_linear_solver_on_augmented_kkt_system() {
@@ -643,8 +649,8 @@ void test_predictor_corrector_run_iteration_reduces_primal_residual() {
 
   solver::RegularizationController regularization(options);
   solver::IterationRecord record;
-  const auto status =
-      solver::gpu::run_iteration(canonical, options, regularization, *state, record);
+  const auto status = solver::gpu::run_iteration(canonical, options, regularization, *state,
+                                                  residuals_before, record);
   CHECK(status.ok());
   if (!status.ok()) return;
 
@@ -680,10 +686,14 @@ void test_predictor_corrector_fixed_sigma_path() {
   CHECK(state.has_value());
   if (!state.has_value()) return;
 
+  CHECK(solver::gpu::update_mu(canonical, *state).ok());
+  solver::Residuals residuals;
+  CHECK(solver::gpu::compute_residuals(canonical, *state, state->mu, residuals).ok());
+
   solver::RegularizationController regularization(options);
   solver::IterationRecord record;
-  const auto status =
-      solver::gpu::run_iteration(canonical, options, regularization, *state, record);
+  const auto status = solver::gpu::run_iteration(canonical, options, regularization, *state,
+                                                  residuals, record);
   CHECK(status.ok());
   if (!status.ok()) return;
 
@@ -748,6 +758,98 @@ void test_solve_problem_normal_equations_matches_augmented() {
   }
 }
 
+void test_solve_problem_qp_converges_to_optimal() {
+  // Regression for the QP dual_objective() bug in Solve.cu: it subtracted the
+  // FULL x'Qx instead of 0.5*x'Qx (CanonicalProblem::objective() defines the
+  // primal objective as c'x + 0.5*x'Qx, so the Lagrangian-derived dual
+  // objective needs the same 1/2). x'Qx was 12.0 at the optimum below, so the
+  // old code reported dual_obj = -12.0 against the true objective of -6.0 --
+  // a fixed relative_gap of 6/7 that MaxIterations could never close, even
+  // though primal/dual residuals and complementarity were all at machine
+  // epsilon by iteration 4. This is instance 2821 from HiGHS's regression
+  // suite (tests/data/lp/2821.mps and its -qmatrix/-quadobj/-summation/
+  // -duplicate MPS-encoding variants, all the same QP).
+  const auto problem = io::parseProblem(R"(NAME          MPSXNAME
+ROWS
+ N  X5
+ E  X6
+ E  X7
+ E  X8
+COLUMNS
+    X0        X6        1.0000000000
+    X1        X5        -4.000000000
+    X1        X6        3.0000000000
+    X1        X8        1.0000000000
+    X2        X5        -4.000000000
+    X2        X7        1.0000000000
+    X3        X5        -2.000000000
+    X3        X7        1.0000000000
+    X4        X5        -2.000000000
+    X4        X7        -2.000000000
+    X4        X8        -1.000000000
+RHS
+    ..RHS     X6        4.0000000000
+QUADOBJ
+    X4        X4        2.0000000000
+    X3        X3        2.0000000000
+    X2        X2        2.0000000000
+    X2        X1        2.0000000000
+    X1        X1        4.0000000000
+    X1        X0        -2.000000000
+    X0        X0        2.0000000000
+ENDATA
+)",
+                                        io::FileFormat::Mps);
+  CHECK(problem.has_value());
+  if (!problem.has_value()) return;
+  CHECK(problem->has_quadratic());
+
+  model::Options options;
+  auto result = solver::gpu::solve_problem(*problem, options);
+  CHECK(result.has_value());
+  if (!result.has_value()) return;
+
+  CHECK(result->status == core::SolverStatus::Optimal);
+  CHECK_NEAR(result->objective, -6.0, 1e-6);
+  CHECK(result->quality.relative_gap < options.tolerances.relative_gap * 10);
+}
+
+void test_solve_problem_status_matches_quality_on_grow7() {
+  // Regression for a bug in Solve.cu's final `best.status = status;`: it
+  // overwrote the status recorded when the BEST (smallest-metric) iterate
+  // was actually snapshotted (Solve.cu's loop, "best.status = status" at the
+  // point metric < best_metric) with whatever the OUTER loop's break
+  // condition observed instead -- which can be a LATER, WORSE iteration's
+  // status (e.g. checker.is_stalled() tripping on a point that had since
+  // drifted) even when the returned snapshot's own quality was already well
+  // inside every tolerance. Found empirically on grow7.mps: a run reported
+  // dual_infeasibility=5.7e-15 and relative_gap=1.6e-16 (both many orders
+  // below the 1e-8 default tolerances) as NotConverged.
+  //
+  // Checked as an INVARIANT (status must agree with the quality actually
+  // returned), not a specific expected status/objective: GPU floating-point
+  // non-associativity makes the exact iteration path -- and so whether any
+  // given run would even reach the pathological point that used to trip this
+  // -- non-deterministic run to run. The invariant must hold regardless.
+  auto problem = io::loadProblem(std::string(SOVSOLVE_TEST_DATA_DIR) + "/lp/grow7.mps");
+  CHECK(problem.has_value());
+  if (!problem.has_value()) return;
+
+  model::Options options;
+  options.limits.max_iterations = 300;
+  auto result = solver::gpu::solve_problem(*problem, options);
+  CHECK(result.has_value());
+  if (!result.has_value()) return;
+
+  const bool quality_is_optimal =
+      result->quality.primal_infeasibility < options.tolerances.primal_feasibility &&
+      result->quality.dual_infeasibility < options.tolerances.dual_feasibility &&
+      result->quality.relative_gap < options.tolerances.relative_gap;
+  if (quality_is_optimal) {
+    CHECK(result->status == core::SolverStatus::Optimal);
+  }
+}
+
 void test_residuals_rejects_mismatched_state_size() {
   const auto problem = make_boxed_equality_problem();
   auto canon = model::canonicalize(problem);
@@ -786,6 +888,8 @@ int main() {
   test_predictor_corrector_fixed_sigma_path();
   test_solve_problem_end_to_end();
   test_solve_problem_normal_equations_matches_augmented();
+  test_solve_problem_qp_converges_to_optimal();
+  test_solve_problem_status_matches_quality_on_grow7();
   test_residuals_rejects_mismatched_state_size();
   return sovsolve::test::report("solver_gpu_algorithms");
 }

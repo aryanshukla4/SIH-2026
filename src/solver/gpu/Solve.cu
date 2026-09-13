@@ -14,6 +14,7 @@
 #include "sovsolve/solver/Scaler.hpp"
 #include "sovsolve/solver/SolutionReconstructor.hpp"
 #include "sovsolve/solver/SolverState.hpp"
+#include "sovsolve/solver/gpu/MuController.hpp"
 #include "sovsolve/solver/gpu/PredictorCorrector.hpp"
 #include "sovsolve/solver/gpu/ResidualCalculator.hpp"
 
@@ -21,7 +22,7 @@ namespace sovsolve::solver::gpu {
 
 namespace {
 
-/// b'y + l'z - u'v - x'Qx (finite-bound terms only). NOT just b'y: with
+/// b'y + l'z - u'v - 0.5*x'Qx (finite-bound terms only). NOT just b'y: with
 /// stationarity (rd=0, Qx-A'y-z+v+c=0) and primal feasibility (rp=0)
 /// substituted into c'x, the l'z/u'v/x'Qx terms are exactly what survives --
 /// derived from the six-block Newton system the same way NewtonRecovery's
@@ -30,6 +31,17 @@ namespace {
 /// permanent, unclosable relative_gap on every Netlib instance with a finite
 /// upper bound -- afiro-adjacent avgas/egout/rgn all reached primal/dual
 /// residuals near 1e-12 yet reported NotConverged solely because of it.
+///
+/// The x'Qx term needs its 1/2: CanonicalProblem::objective() (Canonicalizer.cpp)
+/// defines the primal objective as c'x + 0.5*x'Qx, so substituting stationarity
+/// into the Lagrangian L = c'x + 0.5x'Qx - y'(Ax-b) - z'(x-l) + v'(x-u) leaves
+/// -x'Qx + 0.5x'Qx = -0.5*x'Qx, not -x'Qx. Using the full x'Qx here (as this
+/// comment used to say) double-counts the quadratic term and leaves a
+/// permanent, unclosable relative_gap on every QP instance -- confirmed on
+/// 2821.mps (and its -qmatrix/-quadobj/-summation/-duplicate MPS-encoding
+/// variants): objective converges to exactly -6.0 with primal/dual residuals
+/// at machine epsilon, yet dual_obj came out as -12.0 (x'Qx = 12.0 counted
+/// once too often), a fixed gap of 6.0 that MaxIterations could never close.
 Real dual_objective(const CanonicalProblem& problem, const SolverState& state) {
   Real dual_obj = 0.0;
   for (std::size_t i = 0; i < state.y.size(); ++i) dual_obj += problem.b[i] * state.y[i];
@@ -53,7 +65,7 @@ Real dual_objective(const CanonicalProblem& problem, const SolverState& state) {
       }
       xQx += state.x[i] * row_dot;
     }
-    dual_obj -= xQx;
+    dual_obj -= 0.5 * xQx;
   }
 
   return dual_obj;
@@ -108,11 +120,18 @@ Expected<Solution> solve_problem(const Problem& problem, const Options& options,
   const auto start_time = std::chrono::steady_clock::now();
 
   for (;; ++iteration) {
-    // Re-derives what gpu::run_iteration will ALSO compute internally for
-    // its own KKT right-hand side -- a real, documented inefficiency
-    // (PredictorCorrector.hpp), accepted so this loop can evaluate
-    // convergence and snapshot the best iterate BEFORE deciding whether to
-    // take another step, rather than always checking one iteration late.
+    // update_mu + compute_residuals here is the ONLY place either runs now --
+    // run_iteration used to redo both internally on this exact state, purely
+    // to fill its own IterationRecord, which was a real, wasted SpMV-based
+    // pass every single iteration (PredictorCorrector.hpp's doc comment on
+    // `residuals`). Computed here because this loop needs it anyway, to
+    // evaluate convergence and snapshot the best iterate BEFORE deciding
+    // whether to take another step, rather than always checking one
+    // iteration late -- then handed to run_iteration below instead of
+    // letting it recompute the same thing.
+    st = update_mu(canon->problem, *state);
+    if (!st.ok()) return st.error();
+
     Residuals residuals;
     st = compute_residuals(canon->problem, *state, state->mu, residuals);
     if (!st.ok()) return st.error();
@@ -145,7 +164,7 @@ Expected<Solution> solve_problem(const Problem& problem, const Options& options,
     if (checker.is_stalled()) break;
 
     IterationRecord record;
-    st = run_iteration(canon->problem, options, regularization, *state, record);
+    st = run_iteration(canon->problem, options, regularization, *state, residuals, record);
     if (!st.ok()) {
       // A mid-solve breakdown (e.g. the KKT system stayed ill-conditioned even
       // at delta_max -- which legitimately happens right near convergence,
@@ -162,8 +181,22 @@ Expected<Solution> solve_problem(const Problem& problem, const Options& options,
     log_iteration(record, options.log);
   }
 
-  best.status = status;
-  best.from_best_iterate = status != SolverStatus::Optimal;
+  // NOT `best.status = status;` -- that was the bug. `status` here is
+  // whatever the OUTER loop's break condition last observed (Optimal,
+  // MaxIterations, a stall, or NumericalError from a mid-solve breakdown),
+  // which is not necessarily the status of the snapshot actually being
+  // returned: `best` can hold an EARLIER iteration's x/y/z/v (the one with
+  // the smallest `metric`, line 146), and that earlier iteration's own
+  // status was already recorded correctly at line 147, at the moment it was
+  // captured. Overwriting it here with the break-time status discarded that
+  // -- concretely, a stall on a LATER, WORSE iteration could relabel an
+  // already-Optimal-quality best snapshot as NotConverged, exactly what
+  // grow7.mps showed empirically: dual_infeasibility=5.7e-15 and
+  // relative_gap=1.6e-16 (both many orders below tolerance) reported as
+  // NotConverged, because the loop happened to stall a few iterations later
+  // on a point that had since drifted worse. `best.status` (unmodified since
+  // line 147) already carries the correct, snapshot-time answer.
+  best.from_best_iterate = best.status != SolverStatus::Optimal;
   best.solve_time_seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
 
