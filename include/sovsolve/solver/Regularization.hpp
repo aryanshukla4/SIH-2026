@@ -62,6 +62,13 @@ class RegularizationController {
 
   [[nodiscard]] std::size_t escalation_events() const noexcept { return events_; }
 
+  /// Bumped once per iterative-refinement solve against the unregularized
+  /// residual (PredictorCorrector.cu's solve_newton_system) -- the "evidence
+  /// for any numerical-robustness claim" Diagnostics.hpp's header comment
+  /// asks for, mirroring escalation_events()'s role for regularization itself.
+  void record_refinement_pass() noexcept { ++refinement_passes_; }
+  [[nodiscard]] std::size_t refinement_passes() const noexcept { return refinement_passes_; }
+
  private:
   Real delta_p_;
   Real delta_d_;
@@ -71,6 +78,7 @@ class RegularizationController {
   Real decay_;
   Real max_;
   std::size_t events_ = 0;
+  std::size_t refinement_passes_ = 0;
 };
 
 }  // namespace sovsolve::solver
