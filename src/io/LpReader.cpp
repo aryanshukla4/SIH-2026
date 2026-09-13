@@ -325,10 +325,22 @@ enum class Section : std::uint8_t {
 /// Multi-word headers (`Subject To`, `Semi-Continuous`) are why this peeks two
 /// tokens. `Semi-Continuous` also lexes as three tokens, since `-` is an
 /// operator; the second word is enough to identify it.
+///
+/// An identifier immediately followed by `:` is a row/statement LABEL, never a
+/// section header -- headers are never labeled, but a row legitimately can be
+/// named after one (`end: x - 1 >= 2` is valid LP syntax testing exactly
+/// this). Without this check, every loop that stops at `peek_section(...) !=
+/// Section::None` -- parse_constraints's row loop included -- misreads such a
+/// label as the file's End keyword and silently drops that row and everything
+/// after it, rather than erroring or parsing it. Confirmed on HiGHS's own
+/// regression fixture for this (a constraint literally named `end`): the
+/// dropped row left `x` unconstrained, so the solve returned 0 instead of the
+/// true optimum of 2 -- a "confidently wrong" answer, not a crash.
 Section peek_section(Lexer& lex) {
   const Token& t = lex.peek();
   if (t.kind == Tok::End) return Section::End;
   if (t.kind != Tok::Ident) return Section::None;
+  if (lex.peek2().kind == Tok::Colon) return Section::None;
   const std::string_view w = t.text;
 
   if (iequals(w, "minimize") || iequals(w, "minimise") || iequals(w, "min") ||
