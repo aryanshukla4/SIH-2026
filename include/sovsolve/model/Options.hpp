@@ -65,6 +65,21 @@ struct IpmOptions {
   /// factorization, so it is nearly free.
   bool predictor_corrector = true;
 
+  /// Gondzio (1996) multiple centrality correctors, run after the Mehrotra
+  /// corrector direction (only when `predictor_corrector` is on). The
+  /// fraction-to-boundary ratio test in StepLength.cu takes a single GLOBAL
+  /// min over every dual coordinate, so one tightly-bound/degenerate pair
+  /// throttles the step length for every other variable too -- confirmed on
+  /// bandm/grow15/scfxm1.mps, where the dual step length collapsed to ~0 for
+  /// many consecutive iterations while the residual it was supposed to fix
+  /// stayed exactly flat. Each corrector pass re-centers any complementarity
+  /// pair that an extended trial step would push outside [0.1, 10] * mu by
+  /// solving one more Newton system with a residual that is zero everywhere
+  /// except that shortfall/excess, then adds the result onto the accumulated
+  /// direction -- kept only if it does not shrink either step length. 0
+  /// disables it.
+  int max_centrality_correctors = 2;
+
   /// Primal and dual regularization -- FLOORS, not the values themselves.
   ///
   /// The working deltas are derived from the magnitudes of the SCALED data and
@@ -287,6 +302,91 @@ struct MilpOptions {
   Real gap_tolerance = 1e-9;
 };
 
+/// Which algorithm solves the continuous relaxation.
+///
+/// The two are not interchangeable on every model and are not meant to be:
+/// the interior-point method converges in a near-constant iteration count and
+/// runs its heavy work on the GPU, while the dual simplex terminates at an
+/// exact vertex, produces primal-infeasibility and unboundedness verdicts the
+/// IPM's convergence test structurally cannot, and warm-starts across a bound
+/// change -- which is the only reason a branch-and-bound node is cheap.
+enum class Method : std::uint8_t {
+  InteriorPoint,
+  DualSimplex,
+  PrimalSimplex,
+};
+
+/// Module 23 controls: the dual simplex (solver/simplex/DualSimplex.hpp).
+struct SimplexOptions {
+  Method method = Method::InteriorPoint;
+
+  /// Threshold-pivoting factor for the basis LU: an entry is an eligible
+  /// pivot only at this fraction or more of the largest remaining magnitude
+  /// in its column. Lower admits sparser factors and less stability. 0.1 is
+  /// the long-standing compromise value.
+  Real pivot_tolerance = 0.1;
+
+  /// A reduced cost outside `[-tol, tol]` on the wrong side of its bound is a
+  /// real dual infeasibility rather than rounding.
+  Real dual_feasibility_tolerance = 1e-7;
+
+  /// A basic variable outside its bounds by more than this is genuinely
+  /// primal infeasible, and is what dual pricing selects on.
+  Real primal_feasibility_tolerance = 1e-7;
+
+  /// Smallest `|alpha|` in the pivot row that the ratio test will accept as
+  /// an entering candidate. A pivot below this is a near-parallel column
+  /// whose reciprocal amplifies rounding through every later solve.
+  Real pivot_floor = 1e-9;
+
+  /// Product-form etas appended before the basis is refactorized from the
+  /// original data. Both eta application cost and accumulated rounding grow
+  /// linearly with the eta file, so this bounds them together.
+  std::size_t refactor_interval = 100;
+
+  /// Temporary finite bound given to a dual-infeasible nonbasic column during
+  /// phase 1. Escalated by `artificial_bound_growth` when the solved
+  /// artificially-bounded problem leaves a variable resting on one and the
+  /// unbounded-ray test does not fire.
+  Real artificial_bound = 1e7;
+  Real artificial_bound_growth = 100.0;
+  std::size_t max_artificial_rounds = 5;
+
+  /// Bound-flipping (long-step) dual ratio test. Off is the textbook
+  /// single-candidate test; keep the switch so a suspected ratio-test bug can
+  /// be isolated without rebuilding the rest of the iteration.
+  bool bound_flipping = true;
+
+  /// Finish a dual simplex run that ended without a verdict by handing its
+  /// basis to the primal simplex.
+  ///
+  /// The two algorithms fail in different places, which is the whole point of
+  /// having both. The dual's phase 1 boxes a dual-infeasible column in a
+  /// temporary bound; when that box is still binding at the end and no ray
+  /// proves unboundedness, the dual has no verdict to give. The primal has no
+  /// boxes to be trapped by, and the dual's endpoint is primal feasible (it is
+  /// feasible for the narrower boxed problem, and the true bounds are wider),
+  /// so the primal starts in phase 2 and simply finishes the job.
+  bool primal_cleanup = true;
+
+  /// Pivot budget. `0` means automatic: `50 * (m + n) + 1000`.
+  ///
+  /// Deliberately NOT `Limits::max_iterations`, whose default of 200 is an
+  /// interior-point budget -- an IPM converges in tens of iterations and a
+  /// simplex takes on the order of the problem's own dimension, so one number
+  /// cannot mean both. Sharing the field would silently cut every simplex
+  /// solve off at 200 pivots and report `MaxIterations` on models that were
+  /// solving perfectly well.
+  ///
+  /// The multiplier is deliberately loose. A simplex usually finishes in a
+  /// small multiple of `m + n`, but degeneracy is not rare and the cost of
+  /// guessing low is a `MaxIterations` on a model that was converging:
+  /// measured, Netlib `greenbea` needs 112,421 pivots against `m + n = 7797`,
+  /// which a 10x budget cuts off at 79,970. `Limits::time_limit_seconds` is
+  /// the backstop that actually bounds a runaway solve.
+  std::size_t max_iterations = 0;
+};
+
 /// Everything, in one object.
 struct Options {
   Tolerances tolerances;
@@ -296,6 +396,7 @@ struct Options {
   LogOptions log;
   PresolveOptions presolve;
   MilpOptions milp;
+  SimplexOptions simplex;
 };
 
 }  // namespace sovsolve::model

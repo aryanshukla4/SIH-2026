@@ -29,6 +29,11 @@ tests/data/netlib/*.mps
 !tests/data/netlib/adlittle.mps
 tests/data/miplib/
 tests/data/qplib/
+# Same rule for tests/data/lp/: it holds a large third-party instance set used
+# only for ad-hoc reader checks. blend.lp is the exception, force-added because
+# lp_reader_test needs it and it is tiny.
+tests/data/lp/
+!tests/data/lp/blend.lp
 bench/results/*.json
 bench/results/*.csv
 
@@ -42,3 +47,5 @@ __pycache__/
 *.handover.html
 handover/
 docs/handover/
+HIGHS/
+

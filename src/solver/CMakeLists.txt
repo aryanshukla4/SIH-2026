@@ -6,7 +6,21 @@ add_library(sovsolve_solver STATIC
   SolutionReconstructor.cpp
   ConvergenceChecker.cpp
   Diagnostics.cpp
-  Logging.cpp)
+  Logging.cpp
+  # Module 23, the dual simplex. Host-only by construction: LU, FTRAN/BTRAN and
+  # the ratio test are sequential and latency-bound, so they belong here rather
+  # than in sovsolve_solver_gpu. The pricing sweep is the one part with enough
+  # parallelism to be worth offloading, and it goes behind an interface so the
+  # GPU implementation can live in the gpu library without this one ever
+  # linking against it -- the solver -> gpu edge must stay absent (see below).
+  simplex/detail/SimplexEngine.cpp
+  simplex/Basis.cpp
+  simplex/LuFactor.cpp
+  simplex/DualSimplex.cpp
+  simplex/PrimalSimplex.cpp
+  simplex/SolveSimplex.cpp
+  simplex/SimplexSolution.cpp
+  LpSolve.cpp)
 # Regularization is header-only (see Regularization.hpp) and PredictorCorrector
 # lives under gpu/ -- it orchestrates GPU module calls, so it belongs in
 # sovsolve_solver_gpu, not here.
