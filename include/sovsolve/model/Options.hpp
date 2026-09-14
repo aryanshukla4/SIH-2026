@@ -350,6 +350,23 @@ struct PdlpOptions {
   Real restart_necessary = 0.1;
   Real restart_artificial = 0.5;
 
+  /// Update the primal weight `omega` at each restart (paper Algorithm 3).
+  ///
+  /// `omega` is the one parameter that decides how the step is SPLIT between
+  /// the primal and dual (`tau = eta/omega`, `sigma = eta*omega`), while
+  /// `eta` decides its size. Left at 1 the two halves are weighted equally
+  /// regardless of their actual scales, which is wrong whenever `c` and `q`
+  /// differ in magnitude -- and initializing it to `||c||_2/||q||_2` is
+  /// exactly the statement that they should not be.
+  bool primal_weight_update = true;
+
+  /// Exponential smoothing in log space, Algorithm 3 line 4. The raw estimate
+  /// `||dy||/||dx||` swings wildly from one restart to the next; `theta = 0.5`
+  /// (the paper's value) takes the geometric mean of the estimate and the
+  /// previous weight. Log space is the right place for it because the weight
+  /// is symmetric there: `log(1/omega) = -log(omega)`.
+  Real primal_weight_smoothing = 0.5;
+
   /// Iterations between termination checks. Each check costs a `K'y` product
   /// and, once restarts land, a normalized duality gap evaluation -- real work
   /// that does not advance the iterate. The paper uses 40.
