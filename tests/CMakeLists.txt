@@ -41,6 +41,12 @@ target_compile_definitions(primal_simplex_test PRIVATE
 # instances and checks them against a brute-force oracle in the same file.
 sovsolve_add_test(pdlp_trust_region_test unit/pdlp_trust_region_test.cpp)
 
+# Module 5, exercised properly now that it has two modes to compare against
+# each other. Reads real instances, so it needs the data path.
+sovsolve_add_test(scaler_test          unit/scaler_test.cpp)
+target_compile_definitions(scaler_test PRIVATE
+  SOVSOLVE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+
 # gpu::compute_residuals lives in sovsolve_solver_gpu, which only exists
 # under SOVSOLVE_ENABLE_CUDA (see src/solver/CMakeLists.txt) -- registering
 # this test unconditionally would fail to link on a host-only build.
