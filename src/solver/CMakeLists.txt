@@ -6,6 +6,7 @@ add_library(sovsolve_solver STATIC
   SolutionReconstructor.cpp
   SolutionQuality.cpp
   Iis.cpp
+  Homogeneous.cpp
   ConvergenceChecker.cpp
   Diagnostics.cpp
   Logging.cpp
