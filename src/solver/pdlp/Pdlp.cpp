@@ -6,6 +6,7 @@
 #include <limits>
 #include <vector>
 
+#include "sovsolve/solver/pdlp/DualityGap.hpp"
 #include "sovsolve/solver/pdlp/MatVec.hpp"
 
 namespace sovsolve::solver::pdlp {
@@ -130,7 +131,8 @@ class PdlpSolver {
         opt_(options),
         matvec_(problem),
         m_(problem.num_rows()),
-        n_(problem.num_cols()) {}
+        n_(problem.num_cols()),
+        gap_(problem) {}
 
   core::Expected<PdlpResult> run();
 
@@ -164,10 +166,43 @@ class PdlpSolver {
   Real omega_ = 1.0;  ///< primal weight; adapts in C3, fixed at 1 until then
   std::size_t step_rejections_ = 0;
 
+  // ---- adaptive restarts (paper section 3.2) ----------------------------
+  NormalizedDualityGap gap_;
+  core::RealVector x_restart_;  ///< `z^{n,0}`, the current outer loop's anchor
+  core::RealVector y_restart_;
+  /// Step-size-weighted running sums for `z-bar` (Algorithm 1 line 7). Held
+  /// as sums rather than as the average so a restart is two `assign(0)` calls
+  /// and no division.
+  core::RealVector avg_x_;
+  core::RealVector avg_y_;
+  Real weight_sum_ = 0.0;
+  /// Scratch for the candidate `z-bar`, materialized only when a restart
+  /// check actually runs.
+  core::RealVector bar_x_;
+  core::RealVector bar_y_;
+  core::RealVector scratch_kt_y_;
+  core::RealVector scratch_k_x_;
+
+  /// `mu_n(z^{n,0}, z^{n-1,0})`: the gap at the current anchor, measured
+  /// against the PREVIOUS anchor. Conditions (i) and (ii) compare against it.
+  /// Infinite for the first outer loop, where there is no previous anchor --
+  /// so only condition (iii) can fire, which is correct rather than a
+  /// special case: with no history there is nothing to have decayed from.
+  Real reference_gap_ = std::numeric_limits<Real>::infinity();
+  /// `mu_n(z_c^{n,t}, z^{n,0})` from the previous check, for condition (ii)'s
+  /// "no local progress" half.
+  Real last_candidate_gap_ = std::numeric_limits<Real>::infinity();
+  std::size_t inner_iterations_ = 0;  ///< `t`
+  std::size_t restarts_ = 0;          ///< `n`
+
   /// Algorithm 2. `eta` enters as this iteration's trial size and leaves as
   /// `eta'`, the starting point for the next one.
   void adaptive_step(std::size_t total_iterations, Real& eta);
   void fixed_step(Real tau, Real sigma);
+
+  void accumulate_average(Real eta);
+  /// Section 3.2. Returns true when the outer loop restarted.
+  [[nodiscard]] bool maybe_restart(std::size_t total_iterations);
 };
 
 void PdlpSolver::evaluate(Convergence& conv) {
@@ -228,6 +263,7 @@ PdlpResult PdlpSolver::pack(SolverStatus status, const Convergence& conv) const 
   r.objective = conv.primal_objective;
   r.matrix_products = matvec_.products();
   r.step_rejections = step_rejections_;
+  r.restarts = restarts_;
   r.relative_duality_gap = conv.gap;
   r.relative_primal_residual = conv.primal;
   r.relative_dual_residual = conv.dual;
@@ -404,6 +440,97 @@ void PdlpSolver::adaptive_step(std::size_t total_iterations, Real& eta_inout) {
   eta_inout = eta;
 }
 
+/// Algorithm 1 line 7: the step-size-weighted average of the inner loop's
+/// iterates. Kept as running sums so a restart costs two `assign(0)` calls.
+void PdlpSolver::accumulate_average(Real eta) {
+  weight_sum_ += eta;
+  for (std::size_t j = 0; j < n_; ++j) avg_x_[j] += eta * x_[j];
+  for (std::size_t i = 0; i < m_; ++i) avg_y_[i] += eta * y_[i];
+}
+
+/// Paper section 3.2: choose a restart candidate, test three conditions, and
+/// restart the outer loop from the candidate if any holds.
+///
+/// Why restarts matter more than the other enhancements. PDHG's convergence
+/// guarantee is on the ERGODIC iterate -- the running average -- which
+/// converges at a good rate but keeps the early, bad iterates in the average
+/// forever. The last iterate has no such guarantee but is usually far better
+/// late in a run. Restarting takes whichever is currently better, makes it the
+/// new starting point, and discards the history: the average stops being
+/// polluted, and the guarantee is re-established from a strictly better point.
+/// That is why the paper's ablation ranks this first, and why it is the
+/// enhancement that turns a method which tails off into one that does not.
+///
+/// The candidate is `z^{n,t+1}` or `z-bar^{n,t+1}`, whichever has the smaller
+/// normalized duality gap measured from the anchor (`GetRestartCandidate`).
+/// Evaluating that costs two matrix products per point, which is why this runs
+/// on the same schedule as the termination check rather than every iteration.
+bool PdlpSolver::maybe_restart(std::size_t total_iterations) {
+  // --- condition (iii), long inner loop: `t >= beta_artificial * k`.
+  //
+  // Checked first because it needs no gap evaluation at all. It is not a
+  // fallback: primal weights are updated only at a restart (Algorithm 1 line
+  // 12), so without this an unlucky early weight could never be corrected.
+  const bool long_inner_loop =
+      static_cast<Real>(inner_iterations_) >=
+      opt_.pdlp.restart_artificial * static_cast<Real>(total_iterations);
+
+  // `z-bar`, the step-size-weighted average since the anchor.
+  const bool have_average = weight_sum_ > 0.0;
+  if (have_average) {
+    for (std::size_t j = 0; j < n_; ++j) bar_x_[j] = avg_x_[j] / weight_sum_;
+    for (std::size_t i = 0; i < m_; ++i) bar_y_[i] = avg_y_[i] / weight_sum_;
+  }
+
+  // GetRestartCandidate: the current iterate, or the average, whichever has
+  // the smaller gap from the anchor.
+  matvec_.multiply_transpose(in(y_), out(scratch_kt_y_));
+  matvec_.multiply(in(x_), out(scratch_k_x_));
+  auto current = gap_.evaluate(x_, y_, scratch_kt_y_, scratch_k_x_, x_restart_,
+                               y_restart_, omega_);
+  if (!current.has_value()) return false;
+
+  Real candidate_gap = *current;
+  bool use_average = false;
+  if (have_average) {
+    matvec_.multiply_transpose(in(bar_y_), out(scratch_kt_y_));
+    matvec_.multiply(in(bar_x_), out(scratch_k_x_));
+    auto averaged = gap_.evaluate(bar_x_, bar_y_, scratch_kt_y_, scratch_k_x_,
+                                  x_restart_, y_restart_, omega_);
+    if (averaged.has_value() && *averaged < candidate_gap) {
+      candidate_gap = *averaged;
+      use_average = true;
+    }
+  }
+
+  // --- conditions (i) and (ii), against the previous outer loop's gap.
+  const bool sufficient =
+      candidate_gap <= opt_.pdlp.restart_sufficient * reference_gap_;
+  const bool necessary =
+      candidate_gap <= opt_.pdlp.restart_necessary * reference_gap_ &&
+      candidate_gap > last_candidate_gap_;
+
+  last_candidate_gap_ = candidate_gap;
+  if (!sufficient && !necessary && !long_inner_loop) return false;
+
+  // Restart: the candidate becomes both the new iterate and the new anchor.
+  if (use_average) {
+    for (std::size_t j = 0; j < n_; ++j) x_[j] = bar_x_[j];
+    for (std::size_t i = 0; i < m_; ++i) y_[i] = bar_y_[i];
+  }
+  for (std::size_t j = 0; j < n_; ++j) x_restart_[j] = x_[j];
+  for (std::size_t i = 0; i < m_; ++i) y_restart_[i] = y_[i];
+
+  avg_x_.assign(0.0);
+  avg_y_.assign(0.0);
+  weight_sum_ = 0.0;
+  inner_iterations_ = 0;
+  last_candidate_gap_ = std::numeric_limits<Real>::infinity();
+  reference_gap_ = candidate_gap;
+  ++restarts_;
+  return true;
+}
+
 core::Expected<PdlpResult> PdlpSolver::run() {
   x_.resize(n_);
   x_.assign(0.0);
@@ -429,6 +556,22 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   k_extrapolated_.assign(0.0);
   k_x_current_.resize(m_);
   k_x_current_.assign(0.0);
+  x_restart_.resize(n_);
+  x_restart_.assign(0.0);
+  y_restart_.resize(m_);
+  y_restart_.assign(0.0);
+  avg_x_.resize(n_);
+  avg_x_.assign(0.0);
+  avg_y_.resize(m_);
+  avg_y_.assign(0.0);
+  bar_x_.resize(n_);
+  bar_x_.assign(0.0);
+  bar_y_.resize(m_);
+  bar_y_.assign(0.0);
+  scratch_kt_y_.resize(n_);
+  scratch_kt_y_.assign(0.0);
+  scratch_k_x_.resize(m_);
+  scratch_k_x_.assign(0.0);
 
   // Paper section 4.1: "All first-order methods use all-zero vectors as the
   // initial starting points." Zero is not interior and does not need to be --
@@ -436,6 +579,7 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   for (std::size_t j = 0; j < n_; ++j) {
     x_[j] = std::clamp(0.0, problem_.col_lower[j], problem_.col_upper[j]);
     x_prev_[j] = x_[j];
+    x_restart_[j] = x_[j];
   }
 
   const bool adaptive = opt_.pdlp.adaptive_step_size;
@@ -467,6 +611,8 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   const auto start = std::chrono::steady_clock::now();
   const bool has_time_limit = opt_.limits.time_limit_seconds > 0.0;
 
+  const bool restarts_enabled = opt_.pdlp.adaptive_restart;
+
   Convergence conv;
   evaluate(conv);
   if (conv.converged(opt_.pdlp.termination_tolerance)) {
@@ -477,10 +623,19 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   SolverStatus outcome = SolverStatus::MaxIterations;
 
   while (iteration < budget) {
+    const Real step_taken = eta;
     if (adaptive) {
       adaptive_step(iteration, eta);
     } else {
       fixed_step(fixed_tau, fixed_sigma);
+    }
+    if (restarts_enabled) {
+      // Algorithm 1 line 7 weights each iterate by the step size that
+      // produced it, so a long step counts for more in the average than a
+      // short one -- which is what makes the average meaningful when the
+      // adaptive rule is varying the step by an order of magnitude.
+      accumulate_average(adaptive ? step_taken : fixed_tau);
+      ++inner_iterations_;
     }
 
     ++iteration;
@@ -503,6 +658,13 @@ core::Expected<PdlpResult> PdlpSolver::run() {
           outcome = SolverStatus::TimeLimit;
           break;
         }
+      }
+      // Same schedule as the termination check, and for the same reason: the
+      // gap evaluations cost matrix products that do not advance the iterate
+      // (paper section 3, "we only evaluate the restart or termination
+      // criteria every 40 iterations").
+      if (restarts_enabled) {
+        (void)maybe_restart(iteration);
       }
     }
   }

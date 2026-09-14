@@ -328,6 +328,28 @@ struct PdlpOptions {
   /// as the other two engines rather than being flattered by a looser one.
   Real termination_tolerance = 1e-8;
 
+  /// Adaptive restarts (paper section 3.2). The inner loop restarts from a
+  /// candidate point -- either the current iterate or the step-size-weighted
+  /// average since the last restart, whichever has the smaller normalized
+  /// duality gap -- and the outer loop counter advances.
+  ///
+  /// This is the enhancement the paper's own ablation ranks first, and the
+  /// reason is structural rather than empirical: PDHG's ergodic (averaged)
+  /// iterate converges at a good rate but averages in the early, bad
+  /// iterates forever. Restarting throws that history away once it has served
+  /// its purpose.
+  bool adaptive_restart = true;
+
+  /// Section 3.2's three restart constants. `sufficient` fires on a decisive
+  /// decay of the normalized duality gap; `necessary` fires on a smaller
+  /// decay that has additionally stopped making local progress; `artificial`
+  /// caps how long an inner loop may run relative to the total iteration
+  /// count, which is what guarantees the primal weight (updated only at a
+  /// restart) keeps being updated at all.
+  Real restart_sufficient = 0.9;
+  Real restart_necessary = 0.1;
+  Real restart_artificial = 0.5;
+
   /// Iterations between termination checks. Each check costs a `K'y` product
   /// and, once restarts land, a normalized duality gap evaluation -- real work
   /// that does not advance the iterate. The paper uses 40.
