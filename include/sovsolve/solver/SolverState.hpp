@@ -29,6 +29,20 @@ struct SolverState {
 
   Real mu = 0.0;
 
+  // -- homogeneous self-dual embedding (Module 25, FORMULATION.md 13) -------
+  //
+  // Meaningful only when `IpmOptions::homogeneous_self_dual` is on; left at
+  // the neutral `tau = 1, kappa = 0` otherwise, which is exactly the point at
+  // which the embedded system reduces to the direct one. That is not a
+  // coincidence to be relied on silently -- it is what makes the two paths
+  // comparable, and it is asserted in the tests.
+  //
+  //   tau > 0, kappa -> 0   the model has an optimal solution; divide by tau
+  //   tau -> 0, kappa > 0   the model is primal or dual infeasible, and this
+  //                         iterate is the certificate
+  Real tau = 1.0;
+  Real kappa = 0.0;
+
   // -- Mehrotra predictor-corrector scratch (Module 8) ---------------------
 
   /// Affine ("predictor") direction, computed first each iteration.
@@ -41,6 +55,12 @@ struct SolverState {
   /// Updater) must not apply a direction until Module 19 (Diagnostics) has
   /// recorded the iteration that produced it.
   RealVector dx, ds, dy, dz, dv;
+
+  /// Directions for the embedding's two scalars, matching the split above:
+  /// `_aff` is the affine/predictor direction, the unsuffixed pair is the one
+  /// actually applied.
+  Real dtau_aff = 0.0, dkappa_aff = 0.0;
+  Real dtau = 0.0, dkappa = 0.0;
 
   Real alpha_primal = 0.0;
   Real alpha_dual = 0.0;
