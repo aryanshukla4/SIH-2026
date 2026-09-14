@@ -42,8 +42,11 @@ Each module has one job and uses the shared project types.
   (docs/ARCHITECTURE-REVIEW.md 3.5 measures factorization at ~64x slower than
   the CPU, SpMV at ~2x).
 - Added Module 25: homogeneous self-dual embedding for the interior-point path
-  (2026-09-14). STAGE 1 ONLY -- residuals, mu, classification and recovery; the
-  Newton solve is not written and nothing reads the option yet.
+  (2026-09-14). STAGES 1 AND 2 -- residuals, mu, classification and recovery,
+  then the iteration control (step size, centering, starting point, stopping
+  criteria) transcribed from Andersen & Andersen (2000). The Newton solve is
+  still not written and nothing reads the option yet; section 25 says exactly
+  what blocks it.
 - Added Module 26: irreducible infeasible subsystem (2026-09-14). Turns the
   verdict "this model is infeasible" into "these rows contradict each other,
   and dropping any one makes the rest satisfiable".
@@ -756,7 +759,7 @@ has not been run. PDLP -> simplex crossover is also not done: PDLP tails off
 where the simplex returns an exact vertex, so composing them is the natural
 follow-on.
 
-## 25. Homogeneous self-dual embedding (IPM) -- added 2026-09-14, STAGE 1 ONLY
+## 25. Homogeneous self-dual embedding (IPM) -- added 2026-09-14, STAGES 1-2
 
 Closes a gap README.md names: the interior-point path structurally cannot
 report `Infeasible` or `Unbounded`. With no feasible point there is no interior
@@ -774,15 +777,85 @@ measure, classification of the final iterate, and recovery. Host-only on
 purpose even though the IPM is not, because the load-bearing test has to run in
 the default preset with no CUDA toolkit.
 
-WHAT DOES NOT: the bordered Newton solve, step length, state update and
-termination. `IpmOptions::homogeneous_self_dual` exists, defaults off, and
-NOTHING READS IT YET. FORMULATION section 13 carries a banner saying so.
+WHAT ALSO EXISTS, as of stage 2: `solver/HomogeneousStep.{hpp,cpp}` -- the
+iteration control, TRANSCRIBED from
+
+  E. D. Andersen and K. D. Andersen, "The MOSEK interior point optimizer for
+  linear programming: an implementation of the homogeneous algorithm", in High
+  Performance Optimization, Kluwer, 2000, pp. 197-232.
+
+Algorithmic parameters (Table 1.1), the centering heuristic (1.12), the ratio
+test and step size (1.20)/(1.21), the starting point (1.22) and the three
+stopping criteria (section 1.4.5, 1.24). Nothing in it is derived.
+
+WHAT DOES NOT EXIST: the bordered Newton solve.
+`IpmOptions::homogeneous_self_dual` exists, defaults off, and NOTHING READS IT
+YET.
+
+WHY, precisely -- this is the one open item and it is narrow. [AA] section 1.2
+is explicit: "For simplicity we will work with the LP problem in standard
+form", Ax = b, x >= 0. Homogenizing sends l -> l*tau and u -> u*tau, so with
+FINITE bounds `tau` appears inside the complementarity rows `(x - l tau).*z`
+and `(u tau - x).*v`. Eliminating dz and dv then leaves dtau terms in both the
+dual block row and the gap row, and they are NOT the same terms -- so the
+border column and the border row are not negatives of each other, as they are
+in standard form. Everything else in stage 2 reads an iterate and a direction
+and does not care how the direction was produced, which is why it could be
+built anyway. FORMULATION section 13.3a states the gap and the two candidate
+resolutions.
+
+WHAT THE PAPER CORRECTED IN OUR OWN WRITING. FORMULATION section 13.3 used to
+say the bordered system is [K h; -h' k/t] -- the border row being the negated
+border column. [AA] (1.26) shows it is not: the column is (-c; -b) while the
+row is (-c', +b'), because the second block row carries +A against the first
+row's +A'. Writing the solve from -h' puts a sign error on every dtau. The
+section now transcribes (1.26)-(1.29) instead. The paper also shows the cost is
+LESS than one extra solve per direction: (1.28) is solved once per iteration
+and shared by the predictor and the corrector, only (1.29) is per right-hand
+side.
+
+WHAT WE HAD TO GENERALIZE, and how each is kept honest. Three formulas are not
+[AA] verbatim. Each is marked GENERALIZED in the header next to the
+specialization that recovers the published version, and `homogeneous_step_test`
+builds an instance that IS in standard form after canonicalization and checks
+each generalized formula against [AA]'s equation written out by hand.
+
+ 1. The ratio test carries a term standard form cannot see. `tau` scales the
+    bounds, so `x - l tau` has direction `dx - l dtau`. At l = 0 it vanishes.
+    Omitting it lets a step violate a bound while every coordinate of dx looks
+    safe. The test builds a direction where dx is identically zero and only
+    dtau moves, so that term is the ONLY thing that binds: deleting it turns a
+    finite step into an unbounded one. Confirmed by mutation (1 check, 0.5 vs
+    1e30).
+
+ 2. rho_A (1.24) uses the full dual objective b'y + l'z - u'v.
+
+ 3. [AA] (1.22)'s `y := 0` IS NOT USABLE UNCHANGED, and this one cost a run to
+    find. It is admissible only because standard form has no inequality rows
+    and so no (s, -y_I) pair. We have them, and at y_I = 0 that pair's product
+    is exactly zero -- ON the boundary, not near it -- so the centrality
+    condition (1.20) fails at every positive step, the step size returns 0, and
+    the solve stalls on iteration one. Measured, not predicted: that is what
+    the first run did. Inequality rows now start at y_I = -1; equality rows,
+    unrestricted and pairless, stay at 0, so a model with no inequality rows
+    still gets y = 0.
+
+ONE PARAMETER HAS NO CITATION: rho_bar_G is used in [AA] section 1.4.5's
+infeasibility criterion but is absent from Table 1.1, which lists only
+rho_bar_P, rho_bar_D, rho_bar_A, rho_bar_mu and rho_bar_I. It is set to 1e-8 to
+match its two siblings in that same criterion, and the field says so.
+
+WHY THE CENTRALITY TEST IS NOT OPTIONAL. [AA]: "if all the iterates satisfy the
+condition (1.20), then they converge towards a strictly complementary
+solution." Theorems 2 and 3 -- which are what turn a collapsed tau into a named
+verdict -- both assume strict complementarity. Skipping (1.20) does not make
+the solver slower, it makes the answer unsound.
 
 The Newton system's structure is what makes the rest affordable: homogenizing
 adds one row and one column to the SAME matrix `K`, and a bordered system with
 a 1x1 trailing block is solved by two solves of the unmodified `K` plus a
-scalar Schur complement. `KktBuilder`, `Ordering`, `Preconditioner` and
-`LinearSolver` need no changes at all.
+scalar Schur complement -- [AA] (1.27)-(1.29). `KktBuilder`, `Ordering`,
+`Preconditioner` and `LinearSolver` need no changes at all.
 
 Two tests, catching different things, which is the point of having both. At
 `tau = 1` the embedding must reduce to sections 5-6 TERM FOR TERM (expected
@@ -794,11 +867,15 @@ transcription and a derivation cannot). But that test CANNOT catch a missing
 complementary by mutation: dropping the `tau` from `b*tau` leaves all 57
 equivalence checks passing and fails 3 homogeneity checks.
 
-Caveat worth keeping: the section 13 derivation is OURS, not transcribed.
-Andersen & Andersen's MOSEK homogeneous-algorithm paper is the reference that
-handles general bounds `l <= x <= u`, which is where the border column's bound
-terms come from; if the two disagree, that paper is right and section 13 is
-wrong.
+Stage 2's tests: 212 checks, proven able to fail by four mutations -- dropping
+the l*dtau coupling (1 check), using [AA] (1.22)'s y := 0 verbatim (3), losing
+one power of (1-alpha) from the centering heuristic (9), and swapping min for
+max in the ill-posed tau test (1).
+
+The stage-1 caveat is now RESOLVED except for the border column. Section 13 was
+our own derivation; [AA] confirms the embedding, the verdicts and the two-solve
+structure, and corrects the border row (see above). What [AA] does not supply is
+the general-bounds border column, because it works in standard form throughout.
 
 ## 26. Irreducible infeasible subsystem -- added 2026-09-14
 
