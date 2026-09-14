@@ -25,14 +25,21 @@
 #include <cmath>
 #include <cstddef>
 #include <string>
+#include <random>
 #include <string_view>
 
 #include "sovsolve/core/Types.hpp"
 #include "sovsolve/io/Load.hpp"
 #include "sovsolve/model/Options.hpp"
+#include "sovsolve/model/Canonical.hpp"
 #include "sovsolve/model/Problem.hpp"
 #include "sovsolve/model/Solution.hpp"
 #include "sovsolve/solver/LpSolve.hpp"
+#include "sovsolve/solver/Presolver.hpp"
+#include "sovsolve/solver/Scaler.hpp"
+#include "sovsolve/solver/pdlp/DualityGap.hpp"
+#include "sovsolve/solver/pdlp/MatVec.hpp"
+#include "sovsolve/solver/pdlp/Pdlp.hpp"
 #include "tests/TestMain.hpp"
 
 using namespace sovsolve;  // NOLINT(build/namespaces)
@@ -311,6 +318,123 @@ void test_agrees_with_simplex() {
   }
 }
 
+/// The normalized duality gap's defining properties. The two assertions here
+/// pin down DIFFERENT things, and it is worth being precise about which,
+/// because one of them is weaker than it looks.
+///
+///   * `rho_r(z) >= 0` for every z. This is the invariant the restart
+///     conditions rest on -- they compare gaps against each other, so a gap
+///     that could go negative would make "sufficient decay" fire on noise.
+///     But note what it does NOT test: `min over a ball containing z` is at
+///     most `g'z` whatever `g` happens to be, so this holds even with the
+///     gradient derived wrongly. It guards the TRUST REGION SOLVER, not the
+///     derivation. (Confirmed by mutation: flipping the y-block gradient sign
+///     leaves every one of these checks passing.)
+///
+///   * `rho_r(z) ~ 0` at an optimal z. THIS is what pins the derivation --
+///     the same sign mutation takes it from ~0 to 335.8. It is also what
+///     makes the gap a progress measure rather than an arbitrary non-negative
+///     number.
+void test_normalized_duality_gap_properties() {
+  auto loaded = io::loadProblem(std::string(SOVSOLVE_TEST_DATA_DIR) + "/netlib/afiro.mps");
+  if (!loaded.has_value()) {
+    ::sovsolve::test::record(__FILE__, __LINE__, "load afiro", loaded.error().format());
+    return;
+  }
+  const model::Options options = pdlp_options();
+
+  auto canon = model::canonicalize(loaded.value(), options);
+  if (!canon.has_value()) {
+    ::sovsolve::test::record(__FILE__, __LINE__, "canonicalize",
+                             canon.error().format());
+    return;
+  }
+  core::Status st = solver::presolve(canon->problem, options, canon->transforms);
+  if (st.ok()) st = solver::scale(canon->problem, options, canon->transforms);
+  if (!st.ok()) {
+    ::sovsolve::test::record(__FILE__, __LINE__, "presolve/scale", st.error().format());
+    return;
+  }
+
+  const auto& problem = canon->problem;
+  const std::size_t n = problem.num_cols();
+  const std::size_t m = problem.num_rows();
+
+  solver::pdlp::NormalizedDualityGap gap(problem);
+  solver::pdlp::HostMatVec matvec(problem);
+
+  core::RealVector x(n, 0.0);
+  core::RealVector y(m, 0.0);
+  core::RealVector ref_x(n, 0.0);
+  core::RealVector ref_y(m, 0.0);
+  core::RealVector kt_y(n, 0.0);
+  core::RealVector k_x(m, 0.0);
+
+  auto rho_at = [&](Real omega) {
+    matvec.multiply_transpose(core::HostSpan<const Real>(y.data(), y.size()),
+                              core::HostSpan<Real>(kt_y.data(), kt_y.size()));
+    matvec.multiply(core::HostSpan<const Real>(x.data(), x.size()),
+                    core::HostSpan<Real>(k_x.data(), k_x.size()));
+    return gap.evaluate(x, y, kt_y, k_x, ref_x, ref_y, omega);
+  };
+
+  // Non-negativity over a spread of arbitrary points, including points that
+  // violate the bounds and duals with the wrong sign -- the invariant is not
+  // conditional on feasibility.
+  std::mt19937 rng(20260914);
+  std::uniform_real_distribution<Real> val(-5.0, 5.0);
+  for (int trial = 0; trial < 40; ++trial) {
+    for (std::size_t j = 0; j < n; ++j) x[j] = val(rng);
+    for (std::size_t i = 0; i < m; ++i) y[i] = val(rng);
+    for (std::size_t j = 0; j < n; ++j) ref_x[j] = val(rng);
+    for (std::size_t i = 0; i < m; ++i) ref_y[i] = val(rng);
+    const Real omega = trial % 3 == 0 ? 0.25 : (trial % 3 == 1 ? 1.0 : 4.0);
+    auto rho = rho_at(omega);
+    ++::sovsolve::test::checks_run();
+    if (!rho.has_value()) {
+      ::sovsolve::test::record(__FILE__, __LINE__, "rho_r evaluates",
+                               rho.error().format());
+      continue;
+    }
+    if (!(*rho >= 0.0) || !std::isfinite(*rho)) {
+      ::sovsolve::test::record(__FILE__, __LINE__, "rho_r(z) >= 0 for every z",
+                               "trial " + std::to_string(trial) + " gave " +
+                                   std::to_string(*rho));
+    }
+  }
+
+  // An unmoved iterate has radius zero, so there is no progress to normalize.
+  for (std::size_t j = 0; j < n; ++j) ref_x[j] = x[j];
+  for (std::size_t i = 0; i < m; ++i) ref_y[i] = y[i];
+  auto zero_radius = rho_at(1.0);
+  CHECK(zero_radius.has_value());
+  if (zero_radius.has_value()) CHECK_NEAR(*zero_radius, 0.0, 1e-12);
+
+  // At an optimum the gap must vanish. `solve_pdlp` returns the canonical,
+  // scaled iterate, which is the space the gap is defined in.
+  auto solved = solver::pdlp::solve_pdlp(problem, options);
+  if (!solved.has_value()) {
+    ::sovsolve::test::record(__FILE__, __LINE__, "solve_pdlp", solved.error().format());
+    return;
+  }
+  CHECK(solved->status == SolverStatus::Optimal);
+  for (std::size_t j = 0; j < n; ++j) {
+    x[j] = solved->x[j];
+    ref_x[j] = solved->x[j] + 1e-3;  // a reference a small distance away
+  }
+  for (std::size_t i = 0; i < m; ++i) {
+    y[i] = solved->y[i];
+    ref_y[i] = solved->y[i] + 1e-3;
+  }
+  auto at_optimum = rho_at(1.0);
+  ++::sovsolve::test::checks_run();
+  if (!at_optimum.has_value() || !(*at_optimum < 1e-4)) {
+    ::sovsolve::test::record(
+        __FILE__, __LINE__, "rho_r vanishes at an optimum",
+        at_optimum.has_value() ? std::to_string(*at_optimum) : "evaluation failed");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -322,5 +446,6 @@ int main() {
   test_quadratic_is_rejected();
   test_afiro();
   test_agrees_with_simplex();
+  test_normalized_duality_gap_properties();
   return ::sovsolve::test::report("pdlp_test");
 }

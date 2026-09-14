@@ -160,6 +160,8 @@ struct PdlpResult {
   /// `K` and `K'` products applied, counted separately. One "KKT pass" in the
   /// paper's sense is two of these.
   std::size_t matrix_products = 0;
+  /// Outer-loop restarts performed (paper section 3.2).
+  std::size_t restarts = 0;
   /// Trial steps the adaptive rule rejected (Algorithm 2 line 8 failing).
   /// Each cost one extra `K` product, so this is the price paid for the rule;
   /// comparing it against the iteration saving is how the rule is judged.
