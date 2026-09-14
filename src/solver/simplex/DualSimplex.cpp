@@ -54,6 +54,10 @@ class DualSolver : public SimplexEngine {
   [[nodiscard]] bool any_artificial_installed() const;
 
   [[nodiscard]] Step iterate();
+  /// The Farkas certificate, captured at the pivot that proved infeasibility.
+  /// Empty unless this run ended with `Step::Infeasible`.
+  std::vector<Real> certificate_;
+
   [[nodiscard]] std::size_t choose_leaving(Real& delta, Real& sigma) const;
   [[nodiscard]] bool collect_candidates(Real sigma);
   void apply_flips();
@@ -321,6 +325,13 @@ Step DualSolver::iterate() {
   if (!collect_candidates(sigma)) {
     // No column can absorb the dual step: the dual objective improves without
     // limit, which is a proof that the primal is infeasible.
+    //
+    // Keep the proof. `rho_` is `B^-T e_r`, already computed for the ratio
+    // test, and `sigma * rho_` is the direction the dual objective improves
+    // along -- a Farkas certificate. Discarding it here and reconstructing it
+    // later would mean re-deriving from a basis that has since moved.
+    certificate_.assign(m_, 0.0);
+    for (std::size_t i = 0; i < m_; ++i) certificate_[i] = sigma * rho_[i];
     clear_pivot_row();
     return Step::Infeasible;
   }
@@ -356,6 +367,16 @@ Step DualSolver::iterate() {
     if (entering == total_) {
       // Every eligible column was flippable and all of them together still do
       // not close the violation: nothing blocks the dual step at all.
+      //
+      // This is the SECOND place infeasibility is proved, and it produces the
+      // same certificate as the first -- `sigma * rho_` is still the direction
+      // the dual objective improves along. Capturing it in only one of the two
+      // exits leaves `compute_iis` unable to explain a whole class of models:
+      // `x >= 5` against a bound of `x <= 3` reaches infeasibility HERE, by
+      // flipping `x` to its upper bound and finding the violation still open,
+      // never through the other exit at all.
+      certificate_.assign(m_, 0.0);
+      for (std::size_t i = 0; i < m_; ++i) certificate_[i] = sigma * rho_[i];
       clear_pivot_row();
       flips_.clear();
       return Step::Infeasible;
@@ -628,7 +649,11 @@ core::Expected<SimplexResult> DualSolver::run(const Basis* warm_start) {
     outcome = core::SolverStatus::NotConverged;
   }
 
-  return pack_result(outcome);
+  SimplexResult packed = pack_result(outcome);
+  if (outcome == core::SolverStatus::Infeasible) {
+    packed.infeasibility_certificate = certificate_;
+  }
+  return packed;
 }
 
 }  // namespace

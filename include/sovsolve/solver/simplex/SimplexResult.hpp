@@ -43,6 +43,22 @@ struct SimplexResult {
   /// Canonical (minimization) objective at `x`.
   Real objective = 0.0;
 
+  /// FARKAS CERTIFICATE, populated only when `status == Infeasible` and only
+  /// by the dual simplex. Length `m`, in row space.
+  ///
+  /// This is the direction the dual objective improves along without limit --
+  /// `sigma * rho_r`, where `rho_r = B^-T e_r` is the BTRAN'd unit vector the
+  /// ratio test had already computed when it found no column able to absorb
+  /// the step. So the proof costs nothing: it is a byproduct of the pivot that
+  /// failed.
+  ///
+  /// Being a row of `B^-1` it is a BASIC solution, hence a vertex of the
+  /// alternative polyhedron `{y : y'A = 0, y'b = -1, y >= 0}` -- which by
+  /// Gleeson and Ryan's theorem is exactly what makes its support an
+  /// IRREDUCIBLE infeasible subsystem rather than merely an infeasible one.
+  /// See solver/Iis.hpp.
+  std::vector<Real> infeasibility_certificate;
+
   std::size_t iterations = 0;
   std::size_t refactorizations = 0;
 

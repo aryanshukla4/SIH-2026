@@ -45,6 +45,9 @@ sovsolve_add_test(pdlp_test            unit/pdlp_test.cpp)
 target_compile_definitions(pdlp_test PRIVATE
   SOVSOLVE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 
+# Module 26. Builds its own models, so no data path needed.
+sovsolve_add_test(iis_test             unit/iis_test.cpp)
+
 # Module 5, exercised properly now that it has two modes to compare against
 # each other. Reads real instances, so it needs the data path.
 sovsolve_add_test(scaler_test          unit/scaler_test.cpp)
