@@ -160,6 +160,10 @@ struct PdlpResult {
   /// `K` and `K'` products applied, counted separately. One "KKT pass" in the
   /// paper's sense is two of these.
   std::size_t matrix_products = 0;
+  /// Trial steps the adaptive rule rejected (Algorithm 2 line 8 failing).
+  /// Each cost one extra `K` product, so this is the price paid for the rule;
+  /// comparing it against the iteration saving is how the rule is judged.
+  std::size_t step_rejections = 0;
 
   /// The three quantities (6a)-(6c) test, at the returned iterate. Kept so a
   /// non-converged run says HOW far it got rather than only that it stopped.

@@ -136,6 +136,10 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.pdlp.max_iterations = static_cast<std::size_t>(std::stoull(val));
       return true;
     }
+    if (key == "pdlp-adaptive") {
+      options.pdlp.adaptive_step_size = (val != "0");
+      return true;
+    }
     if (key == "pdlp-check-interval") {
       options.pdlp.check_interval = static_cast<std::size_t>(std::stoull(val));
       return true;
@@ -319,6 +323,14 @@ int main(int argc, char** argv) {
   std::printf("status=%s\n", status_name(solution->status));
   std::printf("objective=%.10e\n", solution->objective);
   std::printf("iterations=%zu\n", solution->iterations);
+  if (solution->matrix_products != 0) {
+    // The cost model for a matrix-free method. One "KKT pass" in PDLP's sense
+    // is one K plus one K', so half the product count -- printed because the
+    // iteration count alone understates the adaptive step size's real cost.
+    std::printf("matrix_products=%zu\n", solution->matrix_products);
+    std::printf("kkt_passes=%.1f\n",
+                static_cast<double>(solution->matrix_products) / 2.0);
+  }
   std::printf("primal_infeasibility=%.6e\n", solution->quality.primal_infeasibility);
   std::printf("dual_infeasibility=%.6e\n", solution->quality.dual_infeasibility);
   std::printf("relative_gap=%.6e\n", solution->quality.relative_gap);
