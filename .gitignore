@@ -47,5 +47,13 @@ __pycache__/
 *.handover.html
 handover/
 docs/handover/
+
+# Vendored third-party solvers, kept locally as CORRECTNESS ORACLES and
+# reference corpora only -- never linked, never built, never committed, and
+# their solver sources deliberately NOT read (PS 26119: "shall not be built
+# upon any existing open source solver library"). See docs/HIGHS-COMPARISON.md.
+#   HiGHS/    -- oracle via scripts/oracle_check.py (SciPy wraps it)
+#   or-tools/ -- GLOP/PDLP/CP-SAT, cross-check via scripts/compare_solvers.py
+or-tools/
 HIGHS/
 
