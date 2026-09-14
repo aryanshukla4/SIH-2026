@@ -1,21 +1,14 @@
-#include "sovsolve/solver/simplex/SimplexSolution.hpp"
+#include "sovsolve/solver/pdlp/PdlpSolution.hpp"
 
-#include <algorithm>
-#include <cmath>
 #include <cstddef>
 
 #include "sovsolve/core/Types.hpp"
 #include "sovsolve/solver/SolutionQuality.hpp"
 
-namespace sovsolve::solver::simplex {
-namespace {
-
-using core::is_finite_bound;
-
-}  // namespace
+namespace sovsolve::solver::pdlp {
 
 model::Solution to_canonical_solution(const model::CanonicalProblem& problem,
-                                      const SimplexResult& result) {
+                                      const PdlpResult& result) {
   const std::size_t m = problem.num_rows();
   const std::size_t n = problem.num_cols();
   const std::size_t equalities = problem.num_equality;
@@ -28,20 +21,28 @@ model::Solution to_canonical_solution(const model::CanonicalProblem& problem,
   solution.x.resize(n);
   for (std::size_t j = 0; j < n; ++j) solution.x[j] = result.x[j];
 
-  // `s` covers inequality rows only -- equality rows carry no slack, and their
-  // logical is fixed at zero rather than represented here (FORMULATION.md
-  // section 3). Its element `k` belongs to canonical row `num_equality + k`.
-  solution.s.resize(inequalities);
-  for (std::size_t k = 0; k < inequalities; ++k) {
-    solution.s[k] = result.x[n + equalities + k];
-  }
-
   solution.y.resize(m);
   for (std::size_t i = 0; i < m; ++i) solution.y[i] = result.y[i];
 
-  // A reduced cost splits into the two bound duals by sign; both are
-  // non-negative and at most one is nonzero, which is the complementarity the
-  // IPM spends its whole run approaching and a vertex satisfies exactly.
+  // Slacks are recovered from row activity -- see PdlpSolution.hpp for why
+  // this moves the visible error from `primal_infeasibility` to
+  // `max_bound_violation`.
+  solution.s.resize(inequalities);
+  if (inequalities > 0) {
+    const auto& csr = problem.A.csr;
+    for (std::size_t k = 0; k < inequalities; ++k) {
+      const std::size_t i = equalities + k;
+      Real activity = 0.0;
+      for (std::size_t idx = csr.slice_begin(i); idx < csr.slice_end(i); ++idx) {
+        activity +=
+            csr.values()[idx] * solution.x[static_cast<std::size_t>(csr.indices()[idx])];
+      }
+      solution.s[k] = problem.b[i] - activity;
+    }
+  }
+
+  // Same split as the simplex: a reduced cost is non-negative on the lower
+  // bound's dual and non-positive on the upper's, and at most one is nonzero.
   solution.z.resize(n);
   solution.v.resize(n);
   for (std::size_t j = 0; j < n; ++j) {
@@ -51,9 +52,8 @@ model::Solution to_canonical_solution(const model::CanonicalProblem& problem,
   }
 
   solution.objective = problem.objective(solution.x.span());
-
   compute_solution_quality(problem, solution);
   return solution;
 }
 
-}  // namespace sovsolve::solver::simplex
+}  // namespace sovsolve::solver::pdlp
