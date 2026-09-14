@@ -30,6 +30,7 @@ add_library(sovsolve_solver STATIC
   # against it.
   pdlp/TrustRegion.cpp
   pdlp/MatVec.cpp
+  pdlp/DualityGap.cpp
   pdlp/Pdlp.cpp
   pdlp/PdlpSolution.cpp
   LpSolve.cpp)
