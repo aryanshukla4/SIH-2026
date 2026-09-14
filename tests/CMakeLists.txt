@@ -50,6 +50,11 @@ target_compile_definitions(pdlp_test PRIVATE
 # and it must run in the default preset, not only under CUDA.
 sovsolve_add_test(homogeneous_test     unit/homogeneous_test.cpp)
 
+# Module 25 stage 2. The iteration control transcribed from Andersen &
+# Andersen (2000), whose load-bearing check is that each generalized formula
+# collapses onto the published standard-form one -- see the file header.
+sovsolve_add_test(homogeneous_step_test unit/homogeneous_step_test.cpp)
+
 # Module 26. Builds its own models, so no data path needed.
 sovsolve_add_test(iis_test             unit/iis_test.cpp)
 
