@@ -21,11 +21,32 @@
 #include "sovsolve/solver/Initializer.hpp"
 #include "sovsolve/solver/KktSystem.hpp"
 #include "sovsolve/solver/Logging.hpp"
+#include "sovsolve/solver/Homogeneous.hpp"
+#include "sovsolve/solver/Iis.hpp"
+#include "sovsolve/solver/LpSolve.hpp"
 #include "sovsolve/solver/Regularization.hpp"
 #include "sovsolve/solver/Residuals.hpp"
 #include "sovsolve/solver/Scaler.hpp"
+#include "sovsolve/solver/SolutionQuality.hpp"
 #include "sovsolve/solver/SolutionReconstructor.hpp"
 #include "sovsolve/solver/SolverState.hpp"
+// Module 23 (simplex) and Module 24 (PDLP). Host-only, but the point of this
+// check is that each header stands alone -- one that only compiles because
+// some other header happened to be included first is a latent break for the
+// next file that includes it in a different order.
+#include "sovsolve/solver/simplex/Basis.hpp"
+#include "sovsolve/solver/simplex/DualSimplex.hpp"
+#include "sovsolve/solver/simplex/LuFactor.hpp"
+#include "sovsolve/solver/simplex/PrimalSimplex.hpp"
+#include "sovsolve/solver/simplex/SimplexResult.hpp"
+#include "sovsolve/solver/simplex/SimplexSolution.hpp"
+#include "sovsolve/solver/simplex/SolveSimplex.hpp"
+#include "sovsolve/solver/pdlp/DualityGap.hpp"
+#include "sovsolve/solver/pdlp/Infeasibility.hpp"
+#include "sovsolve/solver/pdlp/MatVec.hpp"
+#include "sovsolve/solver/pdlp/Pdlp.hpp"
+#include "sovsolve/solver/pdlp/PdlpSolution.hpp"
+#include "sovsolve/solver/pdlp/TrustRegion.hpp"
 // GPU-boundary headers: plain C++ declarations (no CUDA-specific syntax), so
 // they compile under any C++ compiler even though their .cu bodies only
 // build under SOVSOLVE_ENABLE_CUDA.

@@ -215,20 +215,55 @@ every module exposes the same `include/` root.
 
 ## Solver core (Modules 5-20, 23)
 
-**There are two LP engines.**
+**There are three LP engines, from three different algorithm families.**
 
-- **Interior point** (Modules 5-20, `src/solver/gpu/`) -- GPU-resident,
-  matrix-free, predictor-corrector. The default (`--method=ipm`), and the only
-  path that handles QP.
-- **Revised simplex** (Module 23, `src/solver/simplex/`) -- host-only, in both
-  its dual and primal forms, sharing one factorized-basis core.
-  `--method=dual-simplex` / `--method=primal-simplex`. LP only. Added
-  2026-09-13; see `module.txt` section 23 and `docs/FORMULATION.md` section 12.
+| Engine | `--method=` | Family | Where |
+|---|---|---|---|
+| **Interior point** (Modules 5-20) | `ipm` (default) | Second-order, matrix-free Krylov | `src/solver/gpu/`, needs CUDA |
+| **Revised simplex** (Module 23) | `dual-simplex`, `primal-simplex` | Active-set, factorized basis | `src/solver/simplex/`, host-only |
+| **PDLP** (Module 24) | `pdlp` | First-order, no factorization at all | `src/solver/pdlp/`, host-only |
 
-Because the simplex engine has no CUDA dependency, `cmake --preset release` on
-native Windows -- no WSL2, no CUDA toolkit -- now produces a working `solve`
-binary and runs 17 of the 19 test suites. That was not true before Module 23:
+They are not interchangeable and are not meant to be. The simplex terminates at
+an exact vertex and warm-starts across a bound change, which is the only reason
+a branch-and-bound node is cheap. The IPM converges in a near-constant
+iteration count and is the only path that handles QP. PDLP never factors
+anything -- its inner loop is one `K` and one `K'` product and nothing else --
+which is what lets it reach sizes the other two cannot, at lower accuracy per
+iteration.
+
+**Current standing on the 19 local Netlib instances** (measured 2026-09-14; the
+corpus contains one genuinely unbounded model, `gas11`, so 19 correct answers
+means 18 `Optimal` plus one `Unbounded`):
+
+| | correct verdicts | notes |
+|---|---|---|
+| Dual simplex | **19 / 19** | exact vertex; every objective matches the published table |
+| Primal simplex | **19 / 19** | same answers, different pivot counts |
+| PDLP | **18 / 19** | `greenbea` unsolved; all others match the simplex |
+| Interior point | 6-7 / 19 | plus no ability to report `Infeasible` or `Unbounded` at all -- see Module 25 |
+
+Two of the three engines have no CUDA dependency, so `cmake --preset release`
+on native Windows -- no WSL2, no CUDA toolkit -- produces a working `solve`
+binary and runs 22 of the 24 test suites. That was not true before Module 23:
 `tools/solve` was hard-gated on `if(TARGET sovsolve_solver_gpu)`.
+
+### Verdicts the solver could not produce at all before Module 23
+
+`SolverStatus::Infeasible` used to come only from the canonicalizer, and
+`SolverStatus::Unbounded` was an enum value nothing ever returned. Both are now
+reachable, by three independent routes, and the three catch different things:
+
+- **Presolve** -- structural, by inspection. Only sees what is visible in the
+  matrix; two rows that contradict each other *jointly* are invisible to it.
+- **Simplex** -- combinatorial. A failed ratio test *is* the proof, and the
+  certificate is a row of `B^-1` the test had already computed.
+- **PDLP** (Module 24) -- analytic and asymptotic, from the direction the
+  iterates diverge in. No event fires; it has to be asked, and can only ever
+  say "to within a tolerance".
+
+And once you have a certificate, **Module 26** turns it into an *irreducible
+infeasible subsystem* -- not "this model is infeasible" but "these rows
+contradict each other, and dropping any one makes the rest satisfiable".
 
 ### Interior-point path
 
@@ -461,26 +496,38 @@ crashes; it now reaches `Optimal` (with `--stall=40`) matching the published
 
 **Current state, the full local 19-instance Netlib set.**
 
-*Simplex (Module 23, 2026-09-13): **19/19 reach `Optimal` on both engines**,
-with matching objectives.* Every objective was cross-checked against
-`scripts/oracle_check.py`'s published table, including its two documented
-archive-drift entries -- `80bau3b` (8.1e-6) and `greenbea`, where our
-`-7.2555248130e+07` matches the LP DASA / HiGHS value rather than the 1988
-archive's `-7.2462405908e+07`. `gas11` returns **`Unbounded`**: the archive has
-no ground truth for it and HiGHS also reports unbounded. This is the first time
-this solver has produced `Unbounded` at all -- see the IPM paragraph below,
-which called that "an architectural gap, not a quick fix," and was right.
+**The corpus contains one genuinely unbounded model.** `gas11` has no
+published optimum and HiGHS also reports it unbounded, so a perfect score is
+**18 `Optimal` plus one `Unbounded`**, not 19 `Optimal`. Stated explicitly
+because an earlier revision of this table said "19/19 reach `Optimal`", which
+was shorthand for "19/19 correct" and read as something stronger than the truth.
 
-| | IPM | dual simplex | primal simplex |
-|---|---|---|---|
-| `Optimal` | 6-7 / 19 | **19 / 19** | **19 / 19** |
-| `Unbounded` detected | never | `gas11` | `gas11` |
+| | IPM | dual simplex | primal simplex | PDLP |
+|---|---|---|---|---|
+| `Optimal` | 6-7 | **18** | **18** | 17 |
+| `Unbounded` on `gas11` | never | yes | yes | yes |
+| **correct verdicts** | 6-7 / 19 | **19 / 19** | **19 / 19** | **18 / 19** |
+| unsolved | 12-13 | none | none | `greenbea` |
+
+Every simplex objective was cross-checked against `scripts/oracle_check.py`'s
+published table, including its two documented archive-drift entries --
+`80bau3b` (8.1e-6) and `greenbea`, where our `-7.2555248130e+07` matches the LP
+DASA / HiGHS value rather than the 1988 archive's `-7.2462405908e+07`. PDLP's
+converged objectives match the simplex's to 6-8 significant digits.
 
 Neither simplex engine dominates the other: `stair` takes 569 primal pivots
 against 3357 dual, while `80bau3b` takes 5546 dual against 19201 primal. That
 is the ordinary reason production solvers keep both, and it is why
 `--primal-cleanup` (on by default) runs the dual and then hands its final basis
 to the primal.
+
+PDLP is a first-order method and behaves like one: it needs far more iterations
+than the simplex needs pivots (`afiro` ~640 KKT passes against a handful of
+pivots) and tails off near the optimum rather than terminating at a vertex.
+What it buys is that nothing is ever factored, which is the only reason it has
+any claim on this hardware at all -- and that claim is still **unmeasured**,
+because the cuSPARSE backend and the large-instance A/B have not been built.
+See `module.txt` section 24, "Not done".
 
 *IPM, for comparison* (default settings, `--max-iter=300`): **6 reach
 `Optimal`** (`afiro`, `avgas`, `chip`, `egout`,
@@ -510,9 +557,10 @@ compatibility. `--help` prints the full list with defaults and the
 ### `tools/solve` -- CLI entry point for testing against real files
 
 ```sh
-# host-only build, no CUDA toolkit needed (simplex engines)
+# host-only build, no CUDA toolkit needed (simplex and PDLP)
 ./build/tools/solve/solve tests/data/netlib/afiro.mps --method=dual-simplex
 ./build/tools/solve/solve tests/data/netlib/afiro.mps --method=primal-simplex
+./build/tools/solve/solve tests/data/netlib/afiro.mps --method=pdlp
 
 # CUDA build (adds the interior-point default)
 ./build-cuda/tools/solve/solve tests/data/netlib/afiro.mps [max_iterations]
@@ -521,12 +569,28 @@ compatibility. `--help` prints the full list with defaults and the
 Loads a model file, solves it, and prints status/objective/iterations/quality
 in a form a benchmark script can parse.
 
-`--method=ipm|dual-simplex|primal-simplex` selects the engine; `ipm` is the
-default and is **compiled out** when `SOVSOLVE_ENABLE_CUDA` is off, since
-`solve_problem()` needs the GPU library. The simplex flags are
-`--simplex-max-iter`, `--pivot-tolerance`, `--pivot-floor`,
-`--refactor-interval`, `--artificial-bound`, `--primal-cleanup`,
-`--bound-flipping`, `--simplex-tol-primal`, `--simplex-tol-dual`.
+`--method=ipm|dual-simplex|primal-simplex|pdlp` selects the engine; `ipm` is
+the default and is **compiled out** when `SOVSOLVE_ENABLE_CUDA` is off, since
+`solve_problem()` needs the GPU library.
+
+- **Simplex:** `--simplex-max-iter`, `--pivot-tolerance`, `--pivot-floor`,
+  `--refactor-interval`, `--artificial-bound`, `--primal-cleanup`,
+  `--bound-flipping`, `--simplex-tol-primal`, `--simplex-tol-dual`.
+- **PDLP:** `--pdlp-tol`, `--pdlp-max-iter`, `--pdlp-check-interval`,
+  `--pdlp-cert-tol`, and one switch per enhancement so the paper's own ablation
+  is reproducible from the command line -- `--pdlp-adaptive`,
+  `--pdlp-restart`, `--pdlp-primal-weight`, `--pdlp-infeasibility`. Every
+  before/after figure in `module.txt` section 24 was produced with these.
+- **Scaling:** `--scaling=geometric|ruiz`. `ruiz` is implied by
+  `--method=pdlp` (its convergence depends on the preconditioning far more
+  directly than a factorization-based method's does); pass `--scaling=` *after*
+  `--method=` to override.
+
+On a PDLP run the tool additionally prints `matrix_products` and `kkt_passes`.
+That is the metric to compare against, not `iterations`: the adaptive step size
+spends several matrix products on a single iteration when it retries a rejected
+trial step, measured at ~1.53 passes per iteration against the fixed rule's
+~1.03, so iteration counts overstate every improvement by roughly 1.5x.
 
 The tool is no longer gated on the GPU library existing -- it builds against
 `sovsolve_solver` alone and only links `sovsolve_solver_gpu` when that target
