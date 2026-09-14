@@ -4,6 +4,7 @@ add_library(sovsolve_solver STATIC
   Presolver.cpp
   MilpPresolve.cpp
   SolutionReconstructor.cpp
+  SolutionQuality.cpp
   ConvergenceChecker.cpp
   Diagnostics.cpp
   Logging.cpp
@@ -28,6 +29,9 @@ add_library(sovsolve_solver STATIC
   # live in the gpu library and be injected, without this library ever linking
   # against it.
   pdlp/TrustRegion.cpp
+  pdlp/MatVec.cpp
+  pdlp/Pdlp.cpp
+  pdlp/PdlpSolution.cpp
   LpSolve.cpp)
 # Regularization is header-only (see Regularization.hpp) and PredictorCorrector
 # lives under gpu/ -- it orchestrates GPU module calls, so it belongs in

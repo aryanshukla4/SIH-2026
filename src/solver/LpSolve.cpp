@@ -6,6 +6,8 @@
 #include "sovsolve/solver/Presolver.hpp"
 #include "sovsolve/solver/Scaler.hpp"
 #include "sovsolve/solver/SolutionReconstructor.hpp"
+#include "sovsolve/solver/pdlp/Pdlp.hpp"
+#include "sovsolve/solver/pdlp/PdlpSolution.hpp"
 #include "sovsolve/solver/simplex/SolveSimplex.hpp"
 #include "sovsolve/solver/simplex/SimplexSolution.hpp"
 
@@ -59,8 +61,8 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options) {
 
   if (problem.has_quadratic()) {
     return core::make_error(core::ErrorCode::UnsupportedFeature,
-                            "solve_lp: the dual simplex solves linear programs; this "
-                            "model has a quadratic objective");
+                            "solve_lp: the simplex and PDLP engines solve linear "
+                            "programs; this model has a quadratic objective");
   }
 
   auto canon = model::canonicalize(problem, options);
@@ -82,10 +84,20 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options) {
   status = scale(canon->problem, options, canon->transforms);
   if (!status.ok()) return status.error();
 
-  auto result = simplex::solve_simplex(canon->problem, options);
-  if (!result.has_value()) return result.error();
+  // Three engines, one pipeline. Everything above and below this block is
+  // shared; only the middle differs, and each engine is responsible for
+  // producing the same five canonical-space vectors.
+  Solution canonical;
+  if (options.simplex.method == model::Method::Pdlp) {
+    auto result = pdlp::solve_pdlp(canon->problem, options);
+    if (!result.has_value()) return result.error();
+    canonical = pdlp::to_canonical_solution(canon->problem, *result);
+  } else {
+    auto result = simplex::solve_simplex(canon->problem, options);
+    if (!result.has_value()) return result.error();
+    canonical = simplex::to_canonical_solution(canon->problem, *result);
+  }
 
-  const Solution canonical = simplex::to_canonical_solution(canon->problem, *result);
   auto recovered =
       reconstruct_solution(problem, canon->problem, canon->transforms, canonical);
   if (!recovered.has_value()) return recovered.error();

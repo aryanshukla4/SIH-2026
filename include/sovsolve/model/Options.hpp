@@ -320,6 +320,35 @@ enum class Method : std::uint8_t {
   Pdlp,
 };
 
+/// Module 24 controls: PDLP (solver/pdlp/Pdlp.hpp).
+struct PdlpOptions {
+  /// Relative tolerance for all three termination criteria (paper equations
+  /// 6a-6c). The paper uses 1e-8 for "high quality" and 1e-4 for "moderately
+  /// accurate"; 1e-8 is the default here so PDLP is held to the same standard
+  /// as the other two engines rather than being flattered by a looser one.
+  Real termination_tolerance = 1e-8;
+
+  /// Iterations between termination checks. Each check costs a `K'y` product
+  /// and, once restarts land, a normalized duality gap evaluation -- real work
+  /// that does not advance the iterate. The paper uses 40.
+  std::size_t check_interval = 40;
+
+  /// Fraction of `1/||K||_2` used as the baseline step size. PDHG converges
+  /// for `eta <= 1/||K||_2`; the paper's baseline backs off to 0.9 of it.
+  /// Superseded by the adaptive rule once Algorithm 2 lands.
+  Real step_size_fraction = 0.9;
+
+  /// Power-iteration budget and relative tolerance for estimating `||K||_2`.
+  /// Only the baseline needs this: PDLP proper starts from `1/||K||_inf`,
+  /// which is one sweep.
+  std::size_t power_iterations = 100;
+  Real power_tolerance = 1e-6;
+
+  /// Iteration cap. `0` means automatic: `100000`, matching the paper's own
+  /// KKT-pass limit for its baseline comparisons.
+  std::size_t max_iterations = 0;
+};
+
 /// How Module 5 equilibrates `A` before anything downstream sees it.
 enum class ScalingMode : std::uint8_t {
   /// Alternating geometric mean of the smallest and largest magnitude in each
@@ -442,6 +471,7 @@ struct Options {
   MilpOptions milp;
   SimplexOptions simplex;
   ScalingOptions scaling;
+  PdlpOptions pdlp;
 };
 
 }  // namespace sovsolve::model

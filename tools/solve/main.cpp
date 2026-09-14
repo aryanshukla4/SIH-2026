@@ -49,9 +49,14 @@ void print_usage(const char* argv0) {
       "tuning flags (each is a field on model::Options -- see Options.hpp\n"
       "for the full doc comment on why each default is what it is):\n"
       "\n"
-      "  --method=ipm|dual-simplex|primal-simplex   SimplexOptions::method\n"
-      "                        (default ipm; the two simplex paths are host-only,\n"
-      "                        and are the only engines a non-CUDA build has)\n"
+      "  --method=ipm|dual-simplex|primal-simplex|pdlp   SimplexOptions::method\n"
+      "                        (default ipm; simplex and pdlp are host-only, and\n"
+      "                        are the only engines a non-CUDA build has)\n"
+      "  --scaling=geometric|ruiz  ScalingOptions::mode (ruiz is implied by\n"
+      "                        --method=pdlp; pass this AFTER it to override)\n"
+      "  --pdlp-tol=X          PdlpOptions::termination_tolerance (default 1e-8)\n"
+      "  --pdlp-max-iter=N     PdlpOptions::max_iterations   (0 = auto, 100000)\n"
+      "  --pdlp-check-interval=N  PdlpOptions::check_interval (default 40)\n"
       "  --simplex-max-iter=N  SimplexOptions::max_iterations   (0 = auto)\n"
       "  --pivot-tolerance=X   SimplexOptions::pivot_tolerance  (default 0.1)\n"
       "  --pivot-floor=X       SimplexOptions::pivot_floor      (default 1e-9)\n"
@@ -112,6 +117,29 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
   const std::string val = flag.substr(eq + 1);
 
   try {
+    if (key == "scaling") {
+      if (val == "geometric") {
+        options.scaling.mode = sovsolve::model::ScalingMode::GeometricMean;
+      } else if (val == "ruiz") {
+        options.scaling.mode = sovsolve::model::ScalingMode::RuizPockChambolle;
+      } else {
+        std::fprintf(stderr, "unknown --scaling: %s (geometric or ruiz)\n", val.c_str());
+        return false;
+      }
+      return true;
+    }
+    if (key == "pdlp-tol") {
+      options.pdlp.termination_tolerance = std::stod(val);
+      return true;
+    }
+    if (key == "pdlp-max-iter") {
+      options.pdlp.max_iterations = static_cast<std::size_t>(std::stoull(val));
+      return true;
+    }
+    if (key == "pdlp-check-interval") {
+      options.pdlp.check_interval = static_cast<std::size_t>(std::stoull(val));
+      return true;
+    }
     if (key == "method") {
       if (val == "ipm" || val == "interior-point") {
         options.simplex.method = sovsolve::model::Method::InteriorPoint;
@@ -119,8 +147,16 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
         options.simplex.method = sovsolve::model::Method::DualSimplex;
       } else if (val == "primal-simplex" || val == "primal") {
         options.simplex.method = sovsolve::model::Method::PrimalSimplex;
+      } else if (val == "pdlp") {
+        options.simplex.method = sovsolve::model::Method::Pdlp;
+        // PDLP's convergence depends on the scaling far more directly than a
+        // factorization-based method's does, so selecting it also selects the
+        // preconditioning its paper specifies -- overridable with an explicit
+        // later --scaling=.
+        options.scaling.mode = sovsolve::model::ScalingMode::RuizPockChambolle;
       } else {
-        std::fprintf(stderr, "unknown --method: %s (ipm, dual-simplex or primal-simplex)\n",
+        std::fprintf(stderr,
+                     "unknown --method: %s (ipm, dual-simplex, primal-simplex, pdlp)\n",
                      val.c_str());
         return false;
       }
@@ -255,14 +291,15 @@ int main(int argc, char** argv) {
   // Anything that is not the interior-point method is a simplex, and both of
   // them enter through solver::solve_lp. Testing for DualSimplex alone silently
   // routed --method=primal-simplex into the IPM branch.
-  const bool use_simplex =
+  const bool use_host_engine =
       options.simplex.method != sovsolve::model::Method::InteriorPoint;
 
-  // The dual simplex is host-only (src/solver/CMakeLists.txt), so this tool
+  // The simplex and PDLP engines are host-only (src/solver/CMakeLists.txt), so
+  // this tool
   // now builds and runs without the CUDA toolkit -- it previously could not be
   // built at all outside WSL2, which left every stage downstream of the
   // canonicalizer unreachable from the default `release` preset.
-  auto solution = use_simplex
+  auto solution = use_host_engine
                       ? sovsolve::solver::solve_lp(*problem, options)
 #ifdef SOVSOLVE_ENABLE_CUDA
                       : sovsolve::solver::gpu::solve(*problem, options);
@@ -271,7 +308,8 @@ int main(int argc, char** argv) {
                             sovsolve::core::make_error(
                                 sovsolve::core::ErrorCode::NotImplemented,
                                 "this build has no CUDA, so the interior-point path is "
-                                "absent; pass --method=dual-simplex"));
+                                "absent; pass --method=dual-simplex or "
+                                "--method=pdlp"));
 #endif
   if (!solution.has_value()) {
     std::fprintf(stderr, "solve failed: %s\n", solution.error().format().c_str());
