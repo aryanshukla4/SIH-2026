@@ -57,7 +57,8 @@ Solution verdict(const Problem& problem, core::SolverStatus status) {
 
 }  // namespace
 
-Expected<Solution> solve_lp(const Problem& problem, const Options& options) {
+Expected<Solution> solve_lp(const Problem& problem, const Options& options,
+                            const MatVecProvider& matvec_provider) {
   const auto start = std::chrono::steady_clock::now();
 
   if (problem.has_quadratic()) {
@@ -90,7 +91,17 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options) {
   // producing the same five canonical-space vectors.
   Solution canonical;
   if (options.simplex.method == model::Method::Pdlp) {
-    auto result = pdlp::solve_pdlp(canon->problem, options);
+    // The injected backend, when there is one. PDLP's only contact with the
+    // matrix is through this, so the GPU path differs from the host path in
+    // exactly one object and nothing else.
+    pdlp::MatVec* matvec = nullptr;
+    if (matvec_provider) {
+      auto supplied = matvec_provider(canon->problem);
+      if (!supplied.has_value()) return supplied.error();
+      matvec = *supplied;
+    }
+    auto result = matvec ? pdlp::solve_pdlp(canon->problem, options, *matvec)
+                         : pdlp::solve_pdlp(canon->problem, options);
     if (!result.has_value()) return result.error();
     canonical = pdlp::to_canonical_solution(canon->problem, *result);
   } else if (options.simplex.method == model::Method::Hsd) {

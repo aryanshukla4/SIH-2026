@@ -16,6 +16,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <string>
 
 #include "sovsolve/io/Load.hpp"
@@ -23,6 +24,7 @@
 #include "sovsolve/solver/LpSolve.hpp"
 #ifdef SOVSOLVE_ENABLE_CUDA
 #include "sovsolve/solver/gpu/BranchAndBound.hpp"
+#include "sovsolve/solver/gpu/PdlpMatVec.hpp"
 #endif
 
 namespace {
@@ -60,6 +62,11 @@ void print_usage(const char* argv0) {
       "  --pdlp-adaptive=0|1   PdlpOptions::adaptive_step_size (default 1)\n"
       "  --pdlp-restart=0|1    PdlpOptions::adaptive_restart   (default 1)\n"
       "  --pdlp-primal-weight=0|1  PdlpOptions::primal_weight_update (default 1)\n"
+      "  --gpu-spmv=0|1        run --method=pdlp's K and K' through cuSPARSE\n"
+      "  --gpu-spmv-timing=0|1 attribute GPU time to kernel vs transfer. Adds two\n"
+      "                        syncs per product, so it INFLATES the wall time it\n"
+      "                        is reporting on -- never read both from one run.\n"
+      "                        (CUDA builds only; the rest of PDLP is\n                        unchanged, because SpMV is all it touches)\n"
       "  --hsd-max-iter=N      HsdOptions::max_iterations    (default 200)\n"
       "  --hsd-cg-max-iter=N   HsdOptions::cg_max_iterations (default 500)\n"
       "  --hsd-cg-tol=X        HsdOptions::cg_tolerance      (default 1e-10)\n"
@@ -116,6 +123,14 @@ void print_usage(const char* argv0) {
 /// Parses `--flag=value` into `options`. Returns false (and prints why) on an
 /// unrecognized flag or a value that doesn't parse -- fail loud rather than
 /// silently run with a typo'd flag ignored.
+/// Not a field on `model::Options`, deliberately: which BACKEND applies `K` is
+/// a property of this build and this invocation, not of the model or the
+/// algorithm. `Options` describes the problem and the method; putting a CUDA
+/// switch in it would push a GPU concept down into the `model` layer, which
+/// sits below `solver` and must not know about it.
+bool gpu_spmv = false;
+bool gpu_spmv_timing = false;
+
 bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
   const auto eq = flag.find('=');
   if (flag.rfind("--", 0) != 0 || eq == std::string::npos) return false;
@@ -189,6 +204,10 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
             val.c_str());
         return false;
       }
+    } else if (key == "gpu-spmv") {
+      gpu_spmv = (val != "0");
+    } else if (key == "gpu-spmv-timing") {
+      gpu_spmv_timing = (val != "0");
     } else if (key == "hsd-max-iter") {
       options.hsd.max_iterations = static_cast<std::size_t>(std::stoul(val));
     } else if (key == "hsd-cg-max-iter") {
@@ -334,8 +353,29 @@ int main(int argc, char** argv) {
   // now builds and runs without the CUDA toolkit -- it previously could not be
   // built at all outside WSL2, which left every stage downstream of the
   // canonicalizer unreachable from the default `release` preset.
+  // Owned HERE, not inside solve_lp, so its counters survive the call and can
+  // be printed below. solve_lp takes a provider precisely to allow this.
+  sovsolve::solver::MatVecProvider provider;
+#ifdef SOVSOLVE_ENABLE_CUDA
+  std::unique_ptr<sovsolve::solver::gpu::CusparseMatVec> gpu_matvec;
+  if (gpu_spmv && options.simplex.method == sovsolve::model::Method::Pdlp) {
+    provider = [&gpu_matvec](const sovsolve::model::CanonicalProblem& canonical)
+        -> sovsolve::core::Expected<sovsolve::solver::pdlp::MatVec*> {
+      auto created =
+          sovsolve::solver::gpu::CusparseMatVec::create(canonical, gpu_spmv_timing);
+      if (!created.has_value()) return created.error();
+      gpu_matvec = std::move(created.value());
+      return static_cast<sovsolve::solver::pdlp::MatVec*>(gpu_matvec.get());
+    };
+  }
+#else
+  if (gpu_spmv) {
+    std::fprintf(stderr, "--gpu-spmv needs a CUDA build; ignoring it\n");
+  }
+#endif
+
   auto solution = use_host_engine
-                      ? sovsolve::solver::solve_lp(*problem, options)
+                      ? sovsolve::solver::solve_lp(*problem, options, provider)
 #ifdef SOVSOLVE_ENABLE_CUDA
                       : sovsolve::solver::gpu::solve(*problem, options);
 #else
@@ -368,6 +408,21 @@ int main(int argc, char** argv) {
   std::printf("complementarity=%.6e\n", solution->quality.complementarity);
   std::printf("max_bound_violation=%.6e\n", solution->quality.max_bound_violation);
   std::printf("from_best_iterate=%s\n", solution->from_best_iterate ? "true" : "false");
+#ifdef SOVSOLVE_ENABLE_CUDA
+  if (gpu_matvec) {
+    // Kernel and transfer are reported SEPARATELY on purpose. The roofline
+    // argument in PdlpMatVec.hpp predicts the KERNEL time; the copies are an
+    // artefact of entering through a host-span interface. One combined number
+    // would let a good kernel hide behind bad transfers, and the ratio between
+    // them is exactly what says whether a device-resident iterate is the next
+    // thing worth building.
+    if (gpu_spmv_timing) {
+      std::printf("spmv_kernel_seconds=%.6f\n", gpu_matvec->kernel_seconds());
+      std::printf("spmv_transfer_seconds=%.6f\n", gpu_matvec->transfer_seconds());
+    }
+    std::printf("gpu_device_bytes=%zu\n", gpu_matvec->device_bytes());
+  }
+#endif
   std::printf("solve_time_seconds=%.6f\n", solution->solve_time_seconds);
   if (is_milp) {
     std::printf("nodes_explored=%zu\n", solution->nodes_explored);

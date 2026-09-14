@@ -69,6 +69,7 @@ if(SOVSOLVE_ENABLE_CUDA)
     gpu/StateUpdate.cu
     gpu/MuController.cu
     gpu/PredictorCorrector.cu
+    gpu/PdlpMatVec.cu
     gpu/Solve.cu
     gpu/BranchAndBound.cu)
 
