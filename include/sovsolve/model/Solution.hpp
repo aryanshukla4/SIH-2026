@@ -82,6 +82,17 @@ struct Solution {
   std::size_t iterations = 0;
   double solve_time_seconds = 0.0;
 
+  /// Module 24 (PDLP) only: products by `K` and `K'`, counted separately; 0
+  /// for every other engine.
+  ///
+  /// For a matrix-free method this, not the iteration count, IS the cost --
+  /// PDLP's own paper measures in "KKT passes" (one `K` plus one `K'`, so half
+  /// of this) for exactly that reason, and because the metric is noise-free
+  /// and comparable across machines. Reporting only iterations would make the
+  /// adaptive step size look better than it is: it can spend several matrix
+  /// products on a single iteration, retrying rejected trial steps.
+  std::size_t matrix_products = 0;
+
   /// True when the returned point came from the best-iterate snapshot rather
   /// than the final iterate -- i.e. the solve stalled or hit a limit. Callers
   /// reporting results should say so.
