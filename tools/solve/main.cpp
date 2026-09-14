@@ -59,6 +59,7 @@ void print_usage(const char* argv0) {
       "  --pdlp-check-interval=N  PdlpOptions::check_interval (default 40)\n"
       "  --pdlp-adaptive=0|1   PdlpOptions::adaptive_step_size (default 1)\n"
       "  --pdlp-restart=0|1    PdlpOptions::adaptive_restart   (default 1)\n"
+      "  --pdlp-primal-weight=0|1  PdlpOptions::primal_weight_update (default 1)\n"
       "  --simplex-max-iter=N  SimplexOptions::max_iterations   (0 = auto)\n"
       "  --pivot-tolerance=X   SimplexOptions::pivot_tolerance  (default 0.1)\n"
       "  --pivot-floor=X       SimplexOptions::pivot_floor      (default 1e-9)\n"
@@ -136,6 +137,10 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
     }
     if (key == "pdlp-max-iter") {
       options.pdlp.max_iterations = static_cast<std::size_t>(std::stoull(val));
+      return true;
+    }
+    if (key == "pdlp-primal-weight") {
+      options.pdlp.primal_weight_update = (val != "0");
       return true;
     }
     if (key == "pdlp-restart") {
