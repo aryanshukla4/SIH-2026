@@ -55,6 +55,11 @@ sovsolve_add_test(homogeneous_test     unit/homogeneous_test.cpp)
 # collapses onto the published standard-form one -- see the file header.
 sovsolve_add_test(homogeneous_step_test unit/homogeneous_step_test.cpp)
 
+# Module 25 stage 3. Two oracles: our own section 13.1 specification
+# factorized whole, and the PUBLISHED standard-form system reached by shifting
+# the bounds away. Neither alone pins the border terms -- see the file header.
+sovsolve_add_test(homogeneous_newton_test unit/homogeneous_newton_test.cpp)
+
 # Module 26. Builds its own models, so no data path needed.
 sovsolve_add_test(iis_test             unit/iis_test.cpp)
 

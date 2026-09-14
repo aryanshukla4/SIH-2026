@@ -664,10 +664,12 @@ skipped entirely — `phase1_iterations == 0` is asserted in
 > |---|---|---|
 > | §13.1 embedding, §13.2 verdicts, §13.4 mu | `solver/Homogeneous.{hpp,cpp}` | **built**, `homogeneous_test` |
 > | step size, centering, starting point, stopping criteria | `solver/HomogeneousStep.{hpp,cpp}` | **built**, `homogeneous_step_test` |
-> | §13.3 the Newton solve | — | **not built**, and §13.3a says what blocks it |
+> | §13.3 the bordered Newton solve | `solver/HomogeneousNewton.{hpp,cpp}` | **built**, `homogeneous_newton_test` |
 >
 > `IpmOptions::homogeneous_self_dual` exists and defaults **off**; nothing reads
 > it yet, so the interior-point path still behaves exactly as §§5–11 describe.
+> What remains is wiring: an iteration loop calling §13.3 and §13.4 in order,
+> and an A/B against the direct path.
 >
 > **Provenance.** §§13.3–13.5 are now transcribed from
 >
@@ -755,94 +757,147 @@ Two things [AA] makes explicit that are easy to get wrong:
 
 ### 13.3 The Newton system is the old one with a border
 
-**Source: [AA] (1.25)–(1.29).** This subsection was previously written from our
-own derivation and was **wrong in one respect**, corrected below.
+**Source: [AA] (1.25)–(1.29) for the structure; §13.3a for the bound terms.**
+Implemented in `solver/HomogeneousNewton.{hpp,cpp}`, tested by
+`homogeneous_newton_test`.
 
-Homogenizing adds `tau` to every existing block and adds one scalar equation,
-so after the §10 eliminations the system is the **same matrix** `K` as before,
-bordered by one row and one column. [AA] (1.26), for standard form:
+> This subsection was previously written from our own derivation and was **wrong
+> in one respect**, corrected below.
+
+Homogenizing adds `tau` to every existing block and adds one scalar equation, so
+after the §10 eliminations the system is the **same matrix** `K` as before,
+bordered by one row and one column:
 
 ```
-    [ -Theta^-1   A'    h ] [ dx   ]   [ r_d - X^-1 r_xs ]
-    [     A       0    -b ] [ dy   ] = [ r_p             ]
-    [     g'      b'  k/t ] [ dtau ]   [ r_g + r_tk / t  ]
+    [ -Theta^-1   A'    h_x         ] [ dx   ]   [ rd_hat         ]
+    [   A         D_s  -b           ] [ dy   ] = [ rp_hat         ]
+    [   g_x'     -b'   -(w+kappa/t) ] [ dtau ]   [ rg_hat - rtk/t ]
 ```
 
-with `h = -c` and `g' = -c'` in standard form, and `k/t` short for
-`kappa/tau`. `Theta^-1` is §10's diagonal, which for standard form is `X^-1 S`.
+Writing `Theta_l = Z/(x - l tau)` and `Theta_u = V/(u tau - x)` for the two
+halves of §10.1's diagonal:
+
+```
+    Theta^-1 = Theta_l + Theta_u                 diagonal, length n
+    D_s      = S/Sigma_I                         inequality rows only
+    h_x      = Theta_l l + Theta_u u - c         border COLUMN
+    g_x      = Theta_l l + Theta_u u + c         border ROW
+    w        = l' Theta_l l + u' Theta_u u       extra trailing term
+```
 
 **The correction: the border row is NOT the negated border column.** The earlier
-text here wrote the block as `[K h; -h' k/t]`, which assumes the bordered system
-inherits `K`'s symmetry. It does not. In [AA] (1.26) the column is `(-c; -b)`
-while the row is `(-c', +b')` — the `b` block agrees in sign rather than
-flipping — because the second block row is written with `+A` against the first
-row's `+A'`. Writing the solve from `-h'` puts a sign error on every `dtau`.
+text wrote the block as `[K h; -h' k/t]`, assuming the bordered system inherits
+`K`'s symmetry. It does not. `g_x - h_x = 2c` whenever a finite bound is
+present: eliminating `dz` and `dv` puts the *same* bound term on both the dual
+row and the gap row, while `c` enters them with opposite signs. Writing the
+solve from `-h'` puts a sign error on every `dtau`.
 
-A bordered system with a `1x1` trailing block is solved by **two solves with
-`K` and a scalar Schur complement**. [AA] (1.28)/(1.29), transcribed:
+Even in standard form, where `g_x = -h_x` does hold, the earlier text was
+misleading for a second reason: [AA] (1.26)'s column is `(-c; -b)` while its row
+is `(-c', +b')`, the `b` block agreeing rather than flipping, because the second
+block row carries `+A` against the first row's `+A'`.
+
+A bordered system with a `1x1` trailing block is solved by **two solves with `K`
+and a scalar Schur complement** — [AA] (1.28)/(1.29), in our coordinates:
 
 ```
-    K (p; q) = (c; b)                          <- once per ITERATION
-    K (u; v) = (r_d - X^-1 r_xs ; r_p)         <- once per RIGHT-HAND SIDE
+    K (p; q) = (h_x; -b)               <- once per ITERATION
+    K (u; v) = (rd_hat; rp_hat)        <- once per RIGHT-HAND SIDE
 
-    dtau      = ( r_g + r_tk/t - (-c; b)'(u; v) )
-                / ( k/t + (-c; b)'(p; q) )
-
-    (dx; dy)  = (u; v) + (p; q) dtau
+    dtau     = ( g_x'u - b'v - rho ) / ( g_x'p - b'q + w + kappa/tau )
+    (dx; dy) = (u; v) - dtau (p; q)
 ```
 
-then `ds` and `dkappa` back out by substitution.
+with `rho = rg_hat - rtk/tau`; then `dz`, `dv`, `ds`, `dkappa` back out by
+substitution.
 
 So `KktBuilder`, `Ordering`, `Preconditioner` and `LinearSolver` are
-**unchanged** — no new matrix, no new factorization, no new preconditioner.
+**unchanged** — `K` is exactly §10.2's augmented KKT with `Q = 0`. No new
+matrix, no new factorization, no new preconditioner.
 
-**The cost is less than one extra solve per direction, not one.** [AA]: *"even
+**The cost is less than one extra solve per direction.** [AA] §1.5: *"even
 though the system (1.25) has to be solved for different right-hand sides, the
 system (1.28) is only solved once in each iteration. Therefore, the main
 computational cost associated with the homogeneous algorithm compared to the
 primal-dual algorithm is the additional solution of a linear equation system of
 the form (1.28)."* The predictor and the corrector share `(p; q)`; only `(u; v)`
-is recomputed. The predictor-corrector already performs two solves per iteration
-reusing one factorization, so this fits the existing shape rather than fighting
-it.
+is recomputed. `refresh_border_solve` is a separate entry point from
+`solve_homogeneous_newton` precisely so this cannot be silently lost — folding it
+into the step would double the cost and every test would still pass.
 
-### 13.3a The one thing [AA] does not give us — **OPEN**
+**Inequality rows touch only `K`'s (2,2) block**, never the border: the gap row
+does not involve `s` at all. Checked separately against a dense Jacobian.
+
+### 13.3a Where the general-bounds border came from — **CLOSED**
 
 [AA] §1.2 is explicit: *"For simplicity we will work with the LP problem in
-standard form"*, `Ax = b, x >= 0`. Every equation above is stated there for
-`l = 0, u = inf`. Our canonical form (§2) has genuine finite `l` and `u` on both
-sides, and that changes exactly one thing — **`h` and `g` are no longer `-c` and
-`-c'`.**
-
-The reason is visible in §13.1: homogenizing sends `l -> l tau` and `u -> u tau`,
-so `tau` appears **inside the complementarity rows**:
+standard form"*, `Ax = b, x >= 0`. Every equation in §13.3 is stated there for
+`l = 0, u = inf`, which is why its border is the clean `-c`. Our canonical form
+(§2) has genuine finite bounds, and homogenizing sends `l -> l tau`,
+`u -> u tau`, so `tau` appears **inside the complementarity rows**:
 
 ```
-    (x - l tau) .* z = mu        (u tau - x) .* v = mu
+    (x - l tau) .* z = mu           (u tau - x) .* v = mu
 ```
 
-Standard form has `l = 0` (the `tau` multiplies zero and vanishes) and no `u`
-term at all (the pair does not exist), which is why [AA]'s border column is
-clean. With finite bounds, eliminating `dz` and `dv` — the same elimination §10.1
-already performs — leaves `dtau` terms behind in both the dual block row and the
-gap row, and **they are not the same terms**, so `g` is not `-h`.
+Eliminating `dz` and `dv` then leaves `dtau` terms in both the dual block row
+and the gap row. Standard form has `l = 0` (multiplying the first by zero) and
+no `u` pair at all, so both vanish.
 
-Everything in §§13.4–13.5 and in `HomogeneousStep.hpp` is independent of this:
-the step size, the centering heuristic, the starting point and the stopping
-criteria read an iterate and a direction and do not care how the direction was
-produced. **Only the Newton solve is blocked.**
+**This was resolved by a change of variables, not by a new derivation.** The
+shift
 
-Two candidate resolutions, neither taken yet:
+```
+    x = l tau + s1,      s2 = (u - l) tau - s1,      s1, s2 >= 0
+```
 
-1. A source that states the homogeneous embedding for the general bounded form.
-   [AA] does not; neither do Ye–Todd–Mizuno or Xu–Hung–Ye, which are also
-   standard-form. This is the preferred route.
-2. Convert to standard form internally. **Rejected**: `Canonical.hpp` keeps
-   bounds native on purpose, and `gas11` is 44% free columns, which the
-   conversion would split and double.
+carries our bounded embedding onto [AA]'s `(HLF)` **exactly**, with
 
-Until one of those lands, `HomogeneousStep.hpp` is stage 2 and the Newton solve
-is stage 3.
+```
+    s1 = x - l tau       s2 = u tau - x       y2 = -v       sigma = (z, v)
+```
+
+and, on inequality rows, `sigma_I = -y_I` already being standard form. Verified
+against a dense Jacobian in both coordinate systems, agreeing to `1e-15` in
+every block. Two details worth recording:
+
+- The transformed gap row is **ours plus a multiple of the dual row**, not ours
+  exactly: `T3 = -R3 - l'R2`. That is an identity, and the test asserts it
+  rather than assuming it.
+- The `c'l tau` terms introduced by shifting the objective **cancel** against
+  those introduced by shifting the right-hand side, which is why §13.1's gap row
+  `c'x - b'y - l'z + u'v + kappa` emerges from the transformation unchanged.
+  This confirms §13.1 independently of the LP-duality argument it was written
+  from.
+
+**The correspondence is also the test oracle**, which is the better reason to
+record it. `homogeneous_newton_test` carries two:
+
+1. §13.1 transcribed as a dense Jacobian and factorized whole — catches an error
+   in the **elimination**.
+2. The shifted standard-form instance with [AA]'s system written verbatim, our
+   direction mapped across and required to satisfy it — catches an error in the
+   **border itself**, which oracle 1 cannot, because oracle 1 and the
+   implementation are both derived from §13.1 and could share a mistake.
+
+Confirmed complementary by mutation: with oracle 1 disabled, oracle 2 alone
+still catches a border column that loses its bound term (failing at the dual
+row), a border row written as `-h_x` (failing at the gap row) and a dropped `w`
+(likewise) — each at exactly the row that term belongs to.
+
+The shift needs finite bounds, since a column with an infinite bound cannot be
+shifted by `l`. That is not a hole: such a column has no complementarity pair
+and so contributes no bound term, leaving its border entry at [AA]'s `-c_j`.
+Oracle 2 covers exactly what [AA] does not, and a separate test checks the
+infinite-bound case collapses onto [AA] directly.
+
+Measured on a random instance with finite bounds: `||g_x + h_x|| = 7.14` and
+`w = 17.6`. The old `[K h; -h' k/t]` was not a small error.
+
+**The alternative was rejected.** Converting to standard form *in production* —
+rather than only inside a test — would take us to `2n + m_I` columns and `m + n`
+rows. `Canonical.hpp` keeps bounds native on purpose, and `gas11` is 44% free
+columns, which the shift cannot even express.
 
 ### 13.4 Iteration control — step length, centering, start, stopping
 

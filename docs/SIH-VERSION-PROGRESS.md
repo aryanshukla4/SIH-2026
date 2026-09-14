@@ -363,11 +363,22 @@ it away.
 The IPM still cannot report `Infeasible` or `Unbounded`; Version 4's notes call
 that an architectural gap and they are still right. Module 25 begins the
 standard fix (the homogeneous self-dual embedding, which is what MOSEK and
-CPLEX barrier use). **Stages 1 and 2**: the residuals, the classification, the
-recovery, and now the whole iteration control — step size, centering, starting
-point, stopping criteria — transcribed from the MOSEK paper itself (Andersen &
-Andersen 2000). The Newton solve is still not written, the option exists,
-defaults off, and nothing reads it yet; `FORMULATION.md` §13 says so in a table.
+CPLEX barrier use). **Stages 1–3**: the residuals, the classification, the
+recovery; the whole iteration control — step size, centering, starting point,
+stopping criteria — transcribed from the MOSEK paper itself (Andersen & Andersen
+2000); and the bordered Newton solve. The option exists, defaults off, and
+nothing reads it yet — what is left is the iteration loop and the A/B.
+
+The interesting part is what the MOSEK paper does **not** contain. It works in
+standard form (`Ax = b, x >= 0`) throughout, and our models have real bounds
+`l <= x <= u`, which changes the one thing that matters: the border of the
+Newton system. Rather than hunt for a paper that states it, we closed it with a
+change of variables that maps our problem onto theirs exactly — and then kept
+that map as a **test oracle**, so the bound terms are checked against the
+published algorithm rather than against our own reasoning. Verified to 1e-15,
+and proven able to fail: with the first oracle switched off, the second alone
+still catches three different wrong borders, each failing at exactly the row
+that term belongs to.
 
 Worth telling honestly, because it is the same kind of finding as the PDLP
 ones: the MOSEK paper works in **standard form** throughout, and its starting
@@ -402,10 +413,10 @@ score is 18 `Optimal` plus one `Unbounded`, not 19 `Optimal`.)*
   but the measurement that would prove this hardware earns its GPU has not been
   run. We can explain why PDLP *should* suit it; we cannot yet show the number.
 - **`greenbea`** is solved by both simplex engines and by nothing else.
-- **HSD's Newton solve** is the one open piece, and the gap is narrow and named:
-  the MOSEK paper states the bordered system for standard form only, and with
-  finite bounds the border row and column stop being negatives of each other.
-  Everything either side of it is built.
+- **HSD is built but not wired.** All three stages exist and are tested; what is
+  missing is the iteration loop that calls them and the A/B measurement against
+  the current interior-point path. Until that runs, do not claim the IPM detects
+  infeasibility.
 
 **How to say it simply:** *"Ab humare paas teen alag-alag tarike hain LP solve
 karne ke, aur teeno alag family se hain. Aur agar aapka model solve nahi ho
