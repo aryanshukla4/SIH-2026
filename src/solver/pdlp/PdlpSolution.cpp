@@ -17,6 +17,7 @@ model::Solution to_canonical_solution(const model::CanonicalProblem& problem,
   model::Solution solution;
   solution.status = result.status;
   solution.iterations = result.iterations;
+  solution.matrix_products = result.matrix_products;
 
   solution.x.resize(n);
   for (std::size_t j = 0; j < n; ++j) solution.x[j] = result.x[j];

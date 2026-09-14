@@ -578,6 +578,7 @@ core::Expected<Solution> recover_solution(const Problem& original,
   Solution s;
   s.status = canonical_solution.status;
   s.iterations = canonical_solution.iterations;
+  s.matrix_products = canonical_solution.matrix_products;
   s.solve_time_seconds = canonical_solution.solve_time_seconds;
   s.from_best_iterate = canonical_solution.from_best_iterate;
   s.quality = canonical_solution.quality;

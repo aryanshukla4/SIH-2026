@@ -333,6 +333,13 @@ struct PdlpOptions {
   /// that does not advance the iterate. The paper uses 40.
   std::size_t check_interval = 40;
 
+  /// Choose each step's size by trial (paper Algorithm 2) instead of fixing
+  /// it at `0.9/||K||_2`. Off is the textbook rule; keep the switch because
+  /// the paper's own ablation compares exactly these two, and because a
+  /// suspected step-size bug should be isolatable without rebuilding the rest
+  /// of the iteration.
+  bool adaptive_step_size = true;
+
   /// Fraction of `1/||K||_2` used as the baseline step size. PDHG converges
   /// for `eta <= 1/||K||_2`; the paper's baseline backs off to 0.9 of it.
   /// Superseded by the adaptive rule once Algorithm 2 lands.

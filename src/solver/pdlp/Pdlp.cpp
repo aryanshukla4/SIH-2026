@@ -91,6 +91,27 @@ core::HostSpan<Real> out(core::RealVector& v) {
   return sigma;
 }
 
+/// `||K||_inf`, the induced infinity norm: the largest absolute row sum.
+///
+/// PDLP's Algorithm 1 initializes its step size from `1/||K||_inf` rather than
+/// `1/||K||_2`, and the difference is not a detail. The spectral norm needs
+/// power iteration -- tens of matrix products before the first real step --
+/// while this is one sweep of the values already in memory. The adaptive rule
+/// then corrects whatever the initial guess was, so paying for an accurate
+/// starting point buys nothing.
+[[nodiscard]] Real infinity_norm(const CanonicalProblem& problem) {
+  const auto& csr = problem.A.csr;
+  Real worst = 0.0;
+  for (std::size_t i = 0; i < problem.num_rows(); ++i) {
+    Real row_sum = 0.0;
+    for (std::size_t k = csr.slice_begin(i); k < csr.slice_end(i); ++k) {
+      row_sum += std::fabs(csr.values()[k]);
+    }
+    worst = std::max(worst, row_sum);
+  }
+  return worst;
+}
+
 /// Everything equations (6a)-(6c) need, measured at the current iterate.
 struct Convergence {
   Real gap = 0.0;
@@ -131,6 +152,22 @@ class PdlpSolver {
   core::RealVector k_x_;           ///< `K x`
   core::RealVector reduced_cost_;
   core::RealVector primal_residual_;
+
+  // Adaptive step size (Algorithm 2) scratch. `x_trial_`/`y_trial_` hold the
+  // candidate point of a trial that may yet be rejected, so `x_`/`y_` are only
+  // overwritten once a step is accepted.
+  core::RealVector x_trial_;
+  core::RealVector y_trial_;
+  core::RealVector k_extrapolated_;  ///< `K(2x' - x)`, recomputed per trial
+  core::RealVector k_x_current_;     ///< `K x`, fixed across a trial sequence
+
+  Real omega_ = 1.0;  ///< primal weight; adapts in C3, fixed at 1 until then
+  std::size_t step_rejections_ = 0;
+
+  /// Algorithm 2. `eta` enters as this iteration's trial size and leaves as
+  /// `eta'`, the starting point for the next one.
+  void adaptive_step(std::size_t total_iterations, Real& eta);
+  void fixed_step(Real tau, Real sigma);
 };
 
 void PdlpSolver::evaluate(Convergence& conv) {
@@ -190,10 +227,159 @@ PdlpResult PdlpSolver::pack(SolverStatus status, const Convergence& conv) const 
   r.reduced_cost = reduced_cost_.clone();
   r.objective = conv.primal_objective;
   r.matrix_products = matvec_.products();
+  r.step_rejections = step_rejections_;
   r.relative_duality_gap = conv.gap;
   r.relative_primal_residual = conv.primal;
   r.relative_dual_residual = conv.dual;
   return r;
+}
+
+/// One fixed-step PDHG iteration -- paper equation (3) verbatim. Kept so the
+/// adaptive rule can be switched off and compared against, which is how the
+/// paper's own ablation (figure 1) is structured.
+void PdlpSolver::fixed_step(Real tau, Real sigma) {
+  matvec_.multiply_transpose(in(y_), out(kt_y_));
+  for (std::size_t j = 0; j < n_; ++j) {
+    x_prev_[j] = x_[j];
+    const Real step = x_[j] - tau * (problem_.c[j] - kt_y_[j]);
+    x_[j] = std::clamp(step, problem_.col_lower[j], problem_.col_upper[j]);
+  }
+  // The extrapolation `2x^{k+1} - x^k` is what makes this PDHG rather than
+  // Arrow-Hurwicz, and it is what the convergence proof needs; using `x^k`
+  // here converges only under far stronger conditions.
+  for (std::size_t j = 0; j < n_; ++j) {
+    extrapolated_[j] = 2.0 * x_[j] - x_prev_[j];
+  }
+  matvec_.multiply(in(extrapolated_), out(k_x_));
+  for (std::size_t i = 0; i < m_; ++i) {
+    const Real step = y_[i] + sigma * (problem_.b[i] - k_x_[i]);
+    y_[i] = i < problem_.num_equality ? step : std::min(step, 0.0);
+  }
+}
+
+/// Algorithm 2: one PDHG step whose size is chosen by trial.
+///
+/// The convergence analysis of PDHG needs the step to satisfy equation (5),
+///
+///     eta <= ||z^{k+1} - z^k||^2_omega / ( 2 (y^{k+1} - y^k)' K (x^{k+1} - x^k) )
+///
+/// Classically one guarantees that by taking `eta = 1/||K||_2`, which is both
+/// pessimistic -- the bound is global, while the ratio above is local and
+/// usually much larger -- and expensive, since `||K||_2` needs estimating.
+/// Instead: take the step, measure the ratio it actually produced, and accept
+/// only if (5) held. If it did not, shrink and retry the same iteration.
+///
+/// The two exponents in line 7 are what stop this oscillating. The shrink
+/// factor `(1 - (k+1)^-0.3)` and the growth cap `(1 + (k+1)^-0.6)` both decay
+/// with the iteration count, so early steps move aggressively and later ones
+/// settle -- and because the growth cap decays faster than the shrink factor,
+/// the step size cannot keep re-inflating into the same rejection.
+///
+/// Matrix-product accounting, which is the whole cost model here: `y` does NOT
+/// change across trials, so `K'y` is computed ONCE per iteration rather than
+/// per trial. `K x` likewise. Only `K(2x' - x)` is per-trial. So an iteration
+/// costs 2 + (number of trials) products, against the fixed rule's 2.
+void PdlpSolver::adaptive_step(std::size_t total_iterations, Real& eta_inout) {
+  Real eta = eta_inout;
+  // Fixed across the whole trial sequence: `x_` and `y_` do not move until a
+  // trial is accepted.
+  matvec_.multiply_transpose(in(y_), out(kt_y_));
+  matvec_.multiply(in(x_), out(k_x_current_));
+
+  const Real k_plus_one = static_cast<Real>(total_iterations + 1);
+  const Real shrink = 1.0 - std::pow(k_plus_one, -0.3);
+  const Real growth = 1.0 + std::pow(k_plus_one, -0.6);
+
+  // A cap, not part of the algorithm: Algorithm 2's loop is stated as
+  // `for i = 1..infinity`, and it terminates because `eta` shrinks
+  // geometrically until (5) must hold. On degenerate data (a zero row, a
+  // denominator at the rounding floor) that argument can fail numerically, and
+  // an unbounded loop inside a solver is worse than a slightly-too-large step.
+  constexpr int kMaxTrials = 60;
+
+  for (int trial = 0; trial < kMaxTrials; ++trial) {
+    const Real tau = eta / omega_;
+    const Real sigma = eta * omega_;
+
+    // line 4: x' = proj_X(x - (eta/omega)(c - K'y))
+    for (std::size_t j = 0; j < n_; ++j) {
+      const Real step = x_[j] - tau * (problem_.c[j] - kt_y_[j]);
+      x_trial_[j] = std::clamp(step, problem_.col_lower[j], problem_.col_upper[j]);
+      extrapolated_[j] = 2.0 * x_trial_[j] - x_[j];
+    }
+
+    // line 5: y' = proj_Y(y + eta*omega (q - K(2x' - x)))
+    matvec_.multiply(in(extrapolated_), out(k_extrapolated_));
+    for (std::size_t i = 0; i < m_; ++i) {
+      const Real step = y_[i] + sigma * (problem_.b[i] - k_extrapolated_[i]);
+      y_trial_[i] = i < problem_.num_equality ? step : std::min(step, 0.0);
+    }
+
+    // line 6: eta_bar = ||dz||^2_omega / (2 dy' K dx).
+    //
+    // `K dx` needs no product of its own. With `u = 2x' - x` we have
+    // `u - x = 2(x' - x)`, so `K dx = (K u - K x) / 2` -- and both terms are
+    // already in hand.
+    Real interaction = 0.0;
+    for (std::size_t i = 0; i < m_; ++i) {
+      const Real k_dx = 0.5 * (k_extrapolated_[i] - k_x_current_[i]);
+      interaction += (y_trial_[i] - y_[i]) * k_dx;
+    }
+
+    Real dx_dy_norm_sq = 0.0;
+    {
+      Real px = 0.0;
+      for (std::size_t j = 0; j < n_; ++j) {
+        const Real d = x_trial_[j] - x_[j];
+        px += d * d;
+      }
+      Real py = 0.0;
+      for (std::size_t i = 0; i < m_; ++i) {
+        const Real d = y_trial_[i] - y_[i];
+        py += d * d;
+      }
+      dx_dy_norm_sq = omega_ * px + py / omega_;
+    }
+
+    // A non-positive interaction term means the step cannot violate (5) at
+    // any size -- the primal and dual moves did not fight each other -- so the
+    // bound is vacuous and the step is accepted outright.
+    const Real denominator = 2.0 * std::fabs(interaction);
+    const Real eta_bar = denominator > 0.0
+                             ? dx_dy_norm_sq / denominator
+                             : std::numeric_limits<Real>::infinity();
+
+    const Real eta_next = std::min(shrink * eta_bar, growth * eta);
+
+    if (eta <= eta_bar) {
+      // Accepted. `x_prev_` keeps the pre-step primal point because the
+      // restart machinery (C2) needs the iterate difference.
+      for (std::size_t j = 0; j < n_; ++j) {
+        x_prev_[j] = x_[j];
+        x_[j] = x_trial_[j];
+      }
+      for (std::size_t i = 0; i < m_; ++i) y_[i] = y_trial_[i];
+      eta_inout = std::isfinite(eta_next) && eta_next > 0.0 ? eta_next : eta;
+      return;
+    }
+
+    ++step_rejections_;
+    if (!std::isfinite(eta_next) || eta_next <= 0.0 || eta_next >= eta) {
+      // Not shrinking, so retrying cannot help. Take the step anyway rather
+      // than spin: a slightly oversized step degrades convergence, a hang
+      // does not degrade, it stops.
+      for (std::size_t j = 0; j < n_; ++j) {
+        x_prev_[j] = x_[j];
+        x_[j] = x_trial_[j];
+      }
+      for (std::size_t i = 0; i < m_; ++i) y_[i] = y_trial_[i];
+      eta_inout = eta;
+      return;
+    }
+    eta = eta_next;
+  }
+
+  eta_inout = eta;
 }
 
 core::Expected<PdlpResult> PdlpSolver::run() {
@@ -213,6 +399,14 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   k_x_.assign(0.0);
   primal_residual_.resize(m_);
   primal_residual_.assign(0.0);
+  x_trial_.resize(n_);
+  x_trial_.assign(0.0);
+  y_trial_.resize(m_);
+  y_trial_.assign(0.0);
+  k_extrapolated_.resize(m_);
+  k_extrapolated_.assign(0.0);
+  k_x_current_.resize(m_);
+  k_x_current_.assign(0.0);
 
   // Paper section 4.1: "All first-order methods use all-zero vectors as the
   // initial starting points." Zero is not interior and does not need to be --
@@ -222,8 +416,14 @@ core::Expected<PdlpResult> PdlpSolver::run() {
     x_prev_[j] = x_[j];
   }
 
-  const Real spectral = estimate_spectral_norm(matvec_, opt_);
-  if (!(spectral > 0.0) || !std::isfinite(spectral)) {
+  const bool adaptive = opt_.pdlp.adaptive_step_size;
+
+  // Algorithm 1 line 2 starts the adaptive rule from `1/||K||_inf`, one sweep.
+  // The fixed rule needs the far more expensive `0.9/||K||_2` because nothing
+  // downstream will correct a bad guess.
+  const Real scale = adaptive ? infinity_norm(problem_)
+                              : estimate_spectral_norm(matvec_, opt_);
+  if (!(scale > 0.0) || !std::isfinite(scale)) {
     // A zero matrix has no coupling between primal and dual; there is nothing
     // for PDHG to iterate on and the caller should not be told it converged.
     Convergence conv;
@@ -234,11 +434,9 @@ core::Expected<PdlpResult> PdlpSolver::run() {
                 conv);
   }
 
-  // Baseline step sizes: `eta = 0.9/||K||_2`, primal weight `omega = 1`, so
-  // `tau = sigma = eta` (paper equation 4 with omega = 1).
-  const Real eta = opt_.pdlp.step_size_fraction / spectral;
-  const Real tau = eta;
-  const Real sigma = eta;
+  Real eta = adaptive ? 1.0 / scale : opt_.pdlp.step_size_fraction / scale;
+  const Real fixed_tau = eta / omega_;
+  const Real fixed_sigma = eta * omega_;
 
   const std::size_t budget =
       opt_.pdlp.max_iterations != 0 ? opt_.pdlp.max_iterations : kDefaultMaxIterations;
@@ -257,27 +455,10 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   SolverStatus outcome = SolverStatus::MaxIterations;
 
   while (iteration < budget) {
-    // -- primal step: descend `dL/dx = c - K'y`, then project onto the box --
-    matvec_.multiply_transpose(in(y_), out(kt_y_));
-    for (std::size_t j = 0; j < n_; ++j) {
-      x_prev_[j] = x_[j];
-      const Real step = x_[j] - tau * (problem_.c[j] - kt_y_[j]);
-      x_[j] = std::clamp(step, problem_.col_lower[j], problem_.col_upper[j]);
-    }
-
-    // -- dual step: ascend `dL/dy = q - Kx` at the EXTRAPOLATED primal point.
-    //
-    // The extrapolation `2x^{k+1} - x^k` is what makes this PDHG rather than
-    // Arrow-Hurwicz, and it is what the convergence proof needs; using `x^k`
-    // here converges only under far stronger conditions.
-    for (std::size_t j = 0; j < n_; ++j) {
-      extrapolated_[j] = 2.0 * x_[j] - x_prev_[j];
-    }
-    matvec_.multiply(in(extrapolated_), out(k_x_));
-    for (std::size_t i = 0; i < m_; ++i) {
-      const Real step = y_[i] + sigma * (problem_.b[i] - k_x_[i]);
-      // proj_Y: equality rows are free, `<=` rows require `y_i <= 0`.
-      y_[i] = i < problem_.num_equality ? step : std::min(step, 0.0);
+    if (adaptive) {
+      adaptive_step(iteration, eta);
+    } else {
+      fixed_step(fixed_tau, fixed_sigma);
     }
 
     ++iteration;
