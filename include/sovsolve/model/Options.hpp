@@ -137,6 +137,21 @@ struct IpmOptions {
   /// breakdown: escalate and refactor, same as an exact-singular pivot.
   Real max_pivot_ratio = 1e10;
 
+  /// Solve the HOMOGENEOUS SELF-DUAL embedding instead of the problem
+  /// directly (docs/FORMULATION.md section 13).
+  ///
+  /// The direct formulation cannot report `Infeasible` or `Unbounded` at all:
+  /// with no feasible point there is no interior to follow, the iterates
+  /// diverge, and the only honest outcome is `MaxIterations`. The embedding is
+  /// always feasible, and which of the two answers holds is read off the two
+  /// extra scalars at convergence.
+  ///
+  /// Defaults OFF. Every measured interior-point result in README.md was
+  /// produced with the direct formulation, and a reformulation that changes
+  /// the iterates on every instance has to prove itself before it replaces
+  /// them. Turning it on is how that A/B is run.
+  bool homogeneous_self_dual = false;
+
   /// Maximum iterative-refinement passes per linear solve.
   ///
   /// Refinement is measured against the UNREGULARIZED residual: the regularized

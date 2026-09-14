@@ -45,6 +45,11 @@ sovsolve_add_test(pdlp_test            unit/pdlp_test.cpp)
 target_compile_definitions(pdlp_test PRIVATE
   SOVSOLVE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 
+# Module 25. Host-only by design (see Homogeneous.hpp): the embedding's
+# equivalence to the direct formulation at tau = 1 is the load-bearing check
+# and it must run in the default preset, not only under CUDA.
+sovsolve_add_test(homogeneous_test     unit/homogeneous_test.cpp)
+
 # Module 26. Builds its own models, so no data path needed.
 sovsolve_add_test(iis_test             unit/iis_test.cpp)
 
