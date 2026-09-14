@@ -147,10 +147,10 @@ struct Convergence {
 
 class PdlpSolver {
  public:
-  PdlpSolver(const CanonicalProblem& problem, const Options& options)
+  PdlpSolver(const CanonicalProblem& problem, const Options& options, MatVec& matvec)
       : problem_(problem),
         opt_(options),
-        matvec_(problem),
+        matvec_(matvec),
         m_(problem.num_rows()),
         n_(problem.num_cols()),
         gap_(problem),
@@ -164,7 +164,11 @@ class PdlpSolver {
 
   const CanonicalProblem& problem_;
   const Options& opt_;
-  HostMatVec matvec_;
+  /// INJECTED, not owned. The whole engine touches `K` only through this, so
+  /// swapping the host implementation for a cuSPARSE one changes nothing else
+  /// -- and because `MatVec` counts its own products, a CPU-versus-GPU A/B
+  /// reads one instrumentation rather than two.
+  MatVec& matvec_;
   std::size_t m_;
   std::size_t n_;
 
@@ -855,7 +859,24 @@ core::Expected<PdlpResult> solve_pdlp(const CanonicalProblem& problem,
                             "solve_pdlp: PDLP solves linear programs; this model has "
                             "a quadratic objective");
   }
-  PdlpSolver solver(problem, options);
+  HostMatVec matvec(problem);
+  PdlpSolver solver(problem, options, matvec);
+  return solver.run();
+}
+
+core::Expected<PdlpResult> solve_pdlp(const CanonicalProblem& problem,
+                                      const Options& options, MatVec& matvec) {
+  if (!problem.Q.empty()) {
+    return core::make_error(ErrorCode::UnsupportedFeature,
+                            "solve_pdlp: PDLP solves linear programs; this model has "
+                            "a quadratic objective");
+  }
+  if (matvec.num_rows() != problem.num_rows() ||
+      matvec.num_cols() != problem.num_cols()) {
+    return core::make_error(ErrorCode::DimensionMismatch,
+                            "solve_pdlp: the injected MatVec does not match the problem");
+  }
+  PdlpSolver solver(problem, options, matvec);
   return solver.run();
 }
 

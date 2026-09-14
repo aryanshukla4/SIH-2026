@@ -59,6 +59,7 @@
 #include "sovsolve/solver/gpu/MuController.hpp"
 #include "sovsolve/solver/gpu/NewtonRecovery.hpp"
 #include "sovsolve/solver/gpu/Ordering.hpp"
+#include "sovsolve/solver/gpu/PdlpMatVec.hpp"
 #include "sovsolve/solver/gpu/PredictorCorrector.hpp"
 #include "sovsolve/solver/gpu/ResidualCalculator.hpp"
 #include "sovsolve/solver/gpu/Solve.hpp"

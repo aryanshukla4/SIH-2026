@@ -200,6 +200,29 @@ The distinction that matters:
 | Dense/sparse factorization | FLOPs | **~64×** — slower than our CPU |
 | SpMV (`Ax`, `Aᵀy`) | Memory bandwidth | **~2×** (8 bytes vs 4) — perfectly acceptable |
 
+> **Both rows above are spec sheet plus roofline, not measurements** — and the
+> second is routinely misread. Its "~2×" is the **FP64-vs-FP32 cost on the GPU**
+> (doubles move twice the bytes, so a bandwidth-bound kernel costs ~2× more in
+> FP64). It is **not** a GPU-vs-CPU speedup; that is a different quantity
+> (~192 GB/s against a laptop's ~51 GB/s of DDR4, so under 4× as a ceiling).
+>
+> **Measured 2026-09-15** (`module.txt` §24E, `--method=pdlp --gpu-spmv=1`),
+> identical `matrix_products` on both paths:
+>
+> | instance | size | CPU | GPU | |
+> |---|---|---|---|---|
+> | `25fv47` | 360 KB | 0.14 s | 3.52 s | GPU **25× slower** |
+> | `maros-r7` | 4.7 MB | 1.61 s | 3.33 s | GPU 2.1× slower |
+> | `datt256` | 93 MB | 15.81 s | 11.94 s | GPU **1.32× faster** |
+>
+> GPU time is near-**constant** across a 260× size range, so the crossover is
+> set by per-product launch latency, not by arithmetic. Attributing the
+> `datt256` run: kernel 1.63 s, host↔device transfer 2.94 s (**1.8× the
+> kernel**), and ~7.4 s of PDLP's own host-side vector arithmetic that is
+> identical on both paths. Netting that out, the SpMV itself is ~1.8× faster on
+> the GPU — consistent with the ceiling this section predicted. The prediction
+> held; the *threshold* is what only measurement could supply.
+
 So on this hardware the credible GPU story is the **SpMV-heavy, matrix-free path**, not GPU
 factorization. Two consequences worth discussing:
 
