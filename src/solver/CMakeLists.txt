@@ -8,6 +8,7 @@ add_library(sovsolve_solver STATIC
   Iis.cpp
   Homogeneous.cpp
   HomogeneousStep.cpp
+  HomogeneousNewton.cpp
   ConvergenceChecker.cpp
   Diagnostics.cpp
   Logging.cpp
