@@ -656,14 +656,27 @@ skipped entirely — `phase1_iterations == 0` is asserted in
 
 ---
 
-## 13. Homogeneous self-dual embedding — **SPECIFIED, NOT YET IMPLEMENTED**
+## 13. Homogeneous self-dual embedding
 
-> **Status (2026-09-14): this section is a specification written ahead of the
-> code.** No part of it is implemented; `IpmOptions::homogeneous_self_dual`
-> does not exist yet, and the interior-point path still behaves exactly as
-> §§5–11 describe. It is recorded here because the derivation was done and is
-> the thing worth checking before any of it is built. Delete this banner when
-> the code lands, and not before.
+> **Status (2026-09-14): PARTIALLY IMPLEMENTED.**
+>
+> | part | where | state |
+> |---|---|---|
+> | §13.1 embedding, §13.2 verdicts, §13.4 mu | `solver/Homogeneous.{hpp,cpp}` | **built**, `homogeneous_test` |
+> | step size, centering, starting point, stopping criteria | `solver/HomogeneousStep.{hpp,cpp}` | **built**, `homogeneous_step_test` |
+> | §13.3 the Newton solve | — | **not built**, and §13.3a says what blocks it |
+>
+> `IpmOptions::homogeneous_self_dual` exists and defaults **off**; nothing reads
+> it yet, so the interior-point path still behaves exactly as §§5–11 describe.
+>
+> **Provenance.** §§13.3–13.5 are now transcribed from
+>
+> > E. D. Andersen and K. D. Andersen, *"The MOSEK interior point optimizer for
+> > linear programming: an implementation of the homogeneous algorithm"*, in
+> > High Performance Optimization, Kluwer, 2000, pp. 197–232 — cited as **[AA]**.
+>
+> They previously carried our own derivation. Where [AA] and that derivation
+> disagreed, [AA] is right and the difference is called out in place.
 
 §§5–11 describe the IPM applied directly to the problem of §2. That
 formulation has a structural gap this section closes: **it cannot report
@@ -724,46 +737,189 @@ These are the same Farkas certificates §12.6 and Module 24 produce; the
 difference is that here they fall out of ordinary convergence rather than
 needing a separate test.
 
+**Source: [AA] Theorem 3** — *"Let `(x*, tau*, y*, s*, kappa*)` be a strictly
+complementary solution to (HLF) such that `kappa* > 0`. If `c'x* < 0`, then the
+dual problem is infeasible. Similarly if `b'y* > 0`, then the primal problem is
+infeasible."* Our `b'y` becomes the full dual objective `b'y + l'z - u'v`, which
+is [AA]'s verbatim at `l = 0, u = inf`.
+
+Two things [AA] makes explicit that are easy to get wrong:
+
+- **Strict complementarity is a precondition, not a technicality.** Both
+  Theorem 2 (`tau* > 0` iff feasible) and Theorem 3 assume it. §13.4's
+  centrality condition is what delivers it.
+- **Both tests can fire at once.** [AA] after (1.2): *"at least one of `(-c'x*)`
+  or `(b'y*)` must be positive"* — at least one, not exactly one. A model can be
+  both primal and dual infeasible, so `classify_homogeneous` returns
+  `Indeterminate` rather than picking one, and likewise when neither fires.
+
 ### 13.3 The Newton system is the old one with a border
 
-This is what makes the embedding affordable. Homogenizing adds `tau` to every
-existing block and adds one scalar equation, so after the §10 eliminations the
-system is the **same matrix** `K` as before, bordered by one row and one
-column:
+**Source: [AA] (1.25)–(1.29).** This subsection was previously written from our
+own derivation and was **wrong in one respect**, corrected below.
+
+Homogenizing adds `tau` to every existing block and adds one scalar equation,
+so after the §10 eliminations the system is the **same matrix** `K` as before,
+bordered by one row and one column. [AA] (1.26), for standard form:
 
 ```
-    [  K      h  ] [ d(x,y) ]   [ r      ]
-    [ -h'   k/t  ] [ dtau   ] = [ r_g    ]
+    [ -Theta^-1   A'    h ] [ dx   ]   [ r_d - X^-1 r_xs ]
+    [     A       0    -b ] [ dy   ] = [ r_p             ]
+    [     g'      b'  k/t ] [ dtau ]   [ r_g + r_tk / t  ]
 ```
 
-with `h` assembled from `c` and `b`. A bordered system with a `1x1` trailing
-block is solved by **two solves with `K` and a scalar Schur complement**:
+with `h = -c` and `g' = -c'` in standard form, and `k/t` short for
+`kappa/tau`. `Theta^-1` is §10's diagonal, which for standard form is `X^-1 S`.
+
+**The correction: the border row is NOT the negated border column.** The earlier
+text here wrote the block as `[K h; -h' k/t]`, which assumes the bordered system
+inherits `K`'s symmetry. It does not. In [AA] (1.26) the column is `(-c; -b)`
+while the row is `(-c', +b')` — the `b` block agrees in sign rather than
+flipping — because the second block row is written with `+A` against the first
+row's `+A'`. Writing the solve from `-h'` puts a sign error on every `dtau`.
+
+A bordered system with a `1x1` trailing block is solved by **two solves with
+`K` and a scalar Schur complement**. [AA] (1.28)/(1.29), transcribed:
 
 ```
-    K u1 = r        K u2 = h
-    dtau = (r_g + h' u1) / (k/t + h' u2)
-    d(x,y) = u1 - dtau * u2
+    K (p; q) = (c; b)                          <- once per ITERATION
+    K (u; v) = (r_d - X^-1 r_xs ; r_p)         <- once per RIGHT-HAND SIDE
+
+    dtau      = ( r_g + r_tk/t - (-c; b)'(u; v) )
+                / ( k/t + (-c; b)'(p; q) )
+
+    (dx; dy)  = (u; v) + (p; q) dtau
 ```
 
-So `KktBuilder`, `Ordering`, `Preconditioner` and `LinearSolver` are **unchanged**
-— no new matrix, no new factorization, no new preconditioner. The cost is one
-extra solve per Newton direction, against an entirely new capability. The
-predictor-corrector already performs two solves per iteration reusing one
-factorization, so this fits the existing shape rather than fighting it.
+then `ds` and `dkappa` back out by substitution.
 
-### 13.4 Step length and mu
+So `KktBuilder`, `Ordering`, `Preconditioner` and `LinearSolver` are
+**unchanged** — no new matrix, no new factorization, no new preconditioner.
 
-`tau` and `kappa` join the fraction-to-boundary ratio test of §8 as one more
-pair that must stay strictly positive, and join `mu` as one more active pair:
+**The cost is less than one extra solve per direction, not one.** [AA]: *"even
+though the system (1.25) has to be solved for different right-hand sides, the
+system (1.28) is only solved once in each iteration. Therefore, the main
+computational cost associated with the homogeneous algorithm compared to the
+primal-dual algorithm is the additional solution of a linear equation system of
+the form (1.28)."* The predictor and the corrector share `(p; q)`; only `(u; v)`
+is recomputed. The predictor-corrector already performs two solves per iteration
+reusing one factorization, so this fits the existing shape rather than fighting
+it.
+
+### 13.3a The one thing [AA] does not give us — **OPEN**
+
+[AA] §1.2 is explicit: *"For simplicity we will work with the LP problem in
+standard form"*, `Ax = b, x >= 0`. Every equation above is stated there for
+`l = 0, u = inf`. Our canonical form (§2) has genuine finite `l` and `u` on both
+sides, and that changes exactly one thing — **`h` and `g` are no longer `-c` and
+`-c'`.**
+
+The reason is visible in §13.1: homogenizing sends `l -> l tau` and `u -> u tau`,
+so `tau` appears **inside the complementarity rows**:
+
+```
+    (x - l tau) .* z = mu        (u tau - x) .* v = mu
+```
+
+Standard form has `l = 0` (the `tau` multiplies zero and vanishes) and no `u`
+term at all (the pair does not exist), which is why [AA]'s border column is
+clean. With finite bounds, eliminating `dz` and `dv` — the same elimination §10.1
+already performs — leaves `dtau` terms behind in both the dual block row and the
+gap row, and **they are not the same terms**, so `g` is not `-h`.
+
+Everything in §§13.4–13.5 and in `HomogeneousStep.hpp` is independent of this:
+the step size, the centering heuristic, the starting point and the stopping
+criteria read an iterate and a direction and do not care how the direction was
+produced. **Only the Newton solve is blocked.**
+
+Two candidate resolutions, neither taken yet:
+
+1. A source that states the homogeneous embedding for the general bounded form.
+   [AA] does not; neither do Ye–Todd–Mizuno or Xu–Hung–Ye, which are also
+   standard-form. This is the preferred route.
+2. Convert to standard form internally. **Rejected**: `Canonical.hpp` keeps
+   bounds native on purpose, and `gas11` is 44% free columns, which the
+   conversion would split and double.
+
+Until one of those lands, `HomogeneousStep.hpp` is stage 2 and the Newton solve
+is stage 3.
+
+### 13.4 Iteration control — step length, centering, start, stopping
+
+**Source: [AA] §1.4 and Table 1.1.** Implemented in
+`solver/HomogeneousStep.{hpp,cpp}`, tested by `homogeneous_step_test`.
+
+[AA] §1.4.2 writes `x := (x; tau)` and `s := (s; kappa)` and from there treats
+the embedding as an ordinary primal-dual system with `n+1` complementarity
+pairs. We do the same, with our pair list from §6 rather than standard form's
+single `(x, s)`:
+
+```
+    (x - l tau, z)     (u tau - x, v)     (s, -y_I)     (tau, kappa)
+```
+
+so [AA]'s `n+1` becomes `active_pair_count + 1`. That substitution is the only
+change made to the step size and the stopping criteria, and it is what `mu`
+already does:
 
 ```
     mu = [ sum (x - l tau).*z + sum (u tau - x).*v + sum (-s).*y_I + tau*kappa ]
          / (active_pair_count + 1)
 ```
 
+| piece | [AA] | value |
+|---|---|---|
+| centering `gamma := (1-a)^2 min(1-a, beta_1)`, then `eta := 1-gamma` | (1.12) | `beta_1 = 0.1` |
+| ratio test `argmax { (x;tau;s;kappa) + a d >= 0 }` | (1.21) | — |
+| step `a := min(beta_3 a_max, 1)`, reduced until (1.20) holds | §1.4.3 | `beta_2 = 1e-8`, `beta_3 = 0.9999` |
+| starting point `(e, 1, 0, e, 1)` | (1.22) | — |
+| optimal: `rho_P, rho_D, rho_A` within tolerance | §1.4.5 | `1e-8, 1e-8, 1e-10` |
+| infeasible: those plus `rho_G`, and `tau <= rho_I max(1, kappa)` | §1.4.5 | `rho_I = 1e-10` |
+| ill-posed: `mu <= rho_mu mu_0` and `tau <= rho_I min(1, kappa)` | §1.4.5 | `rho_mu = 1e-10` |
+| significant digits `rho_A = \|c'x - b'y\| / (tau + \|b'y\|)` | (1.24) | — |
+
+Three things in that table are **not** [AA] verbatim, each marked GENERALIZED in
+the header with the specialization that recovers [AA]:
+
+1. **The ratio test carries a `tau` term the standard form cannot see.** `tau`
+   scales the bounds, so the quantity `x - l tau` has direction `dx - l dtau`.
+   At `l = 0` that term vanishes, which is why [AA] never writes it. Omitting it
+   lets a step violate a bound while every coordinate of `dx` looks safe;
+   `homogeneous_step_test` builds a direction where it is the only thing that
+   binds, so deleting it turns a finite step into an unbounded one.
+
+2. **`rho_A` uses the full dual objective** `b'y + l'z - u'v`, the same
+   substitution §13.2 already makes. At `l = 0, u = inf` it is (1.24) verbatim.
+
+3. **[AA] (1.22)'s `y := 0` is not usable unchanged.** It is admissible only
+   because standard form has no inequality rows and therefore no `(s, -y_I)`
+   pair. We have them, and at `y_I = 0` that pair's product is exactly zero — on
+   the boundary, not near it — so the centrality condition (1.20) fails at every
+   positive step and the solve stalls on iteration one with nothing to show for
+   it. Measured, not predicted: that is what the first run did. Inequality rows
+   start at `y_I = -1`; equality rows, unrestricted and pairless, stay at 0, so a
+   model with no inequality rows still gets `y = 0`.
+
+**Why (1.20) is not optional.** [AA]: *"if all the iterates satisfy the
+condition (1.20), then they converge towards a strictly complementary
+solution."* [AA] Theorem 2 (`tau* > 0` iff the problem is feasible) and Theorem 3
+(which kind of infeasibility) are both stated for a **strictly** complementary
+solution. Skipping the centrality test does not make the solver slower; it makes
+the verdict unsound.
+
+**One parameter has no citation.** `rho_bar_G` is used in [AA] §1.4.5's
+infeasibility criterion but is absent from Table 1.1. We set it to `1e-8`,
+matching its two siblings in that same criterion, and say so at the field.
+
+**Not implemented from [AA]:** the elaborate starting point (1.23), which is
+defined by two Newton solves and so is blocked by §13.3a; Gondzio multiple
+centrality corrections (§1.4.2), whose `beta_4` is likewise absent from Table
+1.1 — the direct path already has its own correctors.
+
 ### 13.5 Why this is opt-in
 
 `IpmOptions::homogeneous_self_dual` defaults **off**. The direct formulation of
 §§5–11 is what every measured result in `README.md` was produced with, and a
 reformulation that changes the iterates on every instance must prove itself
-before it replaces them. Turning it on is how the A/B is run.
+before it replaces them. Turning it on is how the A/B is run — once §13.3a is
+resolved and there is a Newton solve for it to turn on.

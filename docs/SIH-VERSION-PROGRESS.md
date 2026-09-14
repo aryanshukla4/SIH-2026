@@ -363,10 +363,18 @@ it away.
 The IPM still cannot report `Infeasible` or `Unbounded`; Version 4's notes call
 that an architectural gap and they are still right. Module 25 begins the
 standard fix (the homogeneous self-dual embedding, which is what MOSEK and
-CPLEX barrier use). **Stage 1 only**: the residuals, the classification and the
-recovery are written and tested; the Newton solve is not. The option exists,
-defaults off, and nothing reads it yet — and `FORMULATION.md` §13 carries a
-banner saying exactly that.
+CPLEX barrier use). **Stages 1 and 2**: the residuals, the classification, the
+recovery, and now the whole iteration control — step size, centering, starting
+point, stopping criteria — transcribed from the MOSEK paper itself (Andersen &
+Andersen 2000). The Newton solve is still not written, the option exists,
+defaults off, and nothing reads it yet; `FORMULATION.md` §13 says so in a table.
+
+Worth telling honestly, because it is the same kind of finding as the PDLP
+ones: the MOSEK paper works in **standard form** throughout, and its starting
+point `y := 0` **stalls our solver on iteration one**. It is fine there only
+because standard form has no inequality rows; we have them, and at `y = 0` that
+complementarity pair sits exactly on the boundary, so no positive step is
+admissible. Found by running it, not by reading it.
 
 **Do not claim the IPM detects infeasibility.** It does not. Two of the three
 engines do, which is why this was ranked below the work above.
@@ -394,7 +402,10 @@ score is 18 `Optimal` plus one `Unbounded`, not 19 `Optimal`.)*
   but the measurement that would prove this hardware earns its GPU has not been
   run. We can explain why PDLP *should* suit it; we cannot yet show the number.
 - **`greenbea`** is solved by both simplex engines and by nothing else.
-- **HSD stage 2** — the Newton solve — is specified and not built.
+- **HSD's Newton solve** is the one open piece, and the gap is narrow and named:
+  the MOSEK paper states the bordered system for standard form only, and with
+  finite bounds the border row and column stop being negatives of each other.
+  Everything either side of it is built.
 
 **How to say it simply:** *"Ab humare paas teen alag-alag tarike hain LP solve
 karne ke, aur teeno alag family se hain. Aur agar aapka model solve nahi ho
