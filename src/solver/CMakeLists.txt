@@ -5,6 +5,7 @@ add_library(sovsolve_solver STATIC
   MilpPresolve.cpp
   SolutionReconstructor.cpp
   SolutionQuality.cpp
+  Iis.cpp
   ConvergenceChecker.cpp
   Diagnostics.cpp
   Logging.cpp

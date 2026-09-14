@@ -653,3 +653,117 @@ primal engine. That basis is already primal feasible for the true bounds,
 because the artificial box is a subset of the true bounds, so phase 1 is
 skipped entirely — `phase1_iterations == 0` is asserted in
 `tests/unit/primal_simplex_test.cpp`.
+
+---
+
+## 13. Homogeneous self-dual embedding — **SPECIFIED, NOT YET IMPLEMENTED**
+
+> **Status (2026-09-14): this section is a specification written ahead of the
+> code.** No part of it is implemented; `IpmOptions::homogeneous_self_dual`
+> does not exist yet, and the interior-point path still behaves exactly as
+> §§5–11 describe. It is recorded here because the derivation was done and is
+> the thing worth checking before any of it is built. Delete this banner when
+> the code lands, and not before.
+
+§§5–11 describe the IPM applied directly to the problem of §2. That
+formulation has a structural gap this section closes: **it cannot report
+`Infeasible` or `Unbounded` at all.** If the model has no feasible point there
+is no interior to follow, the iterates diverge, and the only honest outcome is
+`MaxIterations`. `README.md` records `gas11` running away to `-7.5e10` under
+exactly that gap.
+
+The fix is not a detector bolted on afterwards. It is to solve a *different,
+always-feasible* problem whose solution answers the question either way.
+
+### 13.1 The embedding
+
+Introduce two scalars `tau > 0` and `kappa > 0` and homogenize every constant
+by `tau` — `b -> b*tau`, `c -> c*tau`, `l -> l*tau`, `u -> u*tau`:
+
+```
+    A_E x  - b_E tau                       = 0
+    A_I x  + s - b_I tau                   = 0            s >= 0
+    A' y   + z - v - c tau                 = 0            z, v >= 0
+    c'x    - b'y - l'z + u'v + kappa       = 0
+                 l tau <= x <= u tau
+```
+
+The fourth row is the **self-dual gap row**: `kappa` is exactly the duality gap
+`b'y + l'z - u'v - c'x` carried as a variable. The system is homogeneous, so it
+always has the trivial solution, and the complementarity pairs are those of §6
+plus one more:
+
+```
+    (x - l tau, z)     (u tau - x, v)     (s, -y_I)     (tau, kappa)
+```
+
+`l'z` skips columns with an infinite lower bound and `u'v` those with an
+infinite upper bound, exactly as in §5 — an infinite bound has no pair, so it
+contributes no term here either.
+
+### 13.2 Reading the answer
+
+At convergence with `mu -> 0`, complementarity forces `tau * kappa -> 0`, so
+exactly one of two things holds:
+
+| Outcome | Meaning | Recover by |
+|---|---|---|
+| `tau > 0`, `kappa -> 0` | The model has an optimal solution | dividing `x, s, y, z, v` by `tau` |
+| `tau -> 0`, `kappa > 0` | The model is primal OR dual infeasible | inspecting the ray, below |
+
+In the second case `(x, s, y, z, v)` is itself a certificate, and which kind is
+decided by the sign of the two objective terms:
+
+```
+    b'y + l'z - u'v  >  0     ->  PRIMAL INFEASIBLE   (a dual ray)
+    c'x              <  0     ->  DUAL INFEASIBLE     (a primal ray, i.e.
+                                                       the primal is UNBOUNDED)
+```
+
+These are the same Farkas certificates §12.6 and Module 24 produce; the
+difference is that here they fall out of ordinary convergence rather than
+needing a separate test.
+
+### 13.3 The Newton system is the old one with a border
+
+This is what makes the embedding affordable. Homogenizing adds `tau` to every
+existing block and adds one scalar equation, so after the §10 eliminations the
+system is the **same matrix** `K` as before, bordered by one row and one
+column:
+
+```
+    [  K      h  ] [ d(x,y) ]   [ r      ]
+    [ -h'   k/t  ] [ dtau   ] = [ r_g    ]
+```
+
+with `h` assembled from `c` and `b`. A bordered system with a `1x1` trailing
+block is solved by **two solves with `K` and a scalar Schur complement**:
+
+```
+    K u1 = r        K u2 = h
+    dtau = (r_g + h' u1) / (k/t + h' u2)
+    d(x,y) = u1 - dtau * u2
+```
+
+So `KktBuilder`, `Ordering`, `Preconditioner` and `LinearSolver` are **unchanged**
+— no new matrix, no new factorization, no new preconditioner. The cost is one
+extra solve per Newton direction, against an entirely new capability. The
+predictor-corrector already performs two solves per iteration reusing one
+factorization, so this fits the existing shape rather than fighting it.
+
+### 13.4 Step length and mu
+
+`tau` and `kappa` join the fraction-to-boundary ratio test of §8 as one more
+pair that must stay strictly positive, and join `mu` as one more active pair:
+
+```
+    mu = [ sum (x - l tau).*z + sum (u tau - x).*v + sum (-s).*y_I + tau*kappa ]
+         / (active_pair_count + 1)
+```
+
+### 13.5 Why this is opt-in
+
+`IpmOptions::homogeneous_self_dual` defaults **off**. The direct formulation of
+§§5–11 is what every measured result in `README.md` was produced with, and a
+reformulation that changes the iterates on every instance must prove itself
+before it replaces them. Turning it on is how the A/B is run.
