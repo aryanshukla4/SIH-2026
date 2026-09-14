@@ -113,6 +113,26 @@ core::HostSpan<Real> out(core::RealVector& v) {
   return worst;
 }
 
+/// Below this, a norm is treated as structurally zero rather than small.
+/// Algorithm 3 and InitializePrimalWeight both guard divisions with it.
+constexpr Real kZeroTolerance = 1e-12;
+
+/// `InitializePrimalWeight(c, q) = ||c||_2 / ||q||_2` (paper section 3.3).
+///
+/// This is a statement about UNITS. `omega` splits the step between the primal
+/// and dual (`tau = eta/omega`, `sigma = eta*omega`), and the natural scale of
+/// the primal side is set by `c` while the dual's is set by `q` -- so starting
+/// from their ratio makes the two halves comparable before a single iteration
+/// has run. The paper proves this makes the whole method scale-invariant:
+/// multiply the objective, the constraints or the right-hand side by a scalar
+/// and the iterates are identical up to that scaling.
+[[nodiscard]] Real initialize_primal_weight(const CanonicalProblem& problem) {
+  const Real c_norm = euclidean_norm(problem.c);
+  const Real q_norm = euclidean_norm(problem.b);
+  if (c_norm > kZeroTolerance && q_norm > kZeroTolerance) return c_norm / q_norm;
+  return 1.0;
+}
+
 /// Everything equations (6a)-(6c) need, measured at the current iterate.
 struct Convergence {
   Real gap = 0.0;
@@ -188,6 +208,12 @@ class PdlpSolver {
   /// Infinite for the first outer loop, where there is no previous anchor --
   /// so only condition (iii) can fire, which is correct rather than a
   /// special case: with no history there is nothing to have decayed from.
+  /// The PREVIOUS outer loop's anchor, `z^{n-1,0}`. Algorithm 3 measures how
+  /// far the anchor moved between restarts, so both are needed.
+  core::RealVector x_prev_restart_;
+  core::RealVector y_prev_restart_;
+  bool have_prev_restart_ = false;
+
   Real reference_gap_ = std::numeric_limits<Real>::infinity();
   /// `mu_n(z_c^{n,t}, z^{n,0})` from the previous check, for condition (ii)'s
   /// "no local progress" half.
@@ -518,6 +544,40 @@ bool PdlpSolver::maybe_restart(std::size_t total_iterations) {
     for (std::size_t j = 0; j < n_; ++j) x_[j] = bar_x_[j];
     for (std::size_t i = 0; i < m_; ++i) y_[i] = bar_y_[i];
   }
+  // Algorithm 1 line 12 updates the primal weight AFTER the restart, from how
+  // far the anchor moved. Snapshot the outgoing anchor before it is replaced.
+  if (opt_.pdlp.primal_weight_update && have_prev_restart_) {
+    Real dx = 0.0;
+    for (std::size_t j = 0; j < n_; ++j) {
+      const Real d = x_[j] - x_restart_[j];
+      dx += d * d;
+    }
+    Real dy = 0.0;
+    for (std::size_t i = 0; i < m_; ++i) {
+      const Real d = y_[i] - y_restart_[i];
+      dy += d * d;
+    }
+    dx = std::sqrt(dx);
+    dy = std::sqrt(dy);
+
+    // Algorithm 3. Equalizing the primal and dual distances to optimality in
+    // the omega-norm means `sqrt(omega)||dx|| = ||dy||/sqrt(omega)`, i.e.
+    // `omega = ||dy||/||dx||`. That raw estimate swings hard between
+    // restarts, so it is smoothed against the previous weight in LOG space,
+    // where the weight is symmetric (`log(1/omega) = -log(omega)`); with
+    // `theta = 0.5` that is their geometric mean.
+    if (dx > kZeroTolerance && dy > kZeroTolerance) {
+      const Real theta = opt_.pdlp.primal_weight_smoothing;
+      const Real updated =
+          std::exp(theta * std::log(dy / dx) + (1.0 - theta) * std::log(omega_));
+      if (std::isfinite(updated) && updated > 0.0) omega_ = updated;
+    }
+    // Otherwise keep the previous weight: an anchor that did not move in one
+    // of the two blocks carries no information about their balance, and
+    // dividing by it would manufacture some.
+  }
+  have_prev_restart_ = true;
+
   for (std::size_t j = 0; j < n_; ++j) x_restart_[j] = x_[j];
   for (std::size_t i = 0; i < m_; ++i) y_restart_[i] = y_[i];
 
@@ -572,6 +632,10 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   scratch_kt_y_.assign(0.0);
   scratch_k_x_.resize(m_);
   scratch_k_x_.assign(0.0);
+  x_prev_restart_.resize(n_);
+  x_prev_restart_.assign(0.0);
+  y_prev_restart_.resize(m_);
+  y_prev_restart_.assign(0.0);
 
   // Paper section 4.1: "All first-order methods use all-zero vectors as the
   // initial starting points." Zero is not interior and does not need to be --
@@ -581,6 +645,8 @@ core::Expected<PdlpResult> PdlpSolver::run() {
     x_prev_[j] = x_[j];
     x_restart_[j] = x_[j];
   }
+
+  omega_ = opt_.pdlp.primal_weight_update ? initialize_primal_weight(problem_) : 1.0;
 
   const bool adaptive = opt_.pdlp.adaptive_step_size;
 
