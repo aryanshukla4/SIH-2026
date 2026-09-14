@@ -109,7 +109,32 @@
 //     (6c) ||c - K'y - lambda||_2      <= eps (1 + ||c||_2)
 //
 //     dual_obj = q'y + sum_{l_j finite} l_j lambda_j^+
-//                    - sum_{u_j finite} u_j lambda_j^-
+//                    + sum_{u_j finite} u_j lambda_j^-
+//
+// NOTE THE SIGN ON THE UPPER-BOUND TERM. The paper's problem (1) writes the
+// dual objective as `q'y + l'lambda^+ - u'lambda^-`, while its notation
+// section defines `v^-_i = min{0, v_i}` -- a NON-POSITIVE quantity. Those two
+// statements are inconsistent, and taking them together gives the wrong sign.
+// The smallest counterexample settles it:
+//
+//     min -x   over   0 <= x <= 1,  no rows.
+//     Optimum x = 1, objective -1. With no rows, lambda = c = -1,
+//     so lambda^+ = 0 and lambda^- = -1.
+//
+//         paper as printed:  0 + l*0 - u*(-1) = +1     wrong
+//         with `+ u'lambda^-`:  0 + l*0 + u*(-1) = -1  correct
+//
+// So either the paper means `v^-` to be the non-negative magnitude of the
+// negative part (the other common convention, which contradicts its own
+// notation section), or the minus sign is a slip. Either way the formula that
+// satisfies strong duality is the one above, and it is what this code
+// computes -- derived from FORMULATION.md section 4's Lagrangian rather than
+// transcribed:
+//
+//     L = c'x - y'(Ax + s - b) - z'(x - l) - v'(u - x)
+//     stationarity:  c - K'y - z + v = 0   =>   z - v = lambda
+//     dual objective = q'y + l'z - u'v,  with z = lambda^+, v = -lambda^-
+//                    = q'y + l'lambda^+ + u'lambda^-
 //
 // The guards on `l_j`/`u_j` finite are not cosmetic: an infinite bound always
 // pairs with a zero `lambda_j` by the projection above, and `inf * 0` is NaN.

@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "sovsolve/solver/pdlp/DualityGap.hpp"
+#include "sovsolve/solver/pdlp/Infeasibility.hpp"
 #include "sovsolve/solver/pdlp/MatVec.hpp"
 
 namespace sovsolve::solver::pdlp {
@@ -152,7 +153,8 @@ class PdlpSolver {
         matvec_(problem),
         m_(problem.num_rows()),
         n_(problem.num_cols()),
-        gap_(problem) {}
+        gap_(problem),
+        detector_(problem, matvec_) {}
 
   core::Expected<PdlpResult> run();
 
@@ -214,12 +216,28 @@ class PdlpSolver {
   core::RealVector y_prev_restart_;
   bool have_prev_restart_ = false;
 
+  // ---- infeasibility certificates (arXiv 2102.04592) --------------------
+  //
+  // These accumulate from iteration 0 and are deliberately NOT reset by a
+  // restart. The reference's analysis is of un-restarted PDHG, and the object
+  // all three sequences converge to -- the infimal displacement vector -- is a
+  // property of the whole trajectory. Reusing the restart machinery's average,
+  // which resets, would be measuring something else.
+  InfeasibilityDetector detector_;
+  core::RealVector iterate_sum_x_;  ///< sum of all iterates so far
+  core::RealVector iterate_sum_y_;
+  core::RealVector cand_x_;  ///< the candidate being tested
+  core::RealVector cand_y_;
+  core::RealVector diff_x_;  ///< `z^{k+1} - z^k`, captured at each step
+  core::RealVector diff_y_;
+
   Real reference_gap_ = std::numeric_limits<Real>::infinity();
   /// `mu_n(z_c^{n,t}, z^{n,0})` from the previous check, for condition (ii)'s
   /// "no local progress" half.
   Real last_candidate_gap_ = std::numeric_limits<Real>::infinity();
   std::size_t inner_iterations_ = 0;  ///< `t`
   std::size_t restarts_ = 0;          ///< `n`
+  CertificateKind certificate_ = CertificateKind::None;
 
   /// Algorithm 2. `eta` enters as this iteration's trial size and leaves as
   /// `eta'`, the starting point for the next one.
@@ -227,6 +245,9 @@ class PdlpSolver {
   void fixed_step(Real tau, Real sigma);
 
   void accumulate_average(Real eta);
+  /// Tests the reference's three candidate sequences. Returns the verdict, or
+  /// `None`.
+  [[nodiscard]] CertificateKind check_certificates(std::size_t total_iterations);
   /// Section 3.2. Returns true when the outer loop restarted.
   [[nodiscard]] bool maybe_restart(std::size_t total_iterations);
 };
@@ -591,6 +612,39 @@ bool PdlpSolver::maybe_restart(std::size_t total_iterations) {
   return true;
 }
 
+/// arXiv 2102.04592 section 1.1: three sequences, all converging to the
+/// infimal displacement vector, each tested as a certificate.
+///
+/// All three are tracked rather than just the cheapest, because they do not
+/// converge equally fast: the difference of iterates manages only
+/// `O(1/sqrt(k))` while the normalized iterates and the normalized average
+/// both manage `O(1/k)`. The reference makes the point explicitly, that codes
+/// relying on the difference of iterates alone are detecting later than they
+/// need to.
+CertificateKind PdlpSolver::check_certificates(std::size_t total_iterations) {
+  if (total_iterations == 0) return CertificateKind::None;
+  const Real tol = opt_.pdlp.certificate_tolerance;
+  const Real k = static_cast<Real>(total_iterations);
+
+  // (2a) difference of iterates, captured by the step itself.
+  auto kind = detector_.classify(diff_x_, diff_y_, tol);
+  if (kind != CertificateKind::None) return kind;
+
+  // (2b) normalized iterates, `z^k / k`.
+  for (std::size_t j = 0; j < n_; ++j) cand_x_[j] = x_[j] / k;
+  for (std::size_t i = 0; i < m_; ++i) cand_y_[i] = y_[i] / k;
+  kind = detector_.classify(cand_x_, cand_y_, tol);
+  if (kind != CertificateKind::None) return kind;
+
+  // (2c) normalized average, `2/(k+1) * zbar^k` with `zbar^k = (1/k) sum z^j`,
+  // i.e. `2 * sum / (k*(k+1))`. Written as the single factor so the running
+  // sum never has to be divided twice.
+  const Real factor = 2.0 / (k * (k + 1.0));
+  for (std::size_t j = 0; j < n_; ++j) cand_x_[j] = iterate_sum_x_[j] * factor;
+  for (std::size_t i = 0; i < m_; ++i) cand_y_[i] = iterate_sum_y_[i] * factor;
+  return detector_.classify(cand_x_, cand_y_, tol);
+}
+
 core::Expected<PdlpResult> PdlpSolver::run() {
   x_.resize(n_);
   x_.assign(0.0);
@@ -636,6 +690,18 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   x_prev_restart_.assign(0.0);
   y_prev_restart_.resize(m_);
   y_prev_restart_.assign(0.0);
+  iterate_sum_x_.resize(n_);
+  iterate_sum_x_.assign(0.0);
+  iterate_sum_y_.resize(m_);
+  iterate_sum_y_.assign(0.0);
+  cand_x_.resize(n_);
+  cand_x_.assign(0.0);
+  cand_y_.resize(m_);
+  cand_y_.assign(0.0);
+  diff_x_.resize(n_);
+  diff_x_.assign(0.0);
+  diff_y_.resize(m_);
+  diff_y_.assign(0.0);
 
   // Paper section 4.1: "All first-order methods use all-zero vectors as the
   // initial starting points." Zero is not interior and does not need to be --
@@ -678,6 +744,7 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   const bool has_time_limit = opt_.limits.time_limit_seconds > 0.0;
 
   const bool restarts_enabled = opt_.pdlp.adaptive_restart;
+  const bool detect_infeasibility = opt_.pdlp.infeasibility_detection;
 
   Convergence conv;
   evaluate(conv);
@@ -690,10 +757,24 @@ core::Expected<PdlpResult> PdlpSolver::run() {
 
   while (iteration < budget) {
     const Real step_taken = eta;
+    if (detect_infeasibility) {
+      for (std::size_t j = 0; j < n_; ++j) diff_x_[j] = x_[j];
+      for (std::size_t i = 0; i < m_; ++i) diff_y_[i] = y_[i];
+    }
     if (adaptive) {
       adaptive_step(iteration, eta);
     } else {
       fixed_step(fixed_tau, fixed_sigma);
+    }
+    if (detect_infeasibility) {
+      for (std::size_t j = 0; j < n_; ++j) {
+        diff_x_[j] = x_[j] - diff_x_[j];
+        iterate_sum_x_[j] += x_[j];
+      }
+      for (std::size_t i = 0; i < m_; ++i) {
+        diff_y_[i] = y_[i] - diff_y_[i];
+        iterate_sum_y_[i] += y_[i];
+      }
     }
     if (restarts_enabled) {
       // Algorithm 1 line 7 weights each iterate by the step size that
@@ -725,6 +806,22 @@ core::Expected<PdlpResult> PdlpSolver::run() {
           break;
         }
       }
+      // A certificate is a terminal verdict, so it is tested BEFORE the
+      // restart -- restarting would move the iterate off the very direction
+      // the certificate is measured along.
+      if (detect_infeasibility) {
+        const CertificateKind kind = check_certificates(iteration);
+        if (kind == CertificateKind::PrimalInfeasible) {
+          outcome = SolverStatus::Infeasible;
+          certificate_ = kind;
+          break;
+        }
+        if (kind == CertificateKind::DualInfeasible) {
+          outcome = SolverStatus::Unbounded;
+          certificate_ = kind;
+          break;
+        }
+      }
       // Same schedule as the termination check, and for the same reason: the
       // gap evaluations cost matrix products that do not advance the iterate
       // (paper section 3, "we only evaluate the restart or termination
@@ -739,7 +836,10 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   // which case `conv` is stale by up to `interval` iterations. Re-measure so
   // the reported residuals describe the iterate actually returned.
   evaluate(conv);
-  if (conv.converged(opt_.pdlp.termination_tolerance)) outcome = SolverStatus::Optimal;
+  if (certificate_ == CertificateKind::None &&
+      conv.converged(opt_.pdlp.termination_tolerance)) {
+    outcome = SolverStatus::Optimal;
+  }
 
   PdlpResult result = pack(outcome, conv);
   result.iterations = iteration;
