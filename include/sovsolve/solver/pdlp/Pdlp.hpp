@@ -161,6 +161,7 @@
 #include "sovsolve/core/Vector.hpp"
 #include "sovsolve/model/Canonical.hpp"
 #include "sovsolve/model/Options.hpp"
+#include "sovsolve/solver/pdlp/MatVec.hpp"
 
 namespace sovsolve::solver::pdlp {
 
@@ -205,6 +206,20 @@ struct PdlpResult {
 /// `UnsupportedFeature` rather than silently ignored.
 [[nodiscard]] core::Expected<PdlpResult> solve_pdlp(
     const model::CanonicalProblem& problem, const model::Options& options);
+
+/// The same, with `K` applied by a caller-supplied implementation.
+///
+/// This is the seam the GPU backend enters through. PDLP touches the matrix
+/// ONLY as `K x` and `K' y` -- there is no factorization, no ordering, no
+/// preconditioner to port -- so a cuSPARSE `MatVec` is the entire GPU story for
+/// this engine, and everything else in the loop is untouched vector arithmetic.
+///
+/// The backend lives in `sovsolve_solver_gpu` and is INJECTED here rather than
+/// selected here, because the `gpu -> solver` library edge is one-way
+/// (src/solver/CMakeLists.txt) and must stay that way.
+[[nodiscard]] core::Expected<PdlpResult> solve_pdlp(
+    const model::CanonicalProblem& problem, const model::Options& options,
+    MatVec& matvec);
 
 }  // namespace sovsolve::solver::pdlp
 

@@ -20,10 +20,13 @@
 #ifndef SOVSOLVE_SOLVER_LP_SOLVE_HPP
 #define SOVSOLVE_SOLVER_LP_SOLVE_HPP
 
+#include <functional>
+
 #include "sovsolve/core/Status.hpp"
 #include "sovsolve/model/Options.hpp"
 #include "sovsolve/model/Problem.hpp"
 #include "sovsolve/model/Solution.hpp"
+#include "sovsolve/solver/pdlp/MatVec.hpp"
 
 namespace sovsolve::solver {
 
@@ -37,8 +40,25 @@ namespace sovsolve::solver {
 /// silently solved as an LP -- a simplex moves between vertices of the
 /// feasible polytope, and a QP's optimum is generally not at one, so dropping
 /// `Q` would return a confidently wrong answer instead of an error.
-[[nodiscard]] core::Expected<model::Solution> solve_lp(const model::Problem& problem,
-                                                       const model::Options& options = {});
+/// Supplies the `K`/`K'` implementation for `Method::Pdlp`, given the problem
+/// AFTER canonicalize -> presolve -> scale.
+///
+/// A provider rather than an object, because the backend has to be built
+/// against the canonical matrix and the caller does not have that until this
+/// function is already running. It returns a NON-OWNING pointer and the caller
+/// keeps the object alive across the call -- which is what lets a benchmark
+/// read the backend's own counters afterwards instead of having them destroyed
+/// with it.
+///
+/// The GPU implementation lives in `sovsolve_solver_gpu` and is injected here
+/// rather than selected here, because the `gpu -> solver` library edge is
+/// one-way (src/solver/CMakeLists.txt) and must stay that way.
+using MatVecProvider =
+    std::function<core::Expected<pdlp::MatVec*>(const model::CanonicalProblem&)>;
+
+[[nodiscard]] core::Expected<model::Solution> solve_lp(
+    const model::Problem& problem, const model::Options& options = {},
+    const MatVecProvider& matvec_provider = {});
 
 }  // namespace sovsolve::solver
 
