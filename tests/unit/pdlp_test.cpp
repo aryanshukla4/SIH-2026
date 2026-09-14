@@ -435,6 +435,116 @@ void test_normalized_duality_gap_properties() {
   }
 }
 
+/// Infeasibility and unboundedness certificates (arXiv 2102.04592).
+///
+/// PRESOLVE IS TURNED OFF for every case here, and that is the whole point.
+/// With it on, the pipeline's verdict comes from `Presolver` before PDLP runs
+/// a single iteration -- `iterations=0` is the tell -- so a test with presolve
+/// enabled would pass whether or not PDLP could detect anything at all. It
+/// could not, until this change.
+///
+/// The reference for correctness is the dual simplex, which reaches both
+/// verdicts by a completely different route (a failed ratio test, and an
+/// explicitly constructed ray). Two independent engines agreeing is worth more
+/// than either agreeing with my own derivation.
+void test_certificates_without_presolve() {
+  struct Case {
+    const char* label;
+    const char* text;
+    SolverStatus expected;
+  };
+  const Case cases[] = {
+      // Two rows that contradict only JOINTLY -- invisible to presolve's
+      // structural rules, which is why this is the interesting case.
+      {"infeasible", R"(Minimize
+ obj: x + y
+Subject To
+ c1: x + y >= 10
+ c2: x + y <= 4
+Bounds
+ 0 <= x <= 100
+ 0 <= y <= 100
+End
+)",
+       SolverStatus::Infeasible},
+      // Unbounded only along a JOINT direction: neither column alone escapes.
+      {"unbounded", R"(Minimize
+ obj: -x - y
+Subject To
+ c1: x - y <= 1
+ c2: -x + y <= 1
+Bounds
+ x >= 0
+ y >= 0
+End
+)",
+       SolverStatus::Unbounded},
+  };
+
+  for (const Case& c : cases) {
+    model::Options o = pdlp_options();
+    o.presolve.enabled = false;
+    o.pdlp.max_iterations = 200000;
+
+    model::Options simplex = simplex_options();
+    simplex.presolve.enabled = false;
+
+    model::Solution pdlp_solution;
+    model::Solution simplex_solution;
+    if (!solve_with(c.label, c.text, o, pdlp_solution)) continue;
+    if (!solve_with(c.label, c.text, simplex, simplex_solution)) continue;
+
+    ++::sovsolve::test::checks_run();
+    if (pdlp_solution.status != c.expected) {
+      ::sovsolve::test::record(__FILE__, __LINE__, "PDLP reaches the verdict itself",
+                               std::string(c.label) + ": expected the certificate "
+                               "to fire, got a different status");
+    }
+    // Both engines must agree, by construction rather than by coincidence.
+    ++::sovsolve::test::checks_run();
+    if (simplex_solution.status != pdlp_solution.status) {
+      ::sovsolve::test::record(__FILE__, __LINE__, "PDLP and the simplex agree",
+                               std::string(c.label) + ": the two engines reached "
+                               "different verdicts");
+    }
+  }
+}
+
+/// The failure mode that matters more than a missed detection: a FEASIBLE
+/// model must never be declared infeasible.
+///
+/// The certificate tolerance is the only thing standing between the two, and
+/// the margin is not generous -- measured on this corpus, 1e-6 gives no false
+/// verdicts while 1e-4 gives four (25fv47, israel and stair reported
+/// Infeasible, 80bau3b Unbounded, all of them actually Optimal). This pins the
+/// default on the safe side of that cliff.
+void test_no_false_verdicts_on_feasible_models() {
+  const char* instances[] = {"/netlib/afiro.mps", "/netlib/adlittle.mps"};
+  for (const char* name : instances) {
+    auto loaded = io::loadProblem(std::string(SOVSOLVE_TEST_DATA_DIR) + name);
+    if (!loaded.has_value()) {
+      ::sovsolve::test::record(__FILE__, __LINE__, "load", loaded.error().format());
+      continue;
+    }
+    model::Options o = pdlp_options();
+    o.presolve.enabled = false;
+    o.pdlp.max_iterations = 200000;
+    auto result = solver::solve_lp(loaded.value(), o);
+    if (!result.has_value()) {
+      ::sovsolve::test::record(__FILE__, __LINE__, "solve", result.error().format());
+      continue;
+    }
+    ++::sovsolve::test::checks_run();
+    if (result->status == SolverStatus::Infeasible ||
+        result->status == SolverStatus::Unbounded) {
+      ::sovsolve::test::record(
+          __FILE__, __LINE__, "a feasible model is never declared infeasible",
+          std::string(name) + " got a false verdict -- the certificate "
+          "tolerance is too loose");
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -447,5 +557,7 @@ int main() {
   test_afiro();
   test_agrees_with_simplex();
   test_normalized_duality_gap_properties();
+  test_certificates_without_presolve();
+  test_no_false_verdicts_on_feasible_models();
   return ::sovsolve::test::report("pdlp_test");
 }
