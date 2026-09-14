@@ -139,6 +139,14 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.pdlp.max_iterations = static_cast<std::size_t>(std::stoull(val));
       return true;
     }
+    if (key == "pdlp-cert-tol") {
+      options.pdlp.certificate_tolerance = std::stod(val);
+      return true;
+    }
+    if (key == "pdlp-infeasibility") {
+      options.pdlp.infeasibility_detection = (val != "0");
+      return true;
+    }
     if (key == "pdlp-primal-weight") {
       options.pdlp.primal_weight_update = (val != "0");
       return true;

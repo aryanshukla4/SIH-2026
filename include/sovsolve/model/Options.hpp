@@ -367,6 +367,33 @@ struct PdlpOptions {
   /// is symmetric there: `log(1/omega) = -log(omega)`.
   Real primal_weight_smoothing = 0.5;
 
+  /// Detect infeasibility and unboundedness from the iterates themselves
+  /// (arXiv 2102.04592). Without it PDLP simply runs a diverging model to the
+  /// iteration limit -- the objective on `gas11` runs away to -1.9e11 and no
+  /// verdict is produced.
+  bool infeasibility_detection = true;
+
+  /// Margin on every certificate condition.
+  ///
+  /// The asymmetry decides this: too strict only costs a missed detection,
+  /// reported honestly as `MaxIterations`, while too loose declares a
+  /// slowly-converging FEASIBLE model infeasible -- a confidently wrong
+  /// answer, and the exact failure `greenbea` produced in Module 23.
+  ///
+  /// So it was measured rather than chosen. Across the 18 feasible, bounded
+  /// Netlib instances, plus `gas11` which is genuinely unbounded:
+  ///
+  ///     1e-8   no false verdicts, but MISSES gas11 (459 of its 459 rows are
+  ///            equalities, each needing |K v_x|_i <= tol, and the residual
+  ///            sits between 1e-8 and 1e-6)
+  ///     1e-6   no false verdicts, and catches gas11 at iteration 40
+  ///     1e-4   FOUR false verdicts -- 25fv47, israel and stair reported
+  ///            Infeasible and 80bau3b Unbounded, all of them actually Optimal
+  ///
+  /// The cliff between 1e-6 and 1e-4 is sharp, so the default sits two orders
+  /// below it.
+  Real certificate_tolerance = 1e-6;
+
   /// Iterations between termination checks. Each check costs a `K'y` product
   /// and, once restarts land, a normalized duality gap evaluation -- real work
   /// that does not advance the iterate. The paper uses 40.
