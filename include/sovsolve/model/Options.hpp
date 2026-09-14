@@ -304,16 +304,60 @@ struct MilpOptions {
 
 /// Which algorithm solves the continuous relaxation.
 ///
-/// The two are not interchangeable on every model and are not meant to be:
+/// These are not interchangeable on every model and are not meant to be:
 /// the interior-point method converges in a near-constant iteration count and
 /// runs its heavy work on the GPU, while the dual simplex terminates at an
 /// exact vertex, produces primal-infeasibility and unboundedness verdicts the
 /// IPM's convergence test structurally cannot, and warm-starts across a bound
-/// change -- which is the only reason a branch-and-bound node is cheap.
+/// change -- which is the only reason a branch-and-bound node is cheap. PDLP
+/// is a first-order method: no factorization at all, so its per-iteration cost
+/// is a pair of sparse matrix-vector products and it reaches sizes the other
+/// two cannot, at lower accuracy per iteration.
 enum class Method : std::uint8_t {
   InteriorPoint,
   DualSimplex,
   PrimalSimplex,
+  Pdlp,
+};
+
+/// How Module 5 equilibrates `A` before anything downstream sees it.
+enum class ScalingMode : std::uint8_t {
+  /// Alternating geometric mean of the smallest and largest magnitude in each
+  /// row/column: `1/sqrt(min*max)`. The long-standing default here, and what
+  /// the IPM and both simplex engines were tuned against.
+  GeometricMean,
+  /// Ruiz equilibration followed by one Pock-Chambolle pass, which is what
+  /// PDLP specifies (NeurIPS 2021 paper, section 3.5). Only meaningful for
+  /// `Method::Pdlp` -- a first-order method has no factorization to stabilize,
+  /// so its conditioning depends far more directly on the scaling than a
+  /// factorization-based method's does.
+  RuizPockChambolle,
+};
+
+/// Module 5 controls (solver/Scaler.hpp).
+struct ScalingOptions {
+  /// Left at `GeometricMean` unless the caller opts in, so adding PDLP does
+  /// not silently re-tune the IPM and simplex paths.
+  ScalingMode mode = ScalingMode::GeometricMean;
+
+  /// Ruiz iterations before the Pock-Chambolle pass. PDLP section 3.5 uses
+  /// 10. Ruiz proves the row and column infinity norms converge to 1 under
+  /// iteration, so this is a convergence budget, not a tuning knob.
+  std::size_t ruiz_iterations = 10;
+
+  /// Whether the Pock-Chambolle pass runs after the Ruiz iterations. PDLP's
+  /// default is both; its own ablation (paper appendix C.5) compares each
+  /// alone, and turning this off is also the only way to observe Ruiz's
+  /// defining property -- the Pock-Chambolle pass deliberately moves the
+  /// row/column norms away from the fixed point Ruiz drives them to, so a
+  /// test of "did Ruiz equilibrate" has to look before it runs.
+  bool pock_chambolle = true;
+
+  /// Pock-Chambolle exponent. With `alpha = 1` the row pass uses the
+  /// `2 - alpha = 1` norm and the column pass the `alpha = 1` norm, i.e. both
+  /// are l1. PDLP uses 1 as its baseline; the paper also reports testing 0
+  /// and 2.
+  Real pock_chambolle_alpha = 1.0;
 };
 
 /// Module 23 controls: the dual simplex (solver/simplex/DualSimplex.hpp).
@@ -397,6 +441,7 @@ struct Options {
   PresolveOptions presolve;
   MilpOptions milp;
   SimplexOptions simplex;
+  ScalingOptions scaling;
 };
 
 }  // namespace sovsolve::model
