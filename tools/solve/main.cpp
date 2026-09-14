@@ -60,6 +60,9 @@ void print_usage(const char* argv0) {
       "  --pdlp-adaptive=0|1   PdlpOptions::adaptive_step_size (default 1)\n"
       "  --pdlp-restart=0|1    PdlpOptions::adaptive_restart   (default 1)\n"
       "  --pdlp-primal-weight=0|1  PdlpOptions::primal_weight_update (default 1)\n"
+      "  --hsd-max-iter=N      HsdOptions::max_iterations    (default 200)\n"
+      "  --hsd-cg-max-iter=N   HsdOptions::cg_max_iterations (default 500)\n"
+      "  --hsd-cg-tol=X        HsdOptions::cg_tolerance      (default 1e-10)\n"
       "  --simplex-max-iter=N  SimplexOptions::max_iterations   (0 = auto)\n"
       "  --pivot-tolerance=X   SimplexOptions::pivot_tolerance  (default 0.1)\n"
       "  --pivot-floor=X       SimplexOptions::pivot_floor      (default 1e-9)\n"
@@ -177,12 +180,21 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
         // preconditioning its paper specifies -- overridable with an explicit
         // later --scaling=.
         options.scaling.mode = sovsolve::model::ScalingMode::RuizPockChambolle;
+      } else if (val == "hsd" || val == "homogeneous") {
+        options.simplex.method = sovsolve::model::Method::Hsd;
       } else {
-        std::fprintf(stderr,
-                     "unknown --method: %s (ipm, dual-simplex, primal-simplex, pdlp)\n",
-                     val.c_str());
+        std::fprintf(
+            stderr,
+            "unknown --method: %s (ipm, dual-simplex, primal-simplex, pdlp, hsd)\n",
+            val.c_str());
         return false;
       }
+    } else if (key == "hsd-max-iter") {
+      options.hsd.max_iterations = static_cast<std::size_t>(std::stoul(val));
+    } else if (key == "hsd-cg-max-iter") {
+      options.hsd.cg_max_iterations = static_cast<std::size_t>(std::stoul(val));
+    } else if (key == "hsd-cg-tol") {
+      options.hsd.cg_tolerance = std::stod(val);
     } else if (key == "simplex-max-iter") {
       options.simplex.max_iterations = static_cast<std::size_t>(std::stoul(val));
     } else if (key == "pivot-tolerance") {
@@ -331,8 +343,8 @@ int main(int argc, char** argv) {
                             sovsolve::core::make_error(
                                 sovsolve::core::ErrorCode::NotImplemented,
                                 "this build has no CUDA, so the interior-point path is "
-                                "absent; pass --method=dual-simplex or "
-                                "--method=pdlp"));
+                                "absent; pass --method=dual-simplex, "
+                                "--method=pdlp or --method=hsd"));
 #endif
   if (!solution.has_value()) {
     std::fprintf(stderr, "solve failed: %s\n", solution.error().format().c_str());

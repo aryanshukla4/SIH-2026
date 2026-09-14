@@ -7,6 +7,7 @@
 #include "sovsolve/solver/Scaler.hpp"
 #include "sovsolve/solver/SolutionReconstructor.hpp"
 #include "sovsolve/solver/pdlp/Pdlp.hpp"
+#include "sovsolve/solver/HomogeneousSolve.hpp"
 #include "sovsolve/solver/pdlp/PdlpSolution.hpp"
 #include "sovsolve/solver/simplex/SolveSimplex.hpp"
 #include "sovsolve/solver/simplex/SimplexSolution.hpp"
@@ -84,7 +85,7 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options) {
   status = scale(canon->problem, options, canon->transforms);
   if (!status.ok()) return status.error();
 
-  // Three engines, one pipeline. Everything above and below this block is
+  // Four engines, one pipeline. Everything above and below this block is
   // shared; only the middle differs, and each engine is responsible for
   // producing the same five canonical-space vectors.
   Solution canonical;
@@ -92,6 +93,10 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options) {
     auto result = pdlp::solve_pdlp(canon->problem, options);
     if (!result.has_value()) return result.error();
     canonical = pdlp::to_canonical_solution(canon->problem, *result);
+  } else if (options.simplex.method == model::Method::Hsd) {
+    auto result = solve_hsd(canon->problem, options);
+    if (!result.has_value()) return result.error();
+    canonical = to_canonical_solution(canon->problem, *result);
   } else {
     auto result = simplex::solve_simplex(canon->problem, options);
     if (!result.has_value()) return result.error();

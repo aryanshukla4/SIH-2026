@@ -137,21 +137,6 @@ struct IpmOptions {
   /// breakdown: escalate and refactor, same as an exact-singular pivot.
   Real max_pivot_ratio = 1e10;
 
-  /// Solve the HOMOGENEOUS SELF-DUAL embedding instead of the problem
-  /// directly (docs/FORMULATION.md section 13).
-  ///
-  /// The direct formulation cannot report `Infeasible` or `Unbounded` at all:
-  /// with no feasible point there is no interior to follow, the iterates
-  /// diverge, and the only honest outcome is `MaxIterations`. The embedding is
-  /// always feasible, and which of the two answers holds is read off the two
-  /// extra scalars at convergence.
-  ///
-  /// Defaults OFF. Every measured interior-point result in README.md was
-  /// produced with the direct formulation, and a reformulation that changes
-  /// the iterates on every instance has to prove itself before it replaces
-  /// them. Turning it on is how that A/B is run.
-  bool homogeneous_self_dual = false;
-
   /// Maximum iterative-refinement passes per linear solve.
   ///
   /// Refinement is measured against the UNREGULARIZED residual: the regularized
@@ -333,6 +318,63 @@ enum class Method : std::uint8_t {
   DualSimplex,
   PrimalSimplex,
   Pdlp,
+  /// Module 25: the homogeneous self-dual embedding, host-side.
+  ///
+  /// A separate engine rather than a flag on `InteriorPoint` because that path
+  /// is GPU-resident and the gpu -> solver library edge is one-way, so a
+  /// host-only module cannot be called from inside it. The two share the
+  /// interior-point FAMILY and nothing else; see solver/HomogeneousSolve.hpp.
+  Hsd,
+};
+
+/// Module 25 controls: the homogeneous self-dual embedding
+/// (solver/HomogeneousSolve.hpp).
+///
+/// The first nine fields are Andersen & Andersen (2000) Table 1.1 VERBATIM --
+/// MOSEK's shipped defaults, which that paper records as unchanged across its
+/// whole computational study. They are exposed rather than hard-coded so the
+/// A/B against the other engines can be run at matched tolerances, not so they
+/// need tuning.
+///
+/// Plain fields rather than the solver's own `HomogeneousParameters`, because
+/// `model` sits below `solver` and must not include from it -- the same reason
+/// `PdlpOptions` restates its numbers. `solve_hsd` does the conversion.
+struct HsdOptions {
+  Real beta1 = 0.1;      ///< centering cap, [AA] (1.12)
+  Real beta2 = 1.0e-8;   ///< centrality floor, [AA] (1.20)
+  Real beta3 = 0.9999;   ///< fraction to boundary, [AA] section 1.4.3
+  Real rho_p = 1.0e-8;   ///< relative primal infeasibility tolerance
+  Real rho_d = 1.0e-8;   ///< relative dual infeasibility tolerance
+  Real rho_a = 1.0e-10;  ///< relative objective-gap tolerance, [AA] (1.24)
+  Real rho_mu = 1.0e-10; ///< floor on mu/mu_0 in the ill-posed test
+  Real rho_i = 1.0e-10;  ///< threshold at which tau counts as collapsed
+  /// Relative tolerance on the gap-row residual. NOT in [AA] Table 1.1 although
+  /// its section 1.4.5 uses it; set to match its two siblings in that same
+  /// criterion. The one number here with no citation behind it.
+  Real rho_g = 1.0e-8;
+
+  std::size_t max_iterations = 200;
+
+  /// Inner CG controls (solver/HostKkt.hpp). The linear algebra is matrix-free
+  /// conjugate gradients on `A Theta A'`, whose condition number grows like
+  /// `1/mu^2` (FORMULATION.md section 10.1) -- so `cg_max_iterations` is a
+  /// budget that the late iterations are expected to hit, not an assertion.
+  Real cg_tolerance = 1.0e-10;
+  /// MEASURED, not guessed. At 500 the corpus gave 14/19 with three instances
+  /// hitting the outer iteration limit and two stalling outright; at 5000 those
+  /// five became Optimal, and in FEWER outer iterations -- 25fv47 went from 200
+  /// (unconverged) to 26, e226 from a stall at 65 to 17, stair from a stall at
+  /// 64 to 19. An inexact Newton direction does not merely slow the method
+  /// down: it produces a step the centrality condition (1.20) rejects, so the
+  /// run stalls rather than degrading gracefully. `IpmOptions` records the same
+  /// lesson for its MinRes budget.
+  std::size_t cg_max_iterations = 5000;
+  /// Floor on `Theta^-1` before inverting. Mandatory: a free column's entry is
+  /// exactly zero and would invert to infinity.
+  Real theta_inv_floor = 1.0e-12;
+  /// Dual regularization on the normal-equations diagonal, covering rank
+  /// deficiency in `A` that no floor on `Theta` can reach.
+  Real delta_d = 1.0e-10;
 };
 
 /// Module 24 controls: PDLP (solver/pdlp/Pdlp.hpp).
@@ -560,6 +602,7 @@ struct Options {
   SimplexOptions simplex;
   ScalingOptions scaling;
   PdlpOptions pdlp;
+  HsdOptions hsd;
 };
 
 }  // namespace sovsolve::model

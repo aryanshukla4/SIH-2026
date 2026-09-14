@@ -242,7 +242,7 @@ means 18 `Optimal` plus one `Unbounded`):
 | PDLP | **18 / 19** | `greenbea` unsolved; all others match the simplex |
 | Interior point | 6-7 / 19 | plus no ability to report `Infeasible` or `Unbounded` at all -- see Module 25 |
 
-Two of the three engines have no CUDA dependency, so `cmake --preset release`
+Three of the four engines have no CUDA dependency, so `cmake --preset release`
 on native Windows -- no WSL2, no CUDA toolkit -- produces a working `solve`
 binary and runs 22 of the 24 test suites. That was not true before Module 23:
 `tools/solve` was hard-gated on `if(TARGET sovsolve_solver_gpu)`.
@@ -502,12 +502,23 @@ published optimum and HiGHS also reports it unbounded, so a perfect score is
 because an earlier revision of this table said "19/19 reach `Optimal`", which
 was shorthand for "19/19 correct" and read as something stronger than the truth.
 
-| | IPM | dual simplex | primal simplex | PDLP |
-|---|---|---|---|---|
-| `Optimal` | 6-7 | **18** | **18** | 17 |
-| `Unbounded` on `gas11` | never | yes | yes | yes |
-| **correct verdicts** | 6-7 / 19 | **19 / 19** | **19 / 19** | **18 / 19** |
-| unsolved | 12-13 | none | none | `greenbea` |
+| | IPM | dual simplex | primal simplex | PDLP | HSD |
+|---|---|---|---|---|---|
+| `Optimal` | 6-7 | **18** | **18** | 17 | 17 |
+| `Unbounded` on `gas11` | never | yes | yes | yes | yes |
+| **correct verdicts** | 6-7 / 19 | **19 / 19** | **19 / 19** | **18 / 19** | **18 / 19** |
+| unsolved | 12-13 | none | none | `greenbea` | `greenbea` |
+
+**HSD** (`--method=hsd`, `module.txt` section 25) is the homogeneous self-dual
+embedding: the same interior-point *family* as the IPM column, and the reason
+that column is 6-7 rather than 18. It is a fourth engine rather than a flag on
+the IPM because the IPM is GPU-resident and the embedding is host-only.
+
+**`gas11` is the one row of this table to read carefully.** Every engine's
+`Unbounded` there is **presolve's** verdict, not the engine's -- all of them
+report it at iteration 0. HSD *can* detect unboundedness, which the IPM cannot,
+but no instance in this corpus is where that gets demonstrated; the unit tests
+in `homogeneous_solve_test` are.
 
 Every simplex objective was cross-checked against `scripts/oracle_check.py`'s
 published table, including its two documented archive-drift entries --
