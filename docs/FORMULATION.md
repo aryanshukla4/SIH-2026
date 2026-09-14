@@ -1013,7 +1013,12 @@ became `Optimal` in **fewer outer iterations** (`25fv47` 200→26, `e226`
 gracefully here: it produces a step the centrality condition (1.20) rejects, so
 the run **stalls** rather than slowing.
 
-**Still missing:** `greenbea`; `gas11` with presolve off, which stalls at
+**Still missing:** `greenbea` — 226 iterations, 320 s, then the step length goes
+to zero and the loop breaks short of its own cap, returning a point with primal
+infeasibility 1.000031 and a max bound violation of 1394.9. (Its `relative_gap`
+reads 1.54e-9 there, which looks converged and is not: both objectives have
+collapsed toward zero together. That is why §11 reports five quality numbers
+rather than one.) Also missing: `gas11` with presolve off, which stalls at
 iteration 0 because 44% free columns put `Theta = 1e12` on the diagonal before
 the first step; crossover; Gondzio correctors; [AA] (1.23)'s elaborate starting
 point; and the GPU backend.
