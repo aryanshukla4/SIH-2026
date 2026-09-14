@@ -22,15 +22,16 @@ actual architecture and algorithms genuinely differ.
 
 ## 1. Both algorithm families, each derived independently
 
-*(Rewritten 2026-09-13. Until Module 23 this section said "there is no
-simplex code anywhere in this project." That was true when written and is
-not true now; the honest statement is below.)*
+*(Rewritten 2026-09-13, extended 2026-09-14. Until Module 23 this section
+said "there is no simplex code anywhere in this project." That was true when
+written and is not true now; the honest statement is below.)*
 
 **HiGHS** defaults to **dual simplex** for LP, with its own IPM available as
 an option and a MIP branch-and-bound layer on top.
 
-**This solver** now has both families too, and the overlap in *category* is
-worth stating plainly rather than hiding:
+**This solver** now has three engines from three algorithm families, and where
+the *category* overlaps with HiGHS that is worth stating plainly rather than
+hiding:
 
 - A **primal-dual interior-point method** (`src/solver/gpu/`), GPU-resident
   and matrix-free — a predictor-corrector (Mehrotra-style) Newton iteration
@@ -39,6 +40,21 @@ worth stating plainly rather than hiding:
   host-only, in both its **dual** and **primal** forms, sharing one
   factorized-basis core (`detail/SimplexEngine`) and selected at the command
   line with `--method=dual-simplex` / `--method=primal-simplex`.
+- **PDLP**, a **first-order** method (`src/solver/pdlp/`, `module.txt` §24),
+  `--method=pdlp`. This one has **no counterpart in HiGHS at all** — it
+  factors nothing, ever, and its entire inner loop is a pair of sparse
+  matrix-vector products.
+
+That third engine is also where the vendored-source question comes up a second
+time, and it is answered the same way. `or-tools/` contains Google's own PDLP,
+by the same authors as the paper. **It was not read.** The evidence is the same
+kind as for the simplex: the three things our implementation had to get right
+that the *papers themselves* state wrongly or leave out — an acceptance bound
+that diverges as literally written, a dual objective whose printed sign
+contradicts the paper's own notation section, and a trust-region reduction that
+silently drops finite upper bounds. All three are recorded in `module.txt`
+§24 with the measurements that exposed them. Code copied from a working
+implementation does not reproduce a paper's errata and then fix them.
 
 What matters for PS 26119 is not whether the *category* is shared — "revised
 simplex with a factorized basis" is a 1953 result (Dantzig–Orchard-Hays), and
@@ -87,6 +103,16 @@ This project's **simplex** path is also CPU and also factors explicitly — a
 sparse LU is what the method requires, and claiming otherwise would be
 dishonest. The difference described in this section is about the **IPM**
 path, which is GPU-resident and factors nothing.
+
+**PDLP** (§1) factors nothing either, and for a sharper reason: not because it
+avoids a factorization it could have used, but because the algorithm has no
+place to put one. Its entire per-iteration cost is `K x` and `K' y`. That is
+also the one operation this project's hardware does well — `docs/ARCHITECTURE-
+REVIEW.md` §3.5 measures FP64 factorization on this GA107 at roughly **64×**
+penalised, slower than the CPU, against SpMV at **~2×** because it is
+bandwidth-bound rather than FLOP-bound. Whether that theoretical fit turns into
+a measured win is **still unanswered**: the cuSPARSE backend is not written.
+It is listed as not-done in `module.txt` §24 rather than claimed here.
 
 The IPM's linear algebra is **matrix-free and GPU-resident**
 (`src/solver/gpu/LinearSolver.cu`): every Newton system is solved by an

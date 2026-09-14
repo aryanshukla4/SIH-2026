@@ -294,6 +294,116 @@ nahi sakta tha, ab woh proof ke saath batata hai."*
 
 ---
 
+## 5c. Version 6 — a third engine, and answers the solver could not give before (2026-09-14)
+
+**The one-line version: three different algorithm families now, and the solver
+can finally tell you WHICH of your constraints is the problem.**
+
+### (a) PDLP — a first-order method, built in measured stages
+
+Version 5 gave us simplex alongside the interior-point method. This adds a
+third, from a family neither of them belongs to: **PDLP**, primal-dual hybrid
+gradient. It **never factors a matrix** — its whole inner loop is two sparse
+matrix-vector products. That matters for us specifically, because our own
+architecture review measured FP64 *factorization* on this laptop GPU at ~64x
+penalised (slower than the CPU) while SpMV is only ~2x. PDLP is the one
+algorithm shaped to fit that.
+
+It was built one enhancement at a time, each landing as its own commit with
+before/after numbers, because the paper's own ablation says why: baseline PDHG
+solves 50 of 383 instances where full PDLP solves 283. Ours, on the 19-instance
+Netlib set:
+
+| stage | correct | best speedup |
+|---|---|---|
+| baseline PDHG | 12/19 | — |
+| + adaptive step size | 12/19 | 3.6x |
+| + adaptive restarts | 14/19 | 3.9x |
+| + primal weights | **18/19** | 20.6x |
+
+**Say this part honestly if asked, because it is the more impressive claim:**
+we found **three errors in the published papers**, each by measurement rather
+than by reading.
+
+1. The adaptive step-size rule **diverges as literally printed**. We
+   instrumented it and watched the step size ratchet 1.0 → 8.6 while the
+   iterate blew up to 1.4e20 — with every individual step passing the paper's
+   own acceptance test.
+2. The dual objective's sign contradicts the paper's own notation section. One
+   three-line counterexample settles it: `min -x` over `0 ≤ x ≤ 1`.
+3. The trust-region subroutine's reduction **silently drops finite upper
+   bounds**, which our models have. We proved the test catches it by
+   deliberately injecting the paper's version: a variable walks to 5.0 instead
+   of stopping at its bound of 1.0, with no crash and a better-looking answer.
+
+That is the strongest available evidence the work is ours. **Code copied from a
+working implementation does not reproduce a paper's errata and then fix them.**
+(Google's own PDLP sits in `or-tools/` in this repo. It was not read — same
+rule we applied to HiGHS's simplex in Version 5.)
+
+### (b) The solver can now say WHICH constraints are wrong
+
+Previously the best answer to a broken model was "infeasible". Now
+(`module.txt` §26) it returns an **irreducible infeasible subsystem** — the
+specific rows that contradict each other, where dropping any one of them makes
+the rest satisfiable.
+
+This is the feature an actual refinery planner wants. "Your schedule is
+impossible" is not actionable; "these four constraints are mutually impossible"
+is.
+
+And it came almost free, which is the nice part of the story: a 1990 theorem
+(Gleeson and Ryan) says the answer is exactly the **support of the Farkas
+certificate** — and our dual simplex was already computing that certificate as
+a byproduct of the pivot that fails, then throwing it away. We stopped throwing
+it away.
+
+### (c) Interior point — the gap is named and half-closed
+
+The IPM still cannot report `Infeasible` or `Unbounded`; Version 4's notes call
+that an architectural gap and they are still right. Module 25 begins the
+standard fix (the homogeneous self-dual embedding, which is what MOSEK and
+CPLEX barrier use). **Stage 1 only**: the residuals, the classification and the
+recovery are written and tested; the Newton solve is not. The option exists,
+defaults off, and nothing reads it yet — and `FORMULATION.md` §13 carries a
+banner saying exactly that.
+
+**Do not claim the IPM detects infeasibility.** It does not. Two of the three
+engines do, which is why this was ranked below the work above.
+
+### Verified, 2026-09-14
+
+```sh
+cmake --preset release && ctest --test-dir build        # 22/22
+cmake --preset cuda    && ctest --test-dir build-cuda   # 24/24
+```
+
+| engine | correct verdicts on 19 Netlib instances |
+|---|---|
+| dual simplex | 19/19 |
+| primal simplex | 19/19 |
+| PDLP | 18/19 (`greenbea` open) |
+| interior point | 6-7/19 |
+
+*(`gas11` is genuinely unbounded and has no published optimum — so a perfect
+score is 18 `Optimal` plus one `Unbounded`, not 19 `Optimal`.)*
+
+### What is still missing — say this unprompted
+
+- **The GPU backend for PDLP is not written.** The interface is there for it,
+  but the measurement that would prove this hardware earns its GPU has not been
+  run. We can explain why PDLP *should* suit it; we cannot yet show the number.
+- **`greenbea`** is solved by both simplex engines and by nothing else.
+- **HSD stage 2** — the Newton solve — is specified and not built.
+
+**How to say it simply:** *"Ab humare paas teen alag-alag tarike hain LP solve
+karne ke, aur teeno alag family se hain. Aur agar aapka model solve nahi ho
+sakta, toh ab solver sirf 'nahi ho sakta' nahi bolta — woh batata hai KAUN SE
+constraints aapas mein takra rahe hain. Aur haan — humne research papers mein
+teen galtiyan dhoondhi aur theek kiin, measurement se, padh kar nahi."*
+
+---
+
 ## 6. What's next (from our own tracked plan — not invented for this talk)
 
 There's a full internal plan (`Phase 0` through `Phase 4`) targeting the next concrete
@@ -321,8 +431,10 @@ apna kaam track kar rahe hain, sirf demo ke liye nahi bana rahe."*
 | 4 | `grep -rn "highspy\|cplex\|gurobi" --include=*.cpp --include=*.cu --include=*.hpp src/ include/` | §3 (own math, no library) |
 | 5 | `tests/property/milp_presolve_test.cpp` → `make_absorbing_row_problem` | §4 (the 3-bug MILP story) |
 | 6 | `git status` / `git diff --stat` | §5 (live, in-progress work) |
-| 7 | `ctest --test-dir build-cuda --output-on-failure` (**19/19** as of 2026-09-13) | Close — "and everything above still passes, together, right now" |
-| 8 | `./build/tools/solve/solve tests/data/netlib/gas11.mps --method=dual-simplex` | §5b — the `Unbounded` verdict the solver could not produce at all until Version 5 |
+| 7 | `./build/tools/solve/solve tests/data/netlib/gas11.mps --method=dual-simplex` | §5b — the `Unbounded` verdict the solver could not produce at all until Version 5 |
+| 8 | `./build/tools/solve/solve tests/data/netlib/afiro.mps --method=pdlp` | §5c(a) — the third engine, and `kkt_passes` as its honest cost metric |
+| 9 | `tests/unit/iis_test.cpp` → `test_three_row_contradiction` | §5c(b) — the solver names *which* constraints contradict, including a three-row cycle where no pair is infeasible |
+| 10 | `ctest --test-dir build-cuda --output-on-failure` (**24/24** as of 2026-09-14) | Close — "and everything above still passes, together, right now" |
 
 Close with: *"Yeh sab ek hi timeline hai — aap khud verify kar sakte hain, humne kuch bhi
 hide nahi kiya, na hi koi number banaya hai jo verify na ho sake."*
