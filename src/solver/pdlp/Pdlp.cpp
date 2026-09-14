@@ -278,7 +278,13 @@ void PdlpSolver::fixed_step(Real tau, Real sigma) {
 /// Matrix-product accounting, which is the whole cost model here: `y` does NOT
 /// change across trials, so `K'y` is computed ONCE per iteration rather than
 /// per trial. `K x` likewise. Only `K(2x' - x)` is per-trial. So an iteration
-/// costs 2 + (number of trials) products, against the fixed rule's 2.
+/// costs 2 + (number of trials) products, against the fixed rule's 2 --
+/// measured at ~1.53 KKT passes per iteration against ~1.03 on this corpus,
+/// which is why the rule must be judged in passes and not in iterations.
+///
+/// One deviation from the paper's literal statement of (5), found by
+/// measurement rather than by reading it; the argument and the evidence are
+/// at the `denominator` line below.
 void PdlpSolver::adaptive_step(std::size_t total_iterations, Real& eta_inout) {
   Real eta = eta_inout;
   // Fixed across the whole trial sequence: `x_` and `y_` do not move until a
@@ -341,9 +347,25 @@ void PdlpSolver::adaptive_step(std::size_t total_iterations, Real& eta_inout) {
       dx_dy_norm_sq = omega_ * px + py / omega_;
     }
 
-    // A non-positive interaction term means the step cannot violate (5) at
-    // any size -- the primal and dual moves did not fight each other -- so the
-    // bound is vacuous and the step is accepted outright.
+    // DEVIATION from the paper, found by measurement -- see the header block
+    // on this function. Equation (5) and Algorithm 2 line 6 write this
+    // denominator WITHOUT an absolute value, which makes `eta_bar` infinite
+    // whenever the cross term is negative, and the step unconditionally
+    // acceptable. That is true of the single iteration -- the descent
+    // inequality then holds with room to spare -- and unsafe across
+    // iterations, because nothing else bounds `eta` and the growth cap
+    // ratchets it up every time the sign happens to come out negative.
+    //
+    // Taking the magnitude instead is the reading that matches what makes
+    // `eta = 1/||K||_2` admissible in the first place:
+    //
+    //     2 |dy' K dx|  <=  ||K|| ( omega||dx||^2 + ||dy||^2/omega )
+    //                    =  ||K|| ||dz||^2_omega
+    //
+    // so `||dz||^2_omega / (2|dy' K dx|) >= 1/||K||`, which is exactly the
+    // paper's own stated property that `eta_bar >= 1/||K||_2` always holds.
+    // With the signed denominator that property is vacuous rather than
+    // informative.
     const Real denominator = 2.0 * std::fabs(interaction);
     const Real eta_bar = denominator > 0.0
                              ? dx_dy_norm_sq / denominator
