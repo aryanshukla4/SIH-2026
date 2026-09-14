@@ -665,11 +665,10 @@ skipped entirely — `phase1_iterations == 0` is asserted in
 > | §13.1 embedding, §13.2 verdicts, §13.4 mu | `solver/Homogeneous.{hpp,cpp}` | **built**, `homogeneous_test` |
 > | step size, centering, starting point, stopping criteria | `solver/HomogeneousStep.{hpp,cpp}` | **built**, `homogeneous_step_test` |
 > | §13.3 the bordered Newton solve | `solver/HomogeneousNewton.{hpp,cpp}` | **built**, `homogeneous_newton_test` |
+> | §13.5 the loop, and a host `KktSolver` | `solver/HomogeneousSolve.{hpp,cpp}`, `solver/HostKkt.{hpp,cpp}` | **built**, `homogeneous_solve_test` |
 >
-> `IpmOptions::homogeneous_self_dual` exists and defaults **off**; nothing reads
-> it yet, so the interior-point path still behaves exactly as §§5–11 describe.
-> What remains is wiring: an iteration loop calling §13.3 and §13.4 in order,
-> and an A/B against the direct path.
+> Selected by `--method=hsd` (`Method::Hsd`). The direct interior-point path of
+> §§5–11 is unchanged and still the default.
 >
 > **Provenance.** §§13.3–13.5 are now transcribed from
 >
@@ -971,10 +970,50 @@ defined by two Newton solves and so is blocked by §13.3a; Gondzio multiple
 centrality corrections (§1.4.2), whose `beta_4` is likewise absent from Table
 1.1 — the direct path already has its own correctors.
 
-### 13.5 Why this is opt-in
+### 13.5 The loop, and what it measured
 
-`IpmOptions::homogeneous_self_dual` defaults **off**. The direct formulation of
-§§5–11 is what every measured result in `README.md` was produced with, and a
-reformulation that changes the iterates on every instance must prove itself
-before it replaces them. Turning it on is how the A/B is run — once §13.3a is
-resolved and there is a Newton solve for it to turn on.
+**Source: [AA] section 1.4's ordering.** Implemented in
+`solver/HomogeneousSolve.{hpp,cpp}`, with `solver/HostKkt.{hpp,cpp}` supplying
+the `KktSolver` §13.3 takes as an injected interface.
+
+One iteration: residuals and `mu` → stopping tests → the border →
+`K (p; q) = (h_x; -b)` **once** → predictor (`gamma = 0, eta = 1`) → `gamma`
+from its step length → corrector (`eta = 1 - gamma`, Mehrotra term) → step
+length → update. The predictor and corrector share the border solve, so a test
+asserts `kkt_solves == 3 * iterations` on a real run.
+
+**A separate engine, not a flag on the IPM.** The direct interior-point path is
+GPU-resident and the `gpu -> solver` library edge is one-way, so a host-only
+module cannot be called from inside it. `IpmOptions::homogeneous_self_dual` was
+deleted in this stage: nothing ever read it, and `Method::Hsd` says the same
+thing with something behind it.
+
+**The linear algebra** is §10.1's normal-equations reduction —
+`(A Theta A' + D_s) dy = ry + A Theta rx`, SPD, Jacobi-preconditioned CG that
+never forms the product. The same system `solve_spd_cg` already solves on the
+GPU, so a GPU `KktSolver` is a port rather than a redesign.
+
+| engine | correct verdicts, 19 tracked instances |
+|---|---|
+| dual simplex | 19/19 |
+| primal simplex | 19/19 |
+| PDLP | 18/19 (`greenbea`) |
+| **HSD** | **18/19** (`greenbea`) |
+| interior point (direct) | 6–7/19 |
+
+**Say this unprompted: `gas11`'s `Unbounded` is presolve's verdict, not HSD's.**
+Both engines report it at iteration 0, and with `--presolve=0` HSD returns
+`NotConverged` there. No corpus instance is decided by HSD's infeasibility
+detection — the unit tests are the evidence for that, not the sweep.
+
+**One measured default, and the reason matters more than the number.**
+`cg_max_iterations` started at 500 and gave 14/19. At 5000 the five failures
+became `Optimal` in **fewer outer iterations** (`25fv47` 200→26, `e226`
+65→17, `stair` 64→19). An inexact Newton direction does not degrade
+gracefully here: it produces a step the centrality condition (1.20) rejects, so
+the run **stalls** rather than slowing.
+
+**Still missing:** `greenbea`; `gas11` with presolve off, which stalls at
+iteration 0 because 44% free columns put `Theta = 1e12` on the diagonal before
+the first step; crossover; Gondzio correctors; [AA] (1.23)'s elaborate starting
+point; and the GPU backend.

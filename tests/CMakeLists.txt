@@ -60,6 +60,11 @@ sovsolve_add_test(homogeneous_step_test unit/homogeneous_step_test.cpp)
 # the bounds away. Neither alone pins the border terms -- see the file header.
 sovsolve_add_test(homogeneous_newton_test unit/homogeneous_newton_test.cpp)
 
+# Module 25 stage 4, the loop. The tests that matter here are the Infeasible
+# and Unbounded ones: solving a solvable LP is table stakes, but reporting a
+# VERDICT is the gap the whole embedding exists to close.
+sovsolve_add_test(homogeneous_solve_test unit/homogeneous_solve_test.cpp)
+
 # Module 26. Builds its own models, so no data path needed.
 sovsolve_add_test(iis_test             unit/iis_test.cpp)
 
