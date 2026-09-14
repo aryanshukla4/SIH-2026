@@ -358,43 +358,48 @@ certificate** — and our dual simplex was already computing that certificate as
 a byproduct of the pivot that fails, then throwing it away. We stopped throwing
 it away.
 
-### (c) Interior point — the gap is named and half-closed
+### (c) Interior point — the gap is closed, by a fourth engine
 
-The IPM still cannot report `Infeasible` or `Unbounded`; Version 4's notes call
-that an architectural gap and they are still right. Module 25 begins the
-standard fix (the homogeneous self-dual embedding, which is what MOSEK and
-CPLEX barrier use). **Stages 1–3**: the residuals, the classification, the
-recovery; the whole iteration control — step size, centering, starting point,
-stopping criteria — transcribed from the MOSEK paper itself (Andersen & Andersen
-2000); and the bordered Newton solve. The option exists, defaults off, and
-nothing reads it yet — what is left is the iteration loop and the A/B.
+Version 4's notes called the interior-point method's inability to report
+`Infeasible` or `Unbounded` an architectural gap. It was, and this closes it:
+Module 25 is the **homogeneous self-dual embedding**, the same construction
+MOSEK and CPLEX barrier use, now a fourth engine at `--method=hsd`.
 
-The interesting part is what the MOSEK paper does **not** contain. It works in
-standard form (`Ax = b, x >= 0`) throughout, and our models have real bounds
-`l <= x <= u`, which changes the one thing that matters: the border of the
-Newton system. Rather than hunt for a paper that states it, we closed it with a
-change of variables that maps our problem onto theirs exactly — and then kept
-that map as a **test oracle**, so the bound terms are checked against the
-published algorithm rather than against our own reasoning. Verified to 1e-15,
-and proven able to fail: with the first oracle switched off, the second alone
-still catches three different wrong borders, each failing at exactly the row
-that term belongs to.
+The numbers are the headline. The interior-point *family* goes from **6-7/19**
+to **18/19** on the corpus — matching PDLP, one behind the simplex — and it can
+now answer "this model is impossible" instead of running to the iteration limit.
 
-Worth telling honestly, because it is the same kind of finding as the PDLP
-ones: the MOSEK paper works in **standard form** throughout, and its starting
-point `y := 0` **stalls our solver on iteration one**. It is fine there only
-because standard form has no inequality rows; we have them, and at `y = 0` that
-complementarity pair sits exactly on the boundary, so no positive step is
-admissible. Found by running it, not by reading it.
+Two things to say honestly and unprompted:
 
-**Do not claim the IPM detects infeasibility.** It does not. Two of the three
-engines do, which is why this was ranked below the work above.
+- **`gas11`'s `Unbounded` is presolve's verdict, not the engine's.** Every
+  engine reports it at iteration 0. HSD's infeasibility detection is proven by
+  unit tests, not by the corpus.
+- **The direct interior-point path is unchanged and still 6-7/19.** HSD is a
+  separate engine, because that path is GPU-resident and the embedding is
+  host-only. Both ship.
+
+The interesting engineering story here is the same shape as the PDLP one. The
+MOSEK paper (Andersen & Andersen 2000) works in **standard form** throughout,
+and real models have bounds `l <= x <= u`, which changes the Newton system's
+border. Rather than hunt for a paper stating the bounded case, we mapped our
+problem onto theirs with a change of variables — and then kept that map as a
+**test oracle**, so the bound terms are checked against the published algorithm
+rather than against our own reasoning. Verified to 1e-15, and proven able to
+fail: with the obvious oracle switched off, the second one alone still catches
+three different wrong borders, each failing at exactly the row that term
+belongs to.
+
+And one measured default worth repeating because it is counter-intuitive: the
+inner linear solver's iteration budget started at 500 and gave 14/19. At 5000
+the five failures became `Optimal` in **fewer outer iterations**. An inexact
+Newton direction does not make this method slower — it makes it **stall**,
+because the step it produces is one the centrality test rejects outright.
 
 ### Verified, 2026-09-14
 
 ```sh
-cmake --preset release && ctest --test-dir build        # 22/22
-cmake --preset cuda    && ctest --test-dir build-cuda   # 24/24
+cmake --preset release && ctest --test-dir build        # 25/25
+cmake --preset cuda    && ctest --test-dir build-cuda   # 27/27
 ```
 
 | engine | correct verdicts on 19 Netlib instances |
@@ -402,7 +407,8 @@ cmake --preset cuda    && ctest --test-dir build-cuda   # 24/24
 | dual simplex | 19/19 |
 | primal simplex | 19/19 |
 | PDLP | 18/19 (`greenbea` open) |
-| interior point | 6-7/19 |
+| HSD (homogeneous, new) | 18/19 (`greenbea` open) |
+| interior point (direct) | 6-7/19 |
 
 *(`gas11` is genuinely unbounded and has no published optimum — so a perfect
 score is 18 `Optimal` plus one `Unbounded`, not 19 `Optimal`.)*
@@ -413,10 +419,12 @@ score is 18 `Optimal` plus one `Unbounded`, not 19 `Optimal`.)*
   but the measurement that would prove this hardware earns its GPU has not been
   run. We can explain why PDLP *should* suit it; we cannot yet show the number.
 - **`greenbea`** is solved by both simplex engines and by nothing else.
-- **HSD is built but not wired.** All three stages exist and are tested; what is
-  missing is the iteration loop that calls them and the A/B measurement against
-  the current interior-point path. Until that runs, do not claim the IPM detects
-  infeasibility.
+- **The GPU backend for PDLP is still the biggest open item**, and it is the one
+  the problem statement's GPU language actually rests on.
+- **`greenbea`** is solved by both simplex engines and by neither first-order
+  nor interior-point engine.
+- **Do not say "the IPM detects infeasibility."** The HSD engine does; the
+  direct interior-point path still does not, and both ship.
 
 **How to say it simply:** *"Ab humare paas teen alag-alag tarike hain LP solve
 karne ke, aur teeno alag family se hain. Aur agar aapka model solve nahi ho

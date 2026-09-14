@@ -41,13 +41,14 @@ Each module has one job and uses the shared project types.
   is the only operation this hardware's FP64 penalty leaves competitive
   (docs/ARCHITECTURE-REVIEW.md 3.5 measures factorization at ~64x slower than
   the CPU, SpMV at ~2x).
-- Added Module 25: homogeneous self-dual embedding for the interior-point path
-  (2026-09-14/15). STAGES 1-3 -- residuals, mu, classification and recovery;
-  the iteration control transcribed from Andersen & Andersen (2000); and the
+- Added Module 25: homogeneous self-dual embedding, a FOURTH LP engine,
+  `--method=hsd` (2026-09-14/15). Residuals, mu, classification and recovery;
+  the iteration control transcribed from Andersen & Andersen (2000); the
   bordered Newton solve, whose general-bounds border the paper does not give
   and which was obtained instead by a change of variables onto the published
-  standard-form system. Nothing reads the option yet: what remains is the
-  iteration loop and the A/B.
+  standard-form system; and the loop that runs them. 18/19 on the corpus
+  against the direct interior-point path's 6-7/19, and unlike that path it can
+  report Infeasible and Unbounded at all.
 - Added Module 26: irreducible infeasible subsystem (2026-09-14). Turns the
   verdict "this model is infeasible" into "these rows contradict each other,
   and dropping any one makes the rest satisfiable".
@@ -760,7 +761,7 @@ has not been run. PDLP -> simplex crossover is also not done: PDLP tails off
 where the simplex returns an exact vertex, so composing them is the natural
 follow-on.
 
-## 25. Homogeneous self-dual embedding (IPM) -- added 2026-09-14/15, STAGES 1-3
+## 25. Homogeneous self-dual embedding -- added 2026-09-14/15, `--method=hsd`
 
 Closes a gap README.md names: the interior-point path structurally cannot
 report `Infeasible` or `Unbounded`. With no feasible point there is no interior
@@ -922,6 +923,101 @@ Stage 2's tests: 212 checks, proven able to fail by four mutations -- dropping
 the l*dtau coupling (1 check), using [AA] (1.22)'s y := 0 verbatim (3), losing
 one power of (1-alpha) from the centering heuristic (9), and swapping min for
 max in the ill-posed tau test (1).
+
+STAGE 4, the loop and the A/B. `solver/HomogeneousSolve.{hpp,cpp}` runs stages
+1-3 in [AA] section 1.4's order, `solver/HostKkt.{hpp,cpp}` supplies the
+`KktSolver` they take as an injected interface, and `--method=hsd` selects the
+result. One iteration is:
+
+  1. residuals and mu                       stage 1
+  2. progress measures, stopping tests      stage 2
+  3. the border quantities                  stage 3
+  4. K(p;q) = (h_x; -b), ONCE               stage 3, refresh_border_solve
+  5. predictor: gamma = 0, eta = 1          [AA] section 1.4.1
+  6. gamma from the predictor's step        [AA] (1.12)
+  7. corrector: eta = 1-gamma, Mehrotra     [AA] (1.13)
+  8. step length, centrality-tested         [AA] (1.20), (1.21)
+  9. update
+
+Steps 5 and 7 share step 4's solve, which is why the embedding costs one extra
+solve per ITERATION and not per direction. A test asserts kkt_solves ==
+3 * iterations on a real run, not just in a stub.
+
+WHY A FOURTH ENGINE AND NOT A FLAG ON THE IPM. The existing interior-point path
+is GPU-resident, in sovsolve_solver_gpu, and the gpu -> solver library edge is
+one-way (src/solver/CMakeLists.txt). A host-only module cannot be called from
+inside it. So this is `Method::Hsd`, sharing the canonicalize -> presolve ->
+scale -> reconstruct pipeline with the other three and injecting its own
+KktSolver. When a GPU backend exists it supplies a different KktSolver and
+nothing in the loop changes.
+
+`IpmOptions::homogeneous_self_dual` was DELETED in this stage. It was added in
+stage 1 to mean "run the IPM on the embedding", nothing ever read it, and
+selecting the engine now expresses the same intent. A bool with nothing behind
+it is exactly the stale-documentation problem this file exists to avoid.
+
+THE LINEAR ALGEBRA is `HostKkt`: eliminate dx from the first block row, giving
+(A Theta A' + D_s) dy = ry + A Theta rx, SPD, solved by Jacobi-preconditioned
+conjugate gradients that never form the product -- one A'v and one Av per CG
+iteration, through the pdlp::MatVec that already existed for PDLP. That is
+section 10.1's normal-equations reduction, and it is the same system the GPU IPM
+already solves the same way (solve_spd_cg), so the eventual GPU KktSolver is a
+port rather than a redesign.
+
+A MEASURED DEFAULT, and the measurement is the interesting part. cg_max_iterations
+started at 500, matching IpmOptions::cg_max_iterations. On the corpus that gave
+14/19 -- three instances hit the outer iteration limit and two stalled outright.
+At 5000 all five became Optimal, and in FEWER OUTER ITERATIONS:
+
+    25fv47   200 (unconverged)  ->  26
+    e226      65 (stalled)      ->  17
+    stair     64 (stalled)      ->  19
+
+The lesson is not "raise the budget". It is that an inexact Newton direction
+does not degrade gracefully here: the direction it produces is one the
+centrality condition (1.20) REJECTS, so homogeneous_step_size returns 0 and the
+run stalls rather than merely slowing. IpmOptions records the same lesson for
+its MinRes budget ("measured necessary").
+
+
+THE A/B, which is what stage 4 was for.
+
+    engine                    correct verdicts on the 19 tracked instances
+    dual simplex              19/19
+    primal simplex            19/19
+    PDLP                      18/19   (greenbea)
+    HSD  (this module)        18/19   (greenbea)
+    interior point (direct)   6-7/19
+
+So the interior-point FAMILY goes from 6-7/19 to 18/19, and gains the ability
+to report Infeasible and Unbounded at all. That second half is the point; the
+first is a bonus and is largely a statement about the direct path's linear
+algebra rather than about the embedding.
+
+STATE PLAINLY, because the corpus does not show it: gas11's `Unbounded` is
+PRESOLVE's verdict, not HSD's. Both engines report it at iteration 0, and with
+--presolve=0 HSD returns NotConverged there. No instance in the corpus is
+decided by HSD's infeasibility detection. The detection is proven by unit tests
+instead -- `x >= 5` against `x <= 3` gives Infeasible, `min -x` over `x >= 1`
+gives Unbounded, both with tau collapsed against kappa as [AA] Theorem 2
+requires -- and those tests are the evidence, not the corpus run.
+
+KNOWN, not yet fixed:
+
+ - greenbea is the one instance HSD does not solve. PDLP does not either; both
+   simplex engines do.
+ - gas11 with presolve OFF stalls at iteration 0. It is 44% free columns, so
+   theta_inv is exactly 0 on 375 of 862 columns, floored to 1e-12 and inverted
+   to Theta = 1e12 before the method has taken a single step. That is a badly
+   conditioned CG problem at iteration zero, not a late-stage one.
+ - No crossover, no Gondzio correctors, no elaborate starting point ([AA]
+   (1.23), which needs two Newton solves and was skipped in stage 2).
+ - The KktSolver is host-only. A GPU one is a PORT rather than a redesign: it
+   is the same normal-equations system solve_spd_cg in LinearSolver.cu already
+   solves the same way.
+
+Stage 4's tests: 35 checks, and the two that matter are the verdict ones.
+ctest 25/25 host, 27/27 CUDA.
 
 Stage 3's tests: 122 checks, proven able to fail by six mutations -- a border
 column stripped of its bound term (42 checks), a border row written as the

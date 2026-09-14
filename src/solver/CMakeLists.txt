@@ -7,6 +7,8 @@ add_library(sovsolve_solver STATIC
   SolutionQuality.cpp
   Iis.cpp
   Homogeneous.cpp
+  HomogeneousSolve.cpp
+  HostKkt.cpp
   HomogeneousStep.cpp
   HomogeneousNewton.cpp
   ConvergenceChecker.cpp

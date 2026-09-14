@@ -31,7 +31,8 @@ struct SolverState {
 
   // -- homogeneous self-dual embedding (Module 25, FORMULATION.md 13) -------
   //
-  // Meaningful only when `IpmOptions::homogeneous_self_dual` is on; left at
+  // Meaningful only on the `Method::Hsd` path (solver/HomogeneousSolve.hpp);
+  // left at
   // the neutral `tau = 1, kappa = 0` otherwise, which is exactly the point at
   // which the embedded system reduces to the direct one. That is not a
   // coincidence to be relied on silently -- it is what makes the two paths
