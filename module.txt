@@ -42,11 +42,12 @@ Each module has one job and uses the shared project types.
   (docs/ARCHITECTURE-REVIEW.md 3.5 measures factorization at ~64x slower than
   the CPU, SpMV at ~2x).
 - Added Module 25: homogeneous self-dual embedding for the interior-point path
-  (2026-09-14). STAGES 1 AND 2 -- residuals, mu, classification and recovery,
-  then the iteration control (step size, centering, starting point, stopping
-  criteria) transcribed from Andersen & Andersen (2000). The Newton solve is
-  still not written and nothing reads the option yet; section 25 says exactly
-  what blocks it.
+  (2026-09-14/15). STAGES 1-3 -- residuals, mu, classification and recovery;
+  the iteration control transcribed from Andersen & Andersen (2000); and the
+  bordered Newton solve, whose general-bounds border the paper does not give
+  and which was obtained instead by a change of variables onto the published
+  standard-form system. Nothing reads the option yet: what remains is the
+  iteration loop and the A/B.
 - Added Module 26: irreducible infeasible subsystem (2026-09-14). Turns the
   verdict "this model is infeasible" into "these rows contradict each other,
   and dropping any one makes the rest satisfiable".
@@ -759,7 +760,7 @@ has not been run. PDLP -> simplex crossover is also not done: PDLP tails off
 where the simplex returns an exact vertex, so composing them is the natural
 follow-on.
 
-## 25. Homogeneous self-dual embedding (IPM) -- added 2026-09-14, STAGES 1-2
+## 25. Homogeneous self-dual embedding (IPM) -- added 2026-09-14/15, STAGES 1-3
 
 Closes a gap README.md names: the interior-point path structurally cannot
 report `Infeasible` or `Unbounded`. With no feasible point there is no interior
@@ -788,21 +789,71 @@ Algorithmic parameters (Table 1.1), the centering heuristic (1.12), the ratio
 test and step size (1.20)/(1.21), the starting point (1.22) and the three
 stopping criteria (section 1.4.5, 1.24). Nothing in it is derived.
 
-WHAT DOES NOT EXIST: the bordered Newton solve.
-`IpmOptions::homogeneous_self_dual` exists, defaults off, and NOTHING READS IT
-YET.
+WHAT ALSO EXISTS, as of stage 3: `solver/HomogeneousNewton.{hpp,cpp}` -- the
+bordered Newton solve. `IpmOptions::homogeneous_self_dual` exists, defaults off,
+and NOTHING READS IT YET; what remains is an iteration loop calling stage 3 then
+stage 2, and the A/B against the direct path.
 
-WHY, precisely -- this is the one open item and it is narrow. [AA] section 1.2
-is explicit: "For simplicity we will work with the LP problem in standard
-form", Ax = b, x >= 0. Homogenizing sends l -> l*tau and u -> u*tau, so with
-FINITE bounds `tau` appears inside the complementarity rows `(x - l tau).*z`
-and `(u tau - x).*v`. Eliminating dz and dv then leaves dtau terms in both the
-dual block row and the gap row, and they are NOT the same terms -- so the
-border column and the border row are not negatives of each other, as they are
-in standard form. Everything else in stage 2 reads an iterate and a direction
-and does not care how the direction was produced, which is why it could be
-built anyway. FORMULATION section 13.3a states the gap and the two candidate
-resolutions.
+THE ONE THING THE PAPER DOES NOT GIVE, AND HOW IT WAS CLOSED WITHOUT ONE. [AA]
+section 1.2 works in standard form throughout, `Ax = b, x >= 0`. Homogenizing
+sends l -> l*tau and u -> u*tau, so with FINITE bounds `tau` appears inside the
+complementarity rows `(x - l tau).*z` and `(u tau - x).*v`. Eliminating dz and
+dv then leaves dtau terms in BOTH the dual block row and the gap row, and they
+are not the same terms -- so the border column and the border row are not
+negatives of each other, as they are in standard form.
+
+This was closed by a CHANGE OF VARIABLES, not by a new derivation. The shift
+
+    x = l tau + s1,     s2 = (u - l) tau - s1,     s1, s2 >= 0
+
+carries our bounded embedding onto [AA]'s (HLF) exactly, with s1 = x - l tau,
+s2 = u tau - x, y2 = -v, sigma = (z, v), and sigma_I = -y_I on inequality rows
+already being standard form. Verified against a dense Jacobian in both
+coordinate systems: every block agrees to 1e-15. Two details worth keeping:
+the transformed gap row is OURS PLUS A MULTIPLE OF THE DUAL ROW, T3 = -R3 -
+l'R2, which is an identity the test asserts rather than assumes; and the c'l*tau
+terms from shifting the objective CANCEL against those from shifting the
+right-hand side, which is why section 13.1's gap row comes out unchanged -- an
+independent confirmation of a row that had only an LP-duality argument behind it.
+
+What comes out, writing Theta_l = Z/(x - l tau) and Theta_u = V/(u tau - x):
+
+    Theta^-1 = Theta_l + Theta_u              section 10.1's diagonal
+    D_s      = S/Sigma_I                      inequality rows only
+    h_x      = Theta_l l + Theta_u u - c      border COLUMN
+    g_x      = Theta_l l + Theta_u u + c      border ROW
+    w        = l' Theta_l l + u' Theta_u u    extra trailing term
+
+At l = 0, u = inf: h_x = -c, g_x = +c, w = 0 -- [AA] (1.26). With finite bounds,
+measured: ||g_x + h_x|| = 7.14 and w = 17.6.
+
+TWO ORACLES, AND THEY ARE NOT REDUNDANT. Test one transcribes section 13.1 as a
+dense Jacobian and factorizes it whole, catching an error in the ELIMINATION.
+Test two builds the shifted standard-form instance, writes [AA]'s system verbatim
+with no bound terms anywhere in it, maps our direction across and requires it to
+satisfy that system -- catching an error in the BORDER ITSELF, which test one
+cannot, because test one and the implementation are both derived from section
+13.1 and could share a mistake. Confirmed complementary by mutation: with oracle
+1 disabled, oracle 2 ALONE still catches a border column that loses its bound
+term (failing at the dual row), a border row written as -h_x (failing at the gap
+row) and a dropped w (likewise) -- each at exactly the row that term belongs to.
+
+The shift needs finite bounds, since a column with an infinite bound cannot be
+shifted by l. Not a hole: such a column has no complementarity pair and so
+contributes no bound term, leaving its border entry at [AA]'s -c_j. Oracle 2
+covers exactly what [AA] does not, and a third test checks the infinite-bound
+case collapses onto [AA] directly.
+
+Converting to standard form in PRODUCTION, rather than only inside a test, was
+rejected: it costs 2n + m_I columns and m + n rows, Canonical.hpp keeps bounds
+native on purpose, and gas11 is 44% free columns, which the shift cannot express.
+
+COST. [AA] section 1.5: the border solve K(p;q) = (h_x; -b) depends only on the
+iterate, so it is solved ONCE PER ITERATION and shared by the predictor and the
+corrector; only K(u;v) is per right-hand side. `refresh_border_solve` is a
+separate entry point from `solve_homogeneous_newton` precisely so this cannot be
+silently lost -- folding it in would double the cost and every test would still
+pass. A test counts solves: 1 + 1 + 1 for two directions, not 4.
 
 WHAT THE PAPER CORRECTED IN OUR OWN WRITING. FORMULATION section 13.3 used to
 say the bordered system is [K h; -h' k/t] -- the border row being the negated
@@ -872,10 +923,16 @@ the l*dtau coupling (1 check), using [AA] (1.22)'s y := 0 verbatim (3), losing
 one power of (1-alpha) from the centering heuristic (9), and swapping min for
 max in the ill-posed tau test (1).
 
-The stage-1 caveat is now RESOLVED except for the border column. Section 13 was
-our own derivation; [AA] confirms the embedding, the verdicts and the two-solve
-structure, and corrects the border row (see above). What [AA] does not supply is
-the general-bounds border column, because it works in standard form throughout.
+Stage 3's tests: 122 checks, proven able to fail by six mutations -- a border
+column stripped of its bound term (42 checks), a border row written as the
+negated column (39), a dropped w (34), a back-substitution missing its Z*l*dtau
+coupling (10), a gap row missing its u'ruv shift (34), and inequality rows
+wrongly contributing to the border (34).
+
+The stage-1 caveat is now FULLY RESOLVED. Section 13 was our own derivation;
+[AA] confirms the embedding, the verdicts and the two-solve structure, corrects
+the border row, and the change of variables above supplies the general-bounds
+border it does not state. ctest 24/24 host, 26/26 CUDA.
 
 ## 26. Irreducible infeasible subsystem -- added 2026-09-14
 

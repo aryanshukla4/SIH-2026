@@ -22,6 +22,7 @@
 #include "sovsolve/solver/KktSystem.hpp"
 #include "sovsolve/solver/Logging.hpp"
 #include "sovsolve/solver/Homogeneous.hpp"
+#include "sovsolve/solver/HomogeneousNewton.hpp"
 #include "sovsolve/solver/HomogeneousStep.hpp"
 #include "sovsolve/solver/Iis.hpp"
 #include "sovsolve/solver/LpSolve.hpp"
