@@ -37,6 +37,10 @@ sovsolve_add_test(primal_simplex_test  unit/primal_simplex_test.cpp)
 target_compile_definitions(primal_simplex_test PRIVATE
   SOVSOLVE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 
+# Module 24. Also host-only. This one needs no data path -- it builds its own
+# instances and checks them against a brute-force oracle in the same file.
+sovsolve_add_test(pdlp_trust_region_test unit/pdlp_trust_region_test.cpp)
+
 # gpu::compute_residuals lives in sovsolve_solver_gpu, which only exists
 # under SOVSOLVE_ENABLE_CUDA (see src/solver/CMakeLists.txt) -- registering
 # this test unconditionally would fail to link on a host-only build.

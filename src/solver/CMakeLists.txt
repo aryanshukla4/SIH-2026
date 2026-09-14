@@ -20,6 +20,14 @@ add_library(sovsolve_solver STATIC
   simplex/PrimalSimplex.cpp
   simplex/SolveSimplex.cpp
   simplex/SimplexSolution.cpp
+  # Module 24, PDLP. Host-only for now for the same reason the simplex is, but
+  # for the opposite eventual destination: PDLP's inner loop is nothing BUT
+  # SpMV against K and K', which is the one operation this hardware's FP64
+  # penalty leaves competitive (docs/ARCHITECTURE-REVIEW.md 3.5). The matrix
+  # product therefore goes behind an interface so a cuSPARSE implementation can
+  # live in the gpu library and be injected, without this library ever linking
+  # against it.
+  pdlp/TrustRegion.cpp
   LpSolve.cpp)
 # Regularization is header-only (see Regularization.hpp) and PredictorCorrector
 # lives under gpu/ -- it orchestrates GPU module calls, so it belongs in
