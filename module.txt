@@ -35,6 +35,19 @@ Each module has one job and uses the shared project types.
   now `Infeasible` came only from the canonicalizer and `Unbounded` was never
   returned at all.
 
+- Added Module 24: PDLP, primal-dual hybrid gradient for LP (2026-09-14). A
+  THIRD LP engine and the first first-order method here. No factorization at
+  all -- its inner loop is one `K` and one `K'` product and nothing else, which
+  is the only operation this hardware's FP64 penalty leaves competitive
+  (docs/ARCHITECTURE-REVIEW.md 3.5 measures factorization at ~64x slower than
+  the CPU, SpMV at ~2x).
+- Added Module 25: homogeneous self-dual embedding for the interior-point path
+  (2026-09-14). STAGE 1 ONLY -- residuals, mu, classification and recovery; the
+  Newton solve is not written and nothing reads the option yet.
+- Added Module 26: irreducible infeasible subsystem (2026-09-14). Turns the
+  verdict "this model is infeasible" into "these rows contradict each other,
+  and dropping any one makes the rest satisfiable".
+
 ## Changes from v2
 - Module 1: `.mps` is implemented; `.lp` is next, then a model writer, then QPLIB.
 - Module 2: new contract — output is IPM-startable or a definite infeasibility verdict.
@@ -655,6 +668,180 @@ B&B warm starting (Stage 3 of the plan) is also not done: `BranchAndBound.cu`
 still re-runs canonicalize + presolve per node, which can change the canonical
 shape between parent and child, and a basis index space cannot survive that.
 `BranchAndBound.hpp`'s stated limitation therefore still stands as written.
+
+## 24. PDLP -- primal-dual hybrid gradient (LP) -- added 2026-09-14
+
+A third LP engine, `--method=pdlp`. Host-only. Derived from Applegate, Diaz,
+Hinder, Lu, Lubin, O'Donoghue and Schudy, "Practical Large-Scale Linear
+Programming using Primal-Dual Hybrid Gradient" (NeurIPS 2021); the restart
+machinery's normalized duality gap from the same authors' arXiv 2105.12715,
+and the infeasibility certificates from arXiv 2102.04592. The vendored
+`or-tools/` tree contains Google's own PDLP; it was NOT read, the same
+standard Module 23 applied to `HiGHS/highs/simplex/HEkkDual.*`.
+
+Reuses canonicalize -> presolve -> scale -> reconstruct unchanged. The
+formulation mapped with NO conversion, which was the part worth checking
+rather than assuming: FORMULATION.md section 4's existing Lagrangian IS the
+paper's saddle point (2) with `K = A` and `q = b`. The paper puts inequality
+rows first with `y >= 0`; we put equality rows first with `<=` rows and
+`y <= 0`. Both differences are absorbed into the projection onto `Y` rather
+than by permuting the matrix -- permuting would copy the largest object in the
+problem to remove one branch.
+
+Files:
+
+    include/sovsolve/solver/pdlp/TrustRegion.hpp    exact linear-time trust region
+    include/sovsolve/solver/pdlp/MatVec.hpp         the K / K' interface
+    include/sovsolve/solver/pdlp/Pdlp.hpp           solve_pdlp + sign derivation
+    include/sovsolve/solver/pdlp/DualityGap.hpp     normalized duality gap rho_r
+    include/sovsolve/solver/pdlp/Infeasibility.hpp  certificates
+    include/sovsolve/solver/pdlp/PdlpSolution.hpp   -> model::Solution
+
+Landed in measured stages, one enhancement per commit, because the paper's own
+ablation says why: baseline PDHG solves 50 of 383 instances where full PDLP
+solves 283. Corpus at a 1,000,000-iteration budget, measured in KKT passes --
+the paper's metric, and the honest one here, because the adaptive rule costs
+~1.53 passes per iteration against the fixed rule's ~1.03, so iteration counts
+overstate every improvement by roughly 1.5x:
+
+    baseline PDHG                    12/19 Optimal
+    + adaptive step size (Alg 2)     12/19, 1.04x-3.6x fewer passes
+    + adaptive restarts (3.2)        14/19, up to 3.9x
+    + primal weights (Alg 3)         17/19, up to 20.6x
+
+Final: 17 Optimal plus gas11 Unbounded. Only `greenbea` is unsolved. Every
+converged objective matches the dual simplex's exact answer.
+
+Restarts and primal weights each REGRESSED a handful of already-fast instances
+while winning large elsewhere (restarts: six wins up to 3.9x, six losses of
+3-16%; primal weights: two losses). Kept as measured rather than tuned away --
+the wins are multiples and the losses are percentages.
+
+### Three things the papers got wrong, or left out, found by measurement
+
+1. THE ADAPTIVE STEP SIZE DIVERGES AS LITERALLY STATED. Equation (5) and
+   Algorithm 2 line 6 write the acceptance bound with no absolute value, so a
+   negative cross term makes it infinite and the step unconditionally
+   acceptable. True of one iteration; unsafe across iterations, because
+   nothing else bounds `eta` and the growth cap ratchets it up every time the
+   sign comes out negative. Instrumenting a free-column LP showed the cross
+   term negative for 11 of 12 consecutive iterations while `eta` went 1.0 ->
+   8.6 and the iterate diverged to 1.4e20 -- every individual step passing (5).
+   Using the MAGNITUDE fixes it, and is what makes the paper's own stated
+   property `eta_bar >= 1/||K||_2` informative rather than vacuous.
+
+2. THE DUAL OBJECTIVE'S UPPER-BOUND SIGN IS INCONSISTENT IN THE PAPER. Problem
+   (1) writes `q'y + l'lambda^+ - u'lambda^-` while the notation section
+   defines `v^-_i = min{0, v_i}`, a non-positive quantity. Together they give
+   the wrong sign: `min -x` over `0 <= x <= 1` has optimum -1, and the printed
+   formula gives +1. The code was already right, derived from FORMULATION
+   section 4 rather than transcribed; only the comment was wrong.
+
+3. THE TRUST REGION SOLVER'S REDUCTION DROPS UPPER BOUNDS. arXiv 2105.12715
+   Appendix F states its problem with a lower bound only and reduces to `g > 0`
+   by "if g_i < 0 then set g_i = -g_i and l_i = -inf" -- which silently assumes
+   nothing stops the coordinate going up. Our box has finite upper bounds. The
+   correct reduction REFLECTS instead: `g' = -g_i > 0`, `l' = -u_i`. Verified
+   by mutation: the paper's literal version walks a coordinate to the full
+   radius 5.0 instead of stopping at its bound 1.0, with no crash and a
+   strictly better-looking objective.
+
+### Not done
+
+The GPU backend. The `MatVec` interface exists precisely so a cuSPARSE
+implementation can be injected without the host library linking the GPU one,
+but it is not written, and the A/B on `datt256`/`ken-18`/`maros-r7` -- the
+measurement that would actually answer whether this hardware earns its GPU --
+has not been run. PDLP -> simplex crossover is also not done: PDLP tails off
+where the simplex returns an exact vertex, so composing them is the natural
+follow-on.
+
+## 25. Homogeneous self-dual embedding (IPM) -- added 2026-09-14, STAGE 1 ONLY
+
+Closes a gap README.md names: the interior-point path structurally cannot
+report `Infeasible` or `Unbounded`. With no feasible point there is no interior
+to follow, so it diverges and the only honest outcome is `MaxIterations` --
+`gas11` running away to -7.5e10 is exactly that.
+
+The embedding homogenizes every constant by a scalar `tau` and carries the
+duality gap as a scalar `kappa`, giving an always-feasible problem whose
+solution answers either way: `tau > 0` means optimal (divide through by it),
+`tau -> 0` means the iterate IS a Farkas certificate. Derivation in
+FORMULATION.md section 13.
+
+WHAT EXISTS: `solver/Homogeneous.{hpp,cpp}` -- residuals, the complementarity
+measure, classification of the final iterate, and recovery. Host-only on
+purpose even though the IPM is not, because the load-bearing test has to run in
+the default preset with no CUDA toolkit.
+
+WHAT DOES NOT: the bordered Newton solve, step length, state update and
+termination. `IpmOptions::homogeneous_self_dual` exists, defaults off, and
+NOTHING READS IT YET. FORMULATION section 13 carries a banner saying so.
+
+The Newton system's structure is what makes the rest affordable: homogenizing
+adds one row and one column to the SAME matrix `K`, and a bordered system with
+a 1x1 trailing block is solved by two solves of the unmodified `K` plus a
+scalar Schur complement. `KktBuilder`, `Ordering`, `Preconditioner` and
+`LinearSolver` need no changes at all.
+
+Two tests, catching different things, which is the point of having both. At
+`tau = 1` the embedding must reduce to sections 5-6 TERM FOR TERM (expected
+values transcribed from the specification, not obtained by calling the direct
+implementation -- two implementations of one formula can share a sign error, a
+transcription and a derivation cannot). But that test CANNOT catch a missing
+`tau` factor, because `tau = 1` makes one invisible; so a second test doubles
+`tau` and the iterate and requires every residual to double. Verified
+complementary by mutation: dropping the `tau` from `b*tau` leaves all 57
+equivalence checks passing and fails 3 homogeneity checks.
+
+Caveat worth keeping: the section 13 derivation is OURS, not transcribed.
+Andersen & Andersen's MOSEK homogeneous-algorithm paper is the reference that
+handles general bounds `l <= x <= u`, which is where the border column's bound
+terms come from; if the two disagree, that paper is right and section 13 is
+wrong.
+
+## 26. Irreducible infeasible subsystem -- added 2026-09-14
+
+"This model is infeasible" is a verdict; "these rows contradict each other, and
+dropping any one makes the rest satisfiable" is something a planner can act on.
+`solver/Iis.hpp`.
+
+Nearly free, because the certificate already existed. Gleeson and Ryan (1990),
+as stated in arXiv 1804.01327 Theorem 3.4: for an infeasible `Ax <= b` the
+index sets of the IISs are exactly the SUPPORT SETS of the VERTICES of the
+alternative polyhedron `{y : y'A = 0, y'b = -1, y >= 0}`. A point of that
+polyhedron is precisely a Farkas certificate -- which Module 23 computes as a
+byproduct of the pivot that fails, and was throwing away.
+
+"Vertex" is why the DUAL SIMPLEX is required rather than preferred: its
+certificate is a row of `B^-1`, hence a basic solution, hence a vertex. The
+primal simplex proves infeasibility by phase 1 ending with positive
+infeasibility, which yields no such vector; PDLP's is a limit of interior
+iterates with no vertex guarantee. `IisQuality` records which guarantee
+applies rather than assuming the strong one.
+
+Derived for our form: Theorem 3.4 assumes pure `Ax <= b` with no bounds, while
+ours has equality rows (whose multiplier is free in sign, so the support test
+is on magnitude) and a box (whose finite bounds can be HALF the contradiction
+-- `x <= 3` against a row forcing `x >= 5` is infeasible with no two rows
+involved).
+
+Bug found and fixed: the dual simplex proves infeasibility in TWO places, and
+capturing only the first left a whole class of models unexplainable. `x >= 5`
+against `x <= 3` never reaches the ratio-test exit; it reaches the
+bound-flipping exit, where every eligible column was flippable and all of them
+together still do not close the violation.
+
+Presolve is disabled for the IIS solve deliberately -- a certificate computed
+on the reduced model has its support in the REDUCED row space, so the rows it
+names are not the rows the user wrote. Indices are reported in the ORIGINAL
+model's space throughout.
+
+Tests assert IRREDUCIBILITY rather than non-emptiness, since returning every
+row of an infeasible model is trivially a subsystem and useless: every case
+pads the model with satisfiable rows sharing the same variables, including a
+three-row cycle where no PAIR is infeasible, and the definition is checked
+directly by removing each member and requiring the rest to become feasible.
 
 ## Module Independence
 No module silently implements another module's job. All modules use frozen shared types and
