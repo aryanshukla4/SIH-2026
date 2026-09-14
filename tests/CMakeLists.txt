@@ -41,6 +41,10 @@ target_compile_definitions(primal_simplex_test PRIVATE
 # instances and checks them against a brute-force oracle in the same file.
 sovsolve_add_test(pdlp_trust_region_test unit/pdlp_trust_region_test.cpp)
 
+sovsolve_add_test(pdlp_test            unit/pdlp_test.cpp)
+target_compile_definitions(pdlp_test PRIVATE
+  SOVSOLVE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+
 # Module 5, exercised properly now that it has two modes to compare against
 # each other. Reads real instances, so it needs the data path.
 sovsolve_add_test(scaler_test          unit/scaler_test.cpp)
