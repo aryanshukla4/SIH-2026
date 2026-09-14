@@ -1005,7 +1005,18 @@ requires -- and those tests are the evidence, not the corpus run.
 KNOWN, not yet fixed:
 
  - greenbea is the one instance HSD does not solve. PDLP does not either; both
-   simplex engines do.
+   simplex engines do. Measured: it runs 226 iterations in 320 seconds and then
+   STOPS SHORT OF ITS OWN CAP, which means the loop broke rather than ran out
+   -- the step length went to zero and the centrality condition could not be
+   met. The point it returns is nowhere near feasible: primal infeasibility
+   1.000031, dual 0.993, max bound violation 1394.9, complementarity 2.4e4.
+
+   Worth flagging for anyone reading that output: `relative_gap` there is
+   1.54e-9. It looks converged and is not. The gap is small because both
+   objectives have collapsed toward zero together, not because the point is
+   good -- which is exactly why SolutionQuality reports five numbers and not
+   one, and why the corpus check compares OBJECTIVES against the simplex
+   rather than reading a status line.
  - gas11 with presolve OFF stalls at iteration 0. It is 44% free columns, so
    theta_inv is exactly 0 on 375 of 862 columns, floored to 1e-12 and inverted
    to Theta = 1e12 before the method has taken a single step. That is a badly
