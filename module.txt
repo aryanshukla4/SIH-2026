@@ -874,8 +874,17 @@ THE RESULT, and it is not a clean win. 2000 iterations, identical
 
     instance     size      CPU        GPU        outcome
     25fv47       360 KB    0.14 s     3.52 s     GPU 25x SLOWER
+    pilot87      2.4 MB    0.34 s     1.63 s     GPU 4.8x slower
+    fit2d        4.5 MB    0.60 s     1.79 s     GPU 3.0x slower
     maros-r7     4.7 MB    1.61 s     3.33 s     GPU 2.1x slower
     datt256      93 MB     15.81 s    11.94 s    GPU 1.32x FASTER
+    bab2         106 MB    8.32 s     6.24 s     GPU 1.33x FASTER
+
+bab2 is a MIPLIB instance and is the one that matters for the MILP question:
+its LP RELAXATION is what branch-and-bound solves at every node, and it lands on
+the winning side of the threshold. Note also that the ratio is per-product, so
+it does not depend on how many iterations a node runs -- a warm-started node
+doing 50 iterations gets the same 1.33x as a cold root doing 1000.
 
 Repeats: CPU 15.81/15.84, GPU 11.94/11.68 on datt256. Stable.
 
@@ -886,7 +895,19 @@ latency: 16k products against a fixed cost each. On a small problem it IS the
 entire runtime, which is why 25fv47 loses by 25x -- there is not enough work per
 product to fill the device, let alone amortize the launch.
 
-So the crossover is real and it sits between 4.7 MB and 93 MB.
+So the crossover is real and it sits between 4.7 MB and 93 MB, and two
+independent instances above it (one LP, one MILP relaxation) agree on ~1.33x.
+
+WHAT THIS MEANS FOR MILP, since that is where the big models actually are.
+MIPLIB instances routinely exceed 100 MB, so their relaxations clear the
+threshold -- but the win is 1.33x, not an order of magnitude, and every node
+solves a relaxation of the SAME size as the root, so the ratio holds across the
+tree rather than improving down it. The large MILP win is not a faster single
+SpMV; it is that branch-and-bound has many INDEPENDENT nodes and this GPU is
+being fed one medium SpMV at a time, leaving most of it idle. Batching nodes is
+where the throughput argument actually lives. Two things block that today:
+BranchAndBound.cu re-canonicalizes per node, and until Module 27 there was no
+valid bound to prune with.
 
 ATTRIBUTION on datt256 (6454 products), from a separate run because the
 breakdown needs two syncs per product and therefore inflates the total it is
