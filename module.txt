@@ -41,6 +41,11 @@ Each module has one job and uses the shared project types.
   is the only operation this hardware's FP64 penalty leaves competitive
   (docs/ARCHITECTURE-REVIEW.md 3.5 measures factorization at ~64x slower than
   the CPU, SpMV at ~2x).
+- Added Module 27: VALID dual bounds (2026-09-15). An approximate dual
+  objective is not a bound, and pruning on one silently discards optimal
+  solutions -- so this repairs approximate duals to exact feasibility
+  (Neumaier-Shcherbina primal-bound-shift, via Steffy & Wolter section 2)
+  before PDLP is allowed anywhere near branch-and-bound.
 - Added Module 24E: PDLP's K and K' through cuSPARSE, `--gpu-spmv=1`
   (2026-09-15). The GPU measurement this project has owed since the
   architecture review. Measured: 1.32x FASTER on datt256 (93 MB), 2.1x
@@ -766,6 +771,84 @@ measurement that would actually answer whether this hardware earns its GPU --
 has not been run. PDLP -> simplex crossover is also not done: PDLP tails off
 where the simplex returns an exact vertex, so composing them is the natural
 follow-on.
+
+## 27. Valid dual bounds -- added 2026-09-15
+
+WHY THIS BLOCKS MILP-ON-PDLP ENTIRELY. Branch-and-bound prunes a node by
+comparing its dual bound against the incumbent. PDLP and the interior-point
+methods return an APPROXIMATELY optimal point, and an approximate dual objective
+IS NOT A BOUND: optimistic by even 1e-9 and the node holding the true optimum
+gets pruned, and the search returns a wrong answer with nothing anywhere
+reporting an error. That is soundness, not tolerance -- which is why this had to
+exist before PDLP could feed the search at all.
+
+SOURCE: Neumaier and Shcherbina (2004), as presented in D. E. Steffy and
+K. Wolter, "Valid Linear Programming Bounds for Exact Mixed-Integer
+Programming" (Zuse Institute Berlin), section 2, where it is called
+PRIMAL-BOUND-SHIFT. Nothing here is derived.
+
+Given approximate duals, take the residual of the dual EQUALITY constraint and
+push it onto the two bound duals:
+
+    r = c - A'y - z + v        z <- z + r+       v <- v + r-
+
+which restores `A'y + z - v = c` exactly while keeping both nonnegative, so
+`b'y + l'z - u'v` is a valid LOWER bound by weak duality -- the direction
+branch-and-bound prunes on. [SW] Proposition 2.1 prices it: the corrected bound
+sits `l'r+ - u'r-` away from the approximate one, so a tighter dual gives a
+tighter bound, and `correction_penalty` reports that gap so a caller can decide
+how long to run PDLP per node.
+
+TRANSCRIBED, not copied: [SW] state it for `max c'x, Ax <= b`; ours is a
+minimization with equality AND `<=` rows and the dual `max b'y + l'z - u'v`
+subject to `A'y + z - v = c`, `z,v >= 0`, `y_E` free, `y_I <= 0` -- which is
+FORMULATION.md section 13.2's dual, already derived and tested there. Standard
+form recovers [SW] section 2 verbatim and a test asserts it.
+
+THE PRECONDITION, and it is why [SW] wrote a second algorithm. `l'z` needs `l_j`
+finite wherever `z_j > 0`. A FREE column with a nonzero residual cannot be
+repaired at all -- repair means putting weight on a bound dual that does not
+exist -- so the bound is minus infinity. [SW]: "31 out of 59 problems were
+missing at least some variable bounds." Ours is worse in places: gas11 is 44%
+free columns. `DualBound::finite` is therefore a first-class outcome and a
+caller that gets `false` MUST NOT PRUNE.
+
+NOT IMPLEMENTED, deliberately: [SW]'s own contribution, PROJECT-AND-SHIFT
+(their section 3), which drops the finite-bound requirement by projecting onto
+the affine hull of the dual polyhedron and shifting toward its relative
+interior. It needs exact rational arithmetic throughout, an exact LU
+factorization, and an S-interior point from one or two auxiliary LPs in a setup
+phase. That is aimed at EXACT rational MIP, which this project is not. [SW]
+section 2 on the simple method: "the strength and simplicity of computing this
+bound suggests that it will be an excellent choice when tight primal variable
+bounds are available" -- and refinery models, PS 26119's domain, bound
+essentially everything physically. Project-and-shift is the named fallback for
+free-column-heavy models.
+
+TESTS: 327 checks, and the load-bearing one is
+`test_the_uncorrected_bound_is_actually_invalid` -- it evaluates the dual
+objective the way a naive branch-and-bound would and shows the result EXCEEDS
+the true optimum. Without that, this whole module would have nothing justifying
+it.
+
+MUTATION TESTING FOUND TWO WEAK TESTS HERE, which is worth recording because
+both passed first time:
+
+ 1. The free-column test guarded its assertions behind `if (!bound.finite)`, so
+    a defect that wrongly reported the bound as FINITE made the test skip
+    itself and pass. Now unconditional.
+ 2. The inequality-dual sign clamp (`y_I <= 0`, load-bearing in weak duality)
+    survived deletion against a perturbation-based test. The violation is worth
+    `y_i * slack_i` while the repair penalty scales with the variable bound
+    WIDTHS, so on a fixture with tight boxes the penalty simply swamped it. The
+    exposing case had to be DESIGNED, not searched for: a redundant row
+    `x <= 1000` against `x <= 1` with `0 <= x <= 1`, where a wrong-signed dual
+    of +1 collects 1000 from `b'y` and pays about 1 to repair -- a bound near
+    +999 against a true optimum of -1. Unclamped, this module would tell the
+    search to prune every node.
+
+Four mutations now caught: no correction (6 checks), r+ and r- swapped onto the
+wrong duals (1), sign clamp dropped (1), free column silently ignored (3).
 
 ## 24E. PDLP on the GPU -- added 2026-09-15, `--method=pdlp --gpu-spmv=1`
 

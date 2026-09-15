@@ -68,6 +68,10 @@ sovsolve_add_test(homogeneous_solve_test unit/homogeneous_solve_test.cpp)
 # Module 26. Builds its own models, so no data path needed.
 sovsolve_add_test(iis_test             unit/iis_test.cpp)
 
+# Module 27. The load-bearing test here proves the UNCORRECTED bound is
+# genuinely invalid -- without it the module has nothing to justify it.
+sovsolve_add_test(dual_bound_test      unit/dual_bound_test.cpp)
+
 # Module 5, exercised properly now that it has two modes to compare against
 # each other. Reads real instances, so it needs the data path.
 sovsolve_add_test(scaler_test          unit/scaler_test.cpp)
