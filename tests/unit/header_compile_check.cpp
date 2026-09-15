@@ -18,6 +18,7 @@
 #include "sovsolve/io/Load.hpp"
 #include "sovsolve/solver/ConvergenceChecker.hpp"
 #include "sovsolve/solver/Diagnostics.hpp"
+#include "sovsolve/solver/DualBound.hpp"
 #include "sovsolve/solver/Initializer.hpp"
 #include "sovsolve/solver/KktSystem.hpp"
 #include "sovsolve/solver/Logging.hpp"

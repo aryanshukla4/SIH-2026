@@ -57,3 +57,9 @@ docs/handover/
 or-tools/
 HIGHS/
 
+# Large benchmark instances, dropped in by hand for the GPU A/B. Deliberately
+# untracked: `bab2.mps` alone is 106 MB, and a repository is not a place to put
+# MIPLIB. `scripts/gpu_ab.sh` and `--method=pdlp --gpu-spmv=1` take a path, so
+# they work fine against files that live only on the machine running them.
+tests/data/bab2.mps
+tests/data/*.mps.gz
