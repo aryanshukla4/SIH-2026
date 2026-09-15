@@ -905,9 +905,36 @@ solves a relaxation of the SAME size as the root, so the ratio holds across the
 tree rather than improving down it. The large MILP win is not a faster single
 SpMV; it is that branch-and-bound has many INDEPENDENT nodes and this GPU is
 being fed one medium SpMV at a time, leaving most of it idle. Batching nodes is
-where the throughput argument actually lives. Two things block that today:
-BranchAndBound.cu re-canonicalizes per node, and until Module 27 there was no
-valid bound to prune with.
+where the throughput argument actually lives.
+
+WHAT MAKES BATCHING POSSIBLE AT ALL, verified in our own code rather than
+assumed: `A`, `Q` and `c` are INVARIANT across the entire tree.
+BranchAndBound.cu holds one `working` Problem for the whole search and swaps
+only col_lower/col_upper per node (its own comment at the clone says so), cuts
+are root-only ("cut-and-branch"), and branching narrows bounds rather than
+adding rows. So N pending nodes are N different `(l, u)` against ONE shared
+matrix, which makes the batched primitive `A X` with X dense n-by-N -- SpMM,
+not N separate SpMVs.
+
+That attacks both bottlenecks section 24E measured, not one:
+
+  - Bandwidth. SpMV reads 12 bytes per nonzero (8 value + 4 index) for 2 flops,
+    ~0.17 flop/byte. SpMM with N right-hand sides reads the SAME 12 bytes for
+    2N flops. Machine balance on this card is ~0.5 flop/byte, so N = 3 already
+    moves it off the bandwidth roof.
+  - Launch latency, which 24E measured as the DOMINANT cost -- GPU time was
+    near-constant at ~3.3 s across a 260x size range. One launch for N nodes
+    instead of N launches divides that by N.
+
+CORRECTION TO AN EARLIER CLAIM IN THIS FILE'S HISTORY: the per-node
+re-canonicalization is NOT in BranchAndBound.cu. That file is careful about it.
+It is in `solve_problem` (gpu/Solve.cu), which canonicalizes, presolves and
+scales on every call, and B&B calls it once per node. The fix is therefore a
+solve_problem variant taking an ALREADY-canonical problem plus a bound
+override, not a change to the search loop -- a different and smaller job than
+previously stated here.
+
+Until Module 27 there was also no valid bound to prune with.
 
 ATTRIBUTION on datt256 (6454 products), from a separate run because the
 breakdown needs two syncs per product and therefore inflates the total it is
