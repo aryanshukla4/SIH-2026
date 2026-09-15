@@ -215,6 +215,23 @@ The distinction that matters:
 > | `maros-r7` | 4.7 MB | 1.61 s | 3.33 s | GPU 2.1× slower |
 > | `datt256` | 93 MB | 15.81 s | 11.94 s | GPU **1.32× faster** |
 >
+> **This whole section is about GA107 specifically, and reads as more general
+> than it is.** "GPU factorization is slower than our CPU" is a statement about
+> a **1:64** FP64 ratio, which is a consumer-Ampere product decision, not
+> physics. On a datacentre card (A100: 1:2 FP64, ~1.5 TB/s HBM) both rows change
+> sign — factorization is compute-bound, so it would go from ~95 GFLOPS to
+> ~9.7 TFLOPS against a CPU's ~150, and the SpMV ceiling rises from ~3.8× to
+> ~30×. Nothing here should be quoted as "GPUs are bad at factorization"; it
+> means *this* GPU is, and the matrix-free design is what makes the code
+> portable to one where it isn't.
+>
+> Device residency deferred on the same reasoning, and the reasoning is
+> hardware-specific in the opposite direction: it is worth ~4× here, but PCIe
+> does not scale with the GPU, so on a faster card the transfer fraction grows
+> and residency becomes the gate rather than an optimization. Deferred because
+> 4× loses to the ~20× this project has measured from single algorithmic changes
+> — not because it is unimportant.
+>
 > GPU time is near-**constant** across a 260× size range, so the crossover is
 > set by per-product launch latency, not by arithmetic. Attributing the
 > `datt256` run: kernel 1.63 s, host↔device transfer 2.94 s (**1.8× the
