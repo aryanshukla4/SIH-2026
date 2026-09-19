@@ -45,6 +45,10 @@ Each module has one job and uses the shared project types.
   with reliability branching (Achterberg-Koch-Martin; Achterberg's thesis
   ch. 5). Its enumeration oracle found a dual simplex bug on first run --
   the bound-flipping exit called a feasible LP infeasible -- now fixed.
+- Added Module 28 stage 5b: Berthold's diving loop (promising dives run past
+  the quota, non-trivial direction, vectorlength diving). timtab1 finds its
+  first solution; assign1-5-8 reaches its optimum 212. All MIPLIB optima in
+  this file now checked against the official MIPLIB 2017 solu file.
 - Added Module 28 stage 5: primal heuristics ([CIP] ch. 9), simple rounding
   on every node LP and four diving rules under the 5% quota. First incumbent
   at node 1-2 on 9 of 11 MIPLIB instances; gen-ip002 solved for the first
@@ -1578,7 +1582,7 @@ nodes to optimality -- is not available yet (see below for why). What IS
 comparable at a fixed node count, and deterministic (three identical runs give
 identical iterations and bounds), is how far each rule pushes the LOWER BOUND:
 
-    instance      most-fractional  pseudocost    reliability   (opt, approx.)
+    instance      most-fractional  pseudocost    reliability   optimum
     timtab1       191278           297474        405956        764772
     glass4        8.00005e8        8.00005e8     1.00001e9     1.2e9
     enlight_hard  13               19            23.5          37
@@ -1589,8 +1593,9 @@ identical iterations and bounds), is how far each rule pushes the LOWER BOUND:
 
 Reliability gives the strongest bound on 6 of 7, and 2.1x most-fractional's on
 timtab1 -- consistent with [AKM]'s finding that most-fractional is "not better
-than selecting the variable randomly". The optimum column is from memory of
-MIPLIB, marked approximate.
+than selecting the variable randomly". The optimum column was first written
+from memory; it is now checked against MIPLIB 2017's published solution file
+(see "REFERENCE OPTIMA" at the end of section 28) and every value stands.
 
 RETRACTED: the same run's TIME-limited rows (pk1, neos5, glass4-reliability,
 assign1-5-8) are not reported. A CUDA build was running concurrently and
@@ -1813,7 +1818,7 @@ default. "none" = no integer point found.
 
 READING IT.
   - Incumbents: 2 of 11 instances under best-first, 8 of 11 now. neos5's
-    15 is (from memory of MIPLIB, not checked) its optimum; markshare_4_0
+    15 is its proven optimum (MIPLIB 2017 solu file); markshare_4_0
     22 -> 5 (optimum 1).
   - DSE lowers pivots per node on 10 of 11 and time on 7 of 11; neos5 is
     the large one, 22.8s -> 9.8s.
@@ -1881,7 +1886,7 @@ NOT reproducible against stage 4's identical configuration (neos5 16.8s
 here, 9.8s there, same pivot count) -- the machine was under other load,
 so times are indicative only.
 
-    instance       first incumbent node   best incumbent            (optimum*)
+    instance       first incumbent node   best incumbent            optimum
     pk1            4800 -> 1              113 -> 25                 11
     gen-ip054      4774 -> 2              7345.9 -> 7168.2          6840.97
     mas74           664 -> 1              19320.6 -> 13248.3        11801
@@ -1893,7 +1898,7 @@ so times are indicative only.
     glass4         2213 -> 2213           4.5e9 -> 4.5e9            1.2e9
     timtab1        none -> none
     enlight_hard   none -> none
-    (* from memory of MIPLIB, not checked)
+    (optima: MIPLIB 2017 solu file, all proven -- see REFERENCE OPTIMA)
 
 Dive LP iterations were 5-7% of node-LP iterations; time -5% to +68%
 (pk1 3.45s -> 5.78s). The lower bound moved up on pk1 (0 -> 1.90), mas74,
@@ -1904,3 +1909,58 @@ found 5 was not taken. glass4, timtab1 and enlight_hard: dives ran to their
 quota and found nothing. [CIP] 9.5 ranks the feasibility pump (7%) and RENS
 (6%) above line search diving (4%); those are the remaining heuristics of
 consequence, and the pump needs the objective-diving machinery of 9.3.
+
+28, stage 5b -- the diving loop per Berthold, and checked optima.
+
+SOURCE ADDED. T. Berthold, "Primal Heuristics for Mixed Integer Programs",
+diploma thesis, TU Berlin / ZIB 2006 -- [CIP]'s reference [41], cited as
+[B] in MilpSolve.cpp. It gives the dive loop exactly ([B] Algorithm 1) but,
+like [CIP], only SYMBOLIC limits (n_lp_max, i_min, i_max): SCIP's numeric
+per-heuristic settings are not in it, so the 1000-iteration allowance
+stays, still marked as ours. Three changes from it:
+
+  1. A PROMISING dive continues past the iteration quota while the
+     fractional count is at most n_fr - i/2 after i steps -- which bounds
+     the dive by itself. (The i < i_min exception is not implemented; [B]
+     gives no value.)
+  2. A trivially roundable column chosen anyway is bounded in its
+     NON-trivial direction.
+  3. Vectorlength diving ([CIP] 9.2.6, [B] 3.1.1) joins the rotation: round
+     toward the worse objective, smallest objective loss per (column length
+     + 1). [B] measured it the best diver at the root, 93 of 129 instances.
+
+[B] also describes the pseudocost-diving score with f(x) = distance to the
+nearest integer, where [CIP] uses the direction-specific fraction; [CIP] is
+followed, the difference stated in the code.
+
+MEASURED, same configuration as stage 5 (heuristics on), 20000 nodes.
+Deterministic fields only -- HiGHS was running on the same CPU.
+
+    instance       stage 5 incumbent   now            optimum
+    timtab1        none                1306381        764772   FIRST ever
+    glass4         4.50005e9           2.50002e9      1.20001e9
+    gen-ip054      7168.2              6970.5         6840.97
+    assign1-5-8    213                 212            212      OPTIMAL
+    mas76          40871.6             41170.2        40005.05 (worse)
+    gen-ip002      -4675.0             -4674.3        -4783.73 (worse)
+    pk1, mas74, markshare_4_0, neos5: unchanged; enlight_hard: still none.
+
+10 of 11 instances now have an incumbent at 20000 nodes; two (neos5,
+assign1-5-8) are at their optimum, though neither is PROVEN -- the lower
+bound has not met them.
+
+REFERENCE OPTIMA. From the MIPLIB 2017 solution file,
+https://miplib.zib.de/downloads/miplib2017-v31.solu, every one marked =opt=
+(proven optimal):
+
+    pk1 11                   gen-ip054 6840.96564179   timtab1 764771.99999978
+    mas74 11801.18572        mas76 40005.05399         glass4 1200012599.972384
+    enlight_hard 37          gen-ip002 -4783.733392    markshare_4_0 1
+    neos5 15                 assign1-5-8 211.999999999998
+
+A caution learned while checking them: HiGHS 1.15 (highspy, black-box, 300 s
+single thread) reported timtab1 "Optimal" at 764774 and mas76 at
+40005.05414 -- optimal only within its default 1e-4 relative gap, not the
+true optimum. A solver's "Optimal" is a gap statement; the solu file's =opt=
+is the reference. HiGHS also left pk1 (gap 58%), gen-ip054 and mas74 open
+in 300 s.
