@@ -353,6 +353,57 @@ void test_afiro() {
   CHECK(result->quality.dual_infeasibility <= 1e-8);
 }
 
+
+/// REGRESSION: a FEASIBLE model the bound-flipping ratio test called
+/// infeasible, found by milp_test's enumeration oracle (seed 23).
+///
+/// This is the LP relaxation of that seed's integer program. Row r0 can be met
+/// only at its boundary: over the variable box its left-hand side reaches 12 at
+/// most, and only at x0 = 1, x2 = 4, x3 = 1 -- the single feasible point. So on
+/// the first iteration the boxed columns' flips close r0's violation EXACTLY.
+///
+/// On the integer data that cancels to zero and the last column enters. After
+/// geometric scaling it cancels to ~1e-16, and the test `reduction < remaining`
+/// flipped the last column too, left no candidate to enter, and reached the
+/// "nothing blocks the dual step" exit -- reporting Infeasible, with a
+/// certificate that fails arXiv 2102.04592 (50) at every tolerance up to 0.1.
+/// The primal simplex, with no such exit, found the optimum.
+///
+/// The fix passes a breakpoint only while the violation stays open by more than
+/// the primal feasibility tolerance -- the threshold `choose_leaving` already
+/// uses to call a row violated at all.
+///
+/// Caveat recorded rather than hidden: this reproduces through the solver's own
+/// default scaling, which is what produces the residual. A change to the
+/// scaler could make it pass without exercising the exit; the checks below at
+/// least pin that the answer is right either way.
+void test_flips_that_close_the_violation_exactly() {
+  model::Solution solution;
+  if (!solve("exact flips", R"(Maximize
+ obj: - 6 x0 + 1 x1 - 1 x2 + 1 x3 + 2 x4
+Subject To
+ r0: + 3 x0 - 5 x1 + 3 x2 - 3 x3 - 2 x4 >= 12
+ r1: - 2 x0 + 1 x1 - 3 x2 + 0 x3 - 3 x4 <= 5
+ r2: - 2 x0 + 1 x1 - 3 x2 - 5 x3 - 3 x4 <= -4
+Bounds
+ -1 <= x0 <= 1
+ 0 <= x1 <= 3
+ 0 <= x2 <= 4
+ 1 <= x3 <= 5
+ 0 <= x4 <= 2
+End
+)",
+             solution)) {
+    return;
+  }
+  CHECK(solution.status == SolverStatus::Optimal);
+  CHECK_NEAR(solution.objective, -9.0, 1e-7);
+  if (solution.x.size() == 5) {
+    CHECK_NEAR(solution.x[0], 1.0, 1e-7);
+    CHECK_NEAR(solution.x[2], 4.0, 1e-7);
+    CHECK_NEAR(solution.x[3], 1.0, 1e-7);
+  }
+}
 }  // namespace
 
 int main() {
@@ -365,6 +416,7 @@ int main() {
   test_dual_signs();
   test_degenerate_terminates();
   test_bound_flipping_agrees_with_textbook();
+  test_flips_that_close_the_violation_exactly();
   test_afiro();
   return sovsolve::test::report("dual_simplex");
 }

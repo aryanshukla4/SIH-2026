@@ -28,6 +28,12 @@ tests/data/netlib/*.mps
 !tests/data/netlib/afiro.mps
 !tests/data/netlib/adlittle.mps
 tests/data/miplib/
+# MIPLIB instances for the MILP work (module.txt section 28), dropped in by
+# hand. Third-party and large; nothing in the test suite reads them. Both
+# spellings, because the folder on disk is MILP/ and a case-sensitive
+# checkout (WSL, CI) would otherwise not match one of them.
+tests/data/MILP/
+tests/data/milp/
 tests/data/qplib/
 # Same rule for tests/data/lp/: it holds a large third-party instance set used
 # only for ad-hoc reader checks. blend.lp is the exception, force-added because

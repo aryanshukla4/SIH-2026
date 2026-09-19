@@ -353,8 +353,20 @@ Step DualSolver::iterate() {
         // this ratio anyway, so the flip is what KEEPS it dual feasible -- not
         // an optimization bolted onto the ratio test, but the ratio test's own
         // consequence.
+        //
+        // Pass the breakpoint only if the violation stays MATERIALLY open
+        // after the flip -- open by more than the primal feasibility
+        // tolerance, the same threshold `choose_leaving` uses to call a row
+        // violated at all. Comparing against zero instead declared a FEASIBLE
+        // model infeasible: when the flips close the violation EXACTLY -- a
+        // row feasible only at its boundary, as in a MILP relaxation with a
+        // single feasible point -- scaling leaves a residual of ~1e-16, the
+        // last column is flipped rather than entered, no candidate is left,
+        // and the exit below reports an infeasibility that is pure rounding.
+        // Found by milp_test's enumeration oracle (seed 23); the unscaled
+        // model, whose integer data cancels exactly, solved correctly.
         const Real reduction = std::fabs(cand.arow) * (upper_[w] - lower_[w]);
-        if (reduction < remaining) {
+        if (remaining - reduction > opt_.primal_feasibility_tolerance) {
           remaining -= reduction;
           flips_.push_back(cand.w);
           continue;

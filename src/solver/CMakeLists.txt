@@ -7,6 +7,7 @@ add_library(sovsolve_solver STATIC
   SolutionQuality.cpp
   Iis.cpp
   DualBound.cpp
+  MilpSolve.cpp
   Homogeneous.cpp
   HomogeneousSolve.cpp
   HostKkt.cpp

@@ -72,6 +72,10 @@ sovsolve_add_test(iis_test             unit/iis_test.cpp)
 # genuinely invalid -- without it the module has nothing to justify it.
 sovsolve_add_test(dual_bound_test      unit/dual_bound_test.cpp)
 
+# Module 28, host branch-and-bound on the dual simplex. The oracle is
+# enumeration: every branching rule must reproduce the enumerated optimum.
+sovsolve_add_test(milp_test            unit/milp_test.cpp)
+
 # Module 5, exercised properly now that it has two modes to compare against
 # each other. Reads real instances, so it needs the data path.
 sovsolve_add_test(scaler_test          unit/scaler_test.cpp)
