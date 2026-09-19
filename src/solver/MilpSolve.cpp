@@ -658,8 +658,15 @@ bool BranchAndBound::dive_budget_left() const {
 ///      "one level of backtracking");
 ///   9. still infeasible: stop.
 ///
-/// Also stopped by the 5% iteration quota, by an LP without a trustworthy
-/// optimum, and by an LP bound that can no longer beat the incumbent.
+/// Also stopped by an LP without a trustworthy optimum and by an LP bound that
+/// can no longer beat the incumbent -- "the diving process cannot produce a
+/// better solution" (Berthold, "Primal Heuristics for Mixed Integer
+/// Programs", diploma thesis, ZIB 2006, section 3.1 -- [B] below) -- and by
+/// the 5% iteration quota, EXCEPT in a promising dive: [B] Algorithm 1 keeps
+/// going past the limits while the fractional count, n_fr at the start,
+/// is at most n_fr - i/2 after i steps. That cannot run away: it forces the
+/// count down by one per two steps. ([B]'s other exception, i < i_min, is
+/// not implemented: [B] gives no value for i_min.)
 ///
 /// Step 4, the rules, rotated one per dive:
 ///   fractionality (9.2.2)  smallest min{f-, f+}, to the nearest integer;
@@ -673,20 +680,34 @@ bool BranchAndBound::dive_budget_left() const {
 ///                          fraction (< 0.3 down, > 0.7 up), then the smaller
 ///                          pseudocost; select the maximum of
 ///                          f+ (1 + Psi+)/(1 + Psi-) going down, or
-///                          f- (1 + Psi-)/(1 + Psi+) going up.
+///                          f- (1 + Psi-)/(1 + Psi+) going up;
+///   vectorlength  (9.2.6)  round toward the WORSE objective (up if c_j >= 0),
+///                          smallest (objective loss) / (|A_j| + 1): cost per
+///                          row the fixing "repairs". [B] 3.1.1 found it the
+///                          most successful diver at the root, 93 of 129
+///                          instances against 71 and 68.
 /// Common to all ([CIP] 9.2): columns with a zero lock are left to simple
 /// rounding, and binaries are preferred over general integers. A rule with no
 /// usable column (line search when every column sits at its root value)
-/// falls back to fractionality.
+/// falls back to fractionality. A column with a zero lock that is chosen
+/// anyway (only such columns left) is bounded in its NON-trivial direction:
+/// "otherwise, the developing of x would be similar to the one of a rounding
+/// heuristic but with much more computational effort" ([B] 3.1.1).
 ///
 /// READING, pseudocost diving: the extracted text lost its floor/ceiling
 /// marks; the factor that goes with rounding DOWN is taken as f+ = ceil - x,
 /// because the thesis says the measure "prefers variables that are close to
-/// their rounded value" -- rounding down, that is a LARGE f+.
+/// their rounded value" -- rounding down, that is a LARGE f+. [B] 3.1.1
+/// describes the score as "the fractionality f(x) times the quotient" of the
+/// pseudocosts, f(x) = distance to the NEAREST integer (his Definition 1.4);
+/// the two texts differ for a column rounded away from its nearest integer.
+/// [CIP] is followed here as the later description of the same heuristic.
 core::Status BranchAndBound::dive(const Node& node, const SimplexResult& lp) {
   if (!dive_budget_left()) return core::Status::Ok();
   ++stats_.dives;
-  const std::size_t rule = next_dive_rule_++ % 4;
+  const std::size_t rule = next_dive_rule_++ % 5;
+  std::size_t steps = 0;
+  std::size_t start_fractional = 0;
 
   std::vector<Real> lower = node.lower;
   std::vector<Real> upper = node.upper;
@@ -704,6 +725,10 @@ core::Status BranchAndBound::dive(const Node& node, const SimplexResult& lp) {
       return core::Status::Ok();
     }
     if (const auto st = simple_rounding(current, &stats_.dive_solutions); !st.ok()) return st;
+
+    if (steps == 0) start_fractional = cands.size();
+    const bool promising = 2 * cands.size() + steps <= 2 * start_fractional;
+    if (steps > 0 && !dive_budget_left() && !promising) return core::Status::Ok();
 
     // Columns a dive should choose among.
     std::vector<const Candidate*> pool;
@@ -776,6 +801,24 @@ core::Status BranchAndBound::dive(const Node& node, const SimplexResult& lp) {
         }
       }
       if (pick == nullptr) by_fractionality();
+    } else if (rule == 4) {
+      const auto& p = canon_.problem;
+      Real best = kInf;
+      for (const Candidate* c : pool) {
+        const IntegerColumn& ic = integers_[c->column];
+        // The canonical cost per ORIGINAL unit: x_original = s x_canonical.
+        const Real cost = p.c[ic.canonical] / ic.scale;
+        const bool go_up = cost >= 0.0;
+        const Real loss = (go_up ? c->frac_up : c->frac_down) * std::fabs(cost);
+        const auto length = static_cast<Real>(p.A.csc.slice_end(ic.canonical) -
+                                              p.A.csc.slice_begin(ic.canonical));
+        const Real score = loss / (length + 1.0);
+        if (score < best) {
+          best = score;
+          pick = c;
+          up = go_up;
+        }
+      }
     } else {
       Real best = -kInf;
       for (const Candidate* c : pool) {
@@ -804,6 +847,8 @@ core::Status BranchAndBound::dive(const Node& node, const SimplexResult& lp) {
       }
     }
     if (pick == nullptr) return core::Status::Ok();
+    if (down_locks_[pick->column] == 0 && up_locks_[pick->column] > 0) up = true;
+    if (up_locks_[pick->column] == 0 && down_locks_[pick->column] > 0) up = false;
 
     const IntegerColumn& ic = integers_[pick->column];
     const std::size_t j = ic.canonical;
@@ -828,7 +873,7 @@ core::Status BranchAndBound::dive(const Node& node, const SimplexResult& lp) {
     if (!next.has_value() || next->status != SolverStatus::Optimal) return core::Status::Ok();
     if (dominated(next->objective)) return core::Status::Ok();
     current = std::move(*next);
-    if (!dive_budget_left()) return core::Status::Ok();
+    ++steps;
   }
 }
 
