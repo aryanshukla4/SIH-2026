@@ -390,6 +390,10 @@ struct MilpOptions {
   /// [CIP] 8.8's LOCAL reduced cost strengthening at every node, which SCIP
   /// files under separators but which here, as there, only tightens bounds.
   bool propagation = true;
+  /// Each row is visited at most this many times per propagation call.
+  /// [CIP] states no limit -- its 5% minimum-change rule (7.3) is what bounds
+  /// the work -- so this cap is OURS; stopping early is always safe.
+  std::size_t propagation_row_visits = 20;
 
   /// Root cutting planes in canonical space, cut-and-branch as [CIP] 8.10
   /// measures SCIP's default: Gomory mixed integer cuts ([CIP] 8.3 with
@@ -399,6 +403,34 @@ struct MilpOptions {
   bool gomory_cuts = true;
   bool cmir_cuts = true;
   std::size_t cut_rounds = 15;
+  /// A cut enters only if the LP point violates it by more than this,
+  /// relative to max(1, |rhs|). [CIP] and Wolter compare against zero; the
+  /// margin, which drops cuts violated only by rounding, is OURS.
+  Real cut_violation_margin = 1e-6;
+
+  /// Conflict analysis, [CIP] chapter 11: learn a conflict constraint from
+  /// every node proven empty by propagation or by an infeasible LP
+  /// (Algorithm 11.1), resolved through the bound-change trail to one FUIP
+  /// constraint per depth level (at most 10 per conflict, [CIP] 11.3), kept as
+  /// bound disjunctions (11.14) and used in domain propagation. Needs
+  /// `propagation`.
+  bool conflict_analysis = true;
+  /// A conflict constraint considered this many times without a deduction is
+  /// discarded -- [CIP] 11.3's aging. Neither [CIP] nor Witzig, Berthold and
+  /// Heinz, "Experiments with Conflict Analysis in Mixed Integer Programming"
+  /// (CPAIOR 2017, ZIB report 16-63) states the threshold: OURS.
+  std::size_t conflict_max_age = 1000;
+  /// Witzig et al. section 3: the pool holds "at least 1 000 and at most
+  /// 50 000 conflict constraints at the same time", sized by "the number of
+  /// variables and constraints"; when full, "the oldest conflict constraints
+  /// are removed". Their sizing formula is not given; here the size is
+  /// columns + rows, clamped to those bounds (OURS).
+  std::size_t conflict_pool_min = 1000;
+  std::size_t conflict_pool_max = 50000;
+  /// Witzig et al. section 3: a conflict whose proof used the objective
+  /// cutoff is deleted once a new incumbent improves on the one it was
+  /// derived with by more than this fraction -- "a threshold of 5%".
+  Real conflict_cutoff_drop = 0.05;
 
   /// Stop once this many nodes pass without an improved incumbent (0 = off).
   /// The RENS sub-MIP's stalling limit; available to any run.

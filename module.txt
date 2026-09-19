@@ -45,6 +45,10 @@ Each module has one job and uses the shared project types.
   with reliability branching (Achterberg-Koch-Martin; Achterberg's thesis
   ch. 5). Its enumeration oracle found a dual simplex bug on first run --
   the bound-flipping exit called a feasible LP infeasible -- now fixed.
+- Added Module 28 stage 9: conflict analysis ([CIP] ch. 11, pool per Witzig
+  et al. 2017). enlight_hard and pk1 reach their optima at 60 s; gen-ip054,
+  timtab1, glass4 lose node rate to a pool scanned at every node (watched
+  literals next). A per-conflict soundness test found and fixed a real bug.
 - Added Module 28 stage 8b: root cutting planes -- Gomory (conservative, per
   Wolter 6.1) and c-MIR (Wolter's fast separator), CIP Algorithm 3.2
   selection, 15 cut-and-branch rounds. timtab1's root bound 28694 -> 421697,
@@ -2257,3 +2261,82 @@ on enlight "cutting planes deteriorate the performance, because they
 increase the size of the LP relaxations" of a pure feasibility problem.
 Cuts stay on by default (SCIP's measured default; 6 of 11 improve here);
 --mip-gomory=0 --mip-cmir=0 turns them off per instance.
+
+28, stage 9 -- conflict analysis, [CIP] chapter 11.
+
+SOURCES: [CIP] chapter 11; J. Witzig, T. Berthold, S. Heinz, "Experiments
+with Conflict Analysis in Mixed Integer Programming", CPAIOR 2017 (ZIB report
+16-63) -- [WBH] -- for the conflict pool.
+
+WHAT IT DOES. Every local bound change is recorded on a trail with its reason
+([CIP] 11.2.1's generalized conflict graph): a branching decision, a row's
+propagation (Algorithm 7.1, with the bounds it read), an earlier conflict, a
+global bound, or a reduced-cost bound. Nodes share their ancestors' trail
+segments. When a node fails -- propagation empties a domain or proves a row
+(or the objective cutoff) infeasible, or its LP is infeasible, analyzed by
+Algorithm 11.1 on the dual simplex's Farkas ray, relaxing local bounds one
+change at a time while the proof survives -- the failure's reasons are
+resolved backwards to one FUIP constraint per depth level, at most 10
+([CIP] 11.3). Conflicts are bound disjunctions (11.14) -- integer literals
+strict (x <= v-1), continuous relaxed to equality -- used only in
+propagation ([CIP] 11.3: "solely used for domain propagation").
+
+NOT IMPLEMENTED, stated: reconvergence constraints and non-chronological
+backtracking (every open node is propagated against all conflicts when it is
+selected, which prunes the same subtrees when they are reached);
+bound-exceeding LP analysis (Algorithm 11.2); dual-ray constraints ([WBH]'s
+"combined" setting).
+
+POOL, [WBH] section 3: at least 1000 and at most 50000 live conflicts,
+oldest removed first; a conflict whose proof used the objective cutoff is
+deleted once the incumbent improves by more than 5% on the one it was derived
+with. OURS: the pool size as columns + rows clamped to that range ([WBH]
+gives the range, not the formula) and the aging threshold 1000 ([CIP] and
+[WBH] both leave it unstated).
+
+TUNING VALUES CHOSEN HERE (all in Options.hpp, marked OURS, with flags):
+conflict_max_age 1000 (--mip-conflict-age), dive_allowance 1000
+(--mip-dive-allowance), propagation_row_visits 20 (--mip-prop-row-visits,
+moved out of MilpSolve.cpp), cut_violation_margin 1e-6 (--mip-cut-margin,
+moved out of MilpSeparators.cpp), and the pool-size formula above.
+
+A SOUNDNESS BUG, found by a new test before commit. milp_test now logs every
+conflict (MilpStatistics::conflict_log) and checks each one against ALL
+feasible points of 16-binary programs: a conflict may exclude none, or -- if
+its proof used the objective cutoff -- none better than its incumbent. The
+first run found 4 invalid conflicts: global bounds come only from root
+reduced-cost strengthening, which is cutoff reasoning, and dropping such a
+change from a conflict made the conflict claim more than it had proved. The
+final answers were still right -- those conflicts had never pruned an
+optimum -- which is why the answer-only oracle could not see it. Now a dropped
+global or root change is traced, through its reasons, for cutoff use.
+
+Mutants: literal negated the wrong way, LP proof over-relaxed, literal on the
+wrong side -- caught (conflicts stop firing); row reason read from the wrong
+activity side, and deduction recorded with the wrong side -- caught AS
+INVALID CONFLICTS by the per-conflict check (both survived the answer-only
+oracle); reasons read after the deduction -- hangs (resolution cycles),
+caught by a timeout.
+
+MEASURED, 60 s per instance, defaults, conflicts off -> on. The machine was
+under heavy load this run (pk1 off: 115k nodes here, 299k the day before in
+the same configuration); compare within the table only.
+
+    instance       incumbent off -> on          bound off -> on       nodes
+    enlight_hard   none -> 37 OPTIMAL           23.92 -> 26.30        31k -> 29k
+    pk1            20 -> 11 OPTIMAL             4.75 -> 5.09          115k -> 132k
+    mas74          12800.2 -> 12175.1           11070.8 -> 11052.7    117k -> 95k
+    mas76          40005.05 both (optimal)      39488.5 -> 39532.9    123k -> 173k
+    gen-ip054      6851.1 -> 6903.4 (WORSE)     6790.2 -> 6786.2      457k -> 198k
+    timtab1        939310 -> 1116999 (WORSE)    484847 -> 474671      11.6k -> 6.3k
+    glass4         2.475e9 -> 2.600e9 (WORSE)   ~same                 16k -> 19k
+    gen-ip002, markshare_4_0, neos5, assign1-5-8: same incumbent
+
+Where conflicts are reused they decide the instance: enlight_hard made 23507
+conflict deductions and 1416 conflict cutoffs and reached its optimum. Where
+they are not, they are overhead -- gen-ip054 made 7470 conflicts that fired
+17 times and lost more than half its node rate -- because this
+implementation scans the whole pool at every node. SCIP propagates set-
+covering-like constraints with watched literals ([CIP] 7.4), looking at a
+conflict only when a watched variable changes: the fix for that overhead,
+and the next step. Default ON; --mip-conflicts=0 turns it off.

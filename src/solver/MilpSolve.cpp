@@ -6,6 +6,7 @@
 #include <limits>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -136,6 +137,80 @@ struct Origin {
   bool present = false;
 };
 
+// --------------------------------------------------------------------------
+// Conflict analysis data -- [CIP] chapter 11
+// --------------------------------------------------------------------------
+
+/// Why a local bound change happened: the vertices of [CIP] 11.2.1's
+/// generalized conflict graph are bound changes, and the arcs into a vertex
+/// are its reason.
+enum class Reason : std::uint8_t {
+  Branch,    ///< a branching decision: no reason, the first vertex of its depth
+  Row,       ///< Algorithm 7.1 on row `source` (source == m: the objective row)
+  Conflict,  ///< propagation of conflict constraint `source`
+  Global,    ///< the node met a (tightened) global bound: valid everywhere
+  Leaf,      ///< local reduced cost strengthening: kept, never resolved
+};
+
+struct BoundChange {
+  std::size_t col = 0;
+  bool upper = false;       ///< changes the upper bound (else the lower)
+  Real value = 0.0;
+  Real old_value = 0.0;
+  std::size_t depth = 0;
+  Reason reason = Reason::Branch;
+  std::size_t source = 0;
+  /// Trail length when the reason's bounds were read: the deduction used the
+  /// bounds in force at that point, so its reasons are the latest changes
+  /// BEFORE it.
+  std::size_t snapshot = 0;
+  /// Row deduction from the MAX activity (the lambda side) rather than the min.
+  bool from_lambda = false;
+};
+
+/// The trail from the root to a node, shared between siblings: a node owns
+/// only its own segment and points at its parent's.
+struct TrailSegment {
+  std::shared_ptr<const TrailSegment> parent;
+  std::vector<BoundChange> changes;
+  std::size_t base = 0;
+  [[nodiscard]] std::size_t end() const noexcept { return base + changes.size(); }
+};
+
+/// One literal of a bound disjunction (11.14): `x_col <= bound` (upper) or
+/// `x_col >= bound`, canonical units.
+struct Literal {
+  std::size_t col = 0;
+  bool upper = false;
+  Real bound = 0.0;
+};
+
+struct ConflictConstraint {
+  std::vector<Literal> literals;
+  std::size_t age = 0;
+  bool alive = true;
+  /// The proof used the objective cutoff (the objective row, a conflict that
+  /// did, or a reduced-cost bound): valid only for points better than
+  /// `cutoff_value`, the canonical incumbent objective when it was derived.
+  bool uses_cutoff = false;
+  Real cutoff_value = 0.0;
+};
+
+/// Why propagation failed, for the analysis.
+struct Cause {
+  enum class Kind : std::uint8_t { None, RowMin, RowMax, Var, Conflict } kind = Kind::None;
+  std::size_t index = 0;
+  std::size_t snapshot = 0;
+};
+
+/// Records bound changes as propagation makes them.
+struct TrailWriter {
+  std::vector<BoundChange>* changes = nullptr;
+  std::size_t base = 0;
+  std::size_t depth = 0;
+  [[nodiscard]] std::size_t size() const noexcept { return base + changes->size(); }
+};
+
 struct Node {
   std::vector<Real> lower;
   std::vector<Real> upper;
@@ -152,6 +227,9 @@ struct Node {
   /// resumes from it.
   std::shared_ptr<const Basis> warm;
   Origin origin;
+  /// The bound changes from the root to this node, its branching decision
+  /// last ([CIP] chapter 11).
+  std::shared_ptr<const TrailSegment> trail;
 };
 
 /// The open nodes -- the leaves of the tree -- held so that BOTH orders
@@ -339,7 +417,30 @@ class BranchAndBound {
   /// [CIP] Algorithm 7.1 over every row (and the objective cutoff row once an
   /// incumbent exists), to a fixed point. Tightens `lower`/`upper` in place;
   /// returns false when the bounds admit no feasible point.
-  [[nodiscard]] bool propagate(std::vector<Real>& lower, std::vector<Real>& upper);
+  [[nodiscard]] bool propagate(std::vector<Real>& lower, std::vector<Real>& upper,
+                               TrailWriter* trail = nullptr, Cause* cause = nullptr);
+
+  // --- conflict analysis, [CIP] chapter 11 ----------------------------------
+  /// The node's whole trail, flattened: the segments from the root plus the
+  /// node's own changes.
+  [[nodiscard]] static std::vector<BoundChange> flatten(
+      const std::shared_ptr<const TrailSegment>& segment, const std::vector<BoundChange>& local);
+  /// Resolve an initial conflict set (trail positions) and store the
+  /// resulting FUIP conflict constraints.
+  void analyze_conflict(const std::vector<BoundChange>& trail, std::vector<std::size_t> initial,
+                        bool uses_cutoff);
+  /// Whether a propagation failure's own proof involved the cutoff.
+  [[nodiscard]] bool cause_uses_cutoff(const Cause& cause) const;
+  /// Make room in the pool (Witzig et al.): the oldest live conflicts go.
+  void trim_conflict_pool();
+  /// The initial conflict set of a propagation failure.
+  [[nodiscard]] std::vector<std::size_t> propagation_conflict(const std::vector<BoundChange>& trail,
+                                                              const Cause& cause);
+  /// [CIP] Algorithm 11.1 on the Farkas ray of an infeasible node LP.
+  [[nodiscard]] std::vector<std::size_t> lp_conflict(const std::vector<BoundChange>& trail,
+                                                     const std::vector<Real>& ray,
+                                                     const std::vector<Real>& lower,
+                                                     const std::vector<Real>& upper);
   /// [CIP] Algorithm 7.11, on every incumbent improvement.
   void root_reduced_cost_strengthening();
   [[nodiscard]] core::Status rens(const SimplexResult& root);
@@ -409,6 +510,10 @@ class BranchAndBound {
   /// containing every node-LP value it has taken during the search.
   std::vector<Real> active_min_;
   std::vector<Real> active_max_;
+
+  std::vector<ConflictConstraint> conflicts_;
+  std::size_t alive_conflicts_ = 0;
+  std::size_t oldest_alive_ = 0;
 };
 
 Real BranchAndBound::elapsed() const {
@@ -657,6 +762,17 @@ core::Status BranchAndBound::offer_incumbent(const SimplexResult& lp, Real objec
   incumbent_objective_ = objective;
   incumbent_ = std::move(*solution);
   if (options_.milp.propagation) root_reduced_cost_strengthening();
+  // Witzig et al. section 3: a conflict derived under the objective cutoff is
+  // deleted once the incumbent it was derived with is "sufficiently worse"
+  // than the new one -- 5%.
+  for (ConflictConstraint& cc : conflicts_) {
+    if (!cc.alive || !cc.uses_cutoff) continue;
+    const Real worse = cc.cutoff_value - objective;
+    if (worse > options_.milp.conflict_cutoff_drop * std::max(1.0, std::fabs(objective))) {
+      cc.alive = false;
+      --alive_conflicts_;
+    }
+  }
   return core::Status::Ok();
 }
 
@@ -1024,10 +1140,12 @@ Real min_change(Real lo, Real hi, Real bound) {
 /// l <- ceil(l - eps), in original space. Accepted per (7.3). Reduction 4
 /// (min activity above rho, max below lambda) proves the node empty.
 ///
-/// NOT from the thesis: a cap of 20 visits per row per call. [CIP] has no
-/// explicit limit -- (7.3) is what bounds the work there -- and the cap only
-/// stops propagation early, which is always safe.
-bool BranchAndBound::propagate(std::vector<Real>& lower, std::vector<Real>& upper) {
+/// NOT from the thesis: a cap on visits per row per call
+/// (MilpOptions::propagation_row_visits, default 20). [CIP] has no explicit
+/// limit -- (7.3) is what bounds the work there -- and the cap only stops
+/// propagation early, which is always safe.
+bool BranchAndBound::propagate(std::vector<Real>& lower, std::vector<Real>& upper,
+                               TrailWriter* trail, Cause* cause) {
   const model::CanonicalProblem& p = canon_.problem;
   const std::size_t m = p.num_rows();
   const std::size_t n = p.num_cols();
@@ -1045,13 +1163,39 @@ bool BranchAndBound::propagate(std::vector<Real>& lower, std::vector<Real>& uppe
   std::vector<char> queued(rows, 1);
   for (std::size_t r = 0; r < rows; ++r) queue.push_back(r);
   std::size_t visits = 0;
-  const std::size_t max_visits = 20 * rows;
+  const std::size_t max_visits = options_.milp.propagation_row_visits * rows;
+
+  auto fail = [&](Cause::Kind kind, std::size_t index, std::size_t snapshot) {
+    if (cause != nullptr) *cause = Cause{kind, index, snapshot};
+    return false;
+  };
+  auto record = [&](std::size_t j, bool up, Real value, Real old, Reason reason,
+                    std::size_t source, std::size_t snapshot, bool from_lambda) {
+    if (trail == nullptr) return;
+    trail->changes->push_back(BoundChange{j, up, value, old, trail->depth, reason, source,
+                                          snapshot, from_lambda});
+  };
+  auto requeue = [&](std::size_t j) {
+    for (std::size_t q = csc.slice_begin(j); q < csc.slice_end(j); ++q) {
+      const auto row = static_cast<std::size_t>(csc.indices()[q]);
+      if (queued[row] == 0) {
+        queued[row] = 1;
+        queue.push_back(row);
+      }
+    }
+    if (objective_row && p.c[j] != 0.0 && queued[m] == 0) {
+      queued[m] = 1;
+      queue.push_back(m);
+    }
+  };
 
   std::vector<std::pair<std::size_t, Real>> entries;
+  for (;;) {
   while (!queue.empty() && visits++ < max_visits) {
     const std::size_t r = queue.front();
     queue.pop_front();
     queued[r] = 0;
+    const std::size_t snap = trail != nullptr ? trail->size() : 0;
 
     entries.clear();
     Real lambda = -kInf;
@@ -1083,10 +1227,12 @@ bool BranchAndBound::propagate(std::vector<Real>& lower, std::vector<Real>& uppe
       if (is_finite_bound(hi_bound(j, a))) max_act += a * hi_bound(j, a); else ++max_inf;
     }
     // Reduction 4.
-    if (min_inf == 0 && min_act > rho + kPropTolerance * (1.0 + std::fabs(rho))) return false;
+    if (min_inf == 0 && min_act > rho + kPropTolerance * (1.0 + std::fabs(rho))) {
+      return fail(Cause::Kind::RowMin, r, snap);
+    }
     if (max_inf == 0 && std::isfinite(lambda) &&
         max_act < lambda - kPropTolerance * (1.0 + std::fabs(lambda))) {
-      return false;
+      return fail(Cause::Kind::RowMax, r, snap);
     }
 
     for (const auto& [j, a] : entries) {
@@ -1121,6 +1267,8 @@ bool BranchAndBound::propagate(std::vector<Real>& lower, std::vector<Real>& uppe
         if (new_hi < upper[j] &&
             (!is_finite_bound(upper[j]) ||
              new_hi < upper[j] - min_change(lower[j], upper[j], upper[j]))) {
+          // An upper bound comes from rho when a > 0, from lambda when a < 0.
+          record(j, true, new_hi, upper[j], Reason::Row, r, snap, a < 0.0);
           upper[j] = new_hi;
           changed = true;
         }
@@ -1131,28 +1279,462 @@ bool BranchAndBound::propagate(std::vector<Real>& lower, std::vector<Real>& uppe
         if (new_lo > lower[j] &&
             (!is_finite_bound(lower[j]) ||
              new_lo > lower[j] + min_change(lower[j], upper[j], lower[j]))) {
+          record(j, false, new_lo, lower[j], Reason::Row, r, snap, a > 0.0);
           lower[j] = new_lo;
           changed = true;
         }
       }
       if (!changed) continue;
       ++stats_.propagation_tightenings;
-      if (lower[j] > upper[j] + kPropTolerance * (1.0 + std::fabs(upper[j]))) return false;
+      if (lower[j] > upper[j] + kPropTolerance * (1.0 + std::fabs(upper[j]))) {
+        return fail(Cause::Kind::Var, j, trail != nullptr ? trail->size() : 0);
+      }
       if (lower[j] > upper[j]) lower[j] = upper[j];  // equal within tolerance
-      for (std::size_t q = csc.slice_begin(j); q < csc.slice_end(j); ++q) {
-        const auto row = static_cast<std::size_t>(csc.indices()[q]);
-        if (queued[row] == 0) {
-          queued[row] = 1;
-          queue.push_back(row);
-        }
-      }
-      if (objective_row && p.c[j] != 0.0 && queued[m] == 0) {
-        queued[m] = 1;
-        queue.push_back(m);
-      }
+      requeue(j);
     }
   }
+
+  // The conflict constraints ([CIP] 11.3: "solely used for domain
+  // propagation"). A bound disjunction with every literal false proves the
+  // node empty; with exactly one literal left undecided, that literal must
+  // hold. A constraint that deduces nothing ages, and is dropped at the limit.
+  bool deduced = false;
+  for (std::size_t k = 0; k < conflicts_.size(); ++k) {
+    ConflictConstraint& cc = conflicts_[k];
+    if (!cc.alive) continue;
+    std::size_t open_count = 0;
+    std::size_t open_lit = 0;
+    bool satisfied = false;
+    for (std::size_t q = 0; q < cc.literals.size() && !satisfied; ++q) {
+      const Literal& lit = cc.literals[q];
+      const Real tol = kPropTolerance * (1.0 + std::fabs(lit.bound));
+      if (lit.upper) {
+        if (upper[lit.col] <= lit.bound + tol) satisfied = true;
+        else if (lower[lit.col] <= lit.bound + tol) { ++open_count; open_lit = q; }
+      } else {
+        if (lower[lit.col] >= lit.bound - tol) satisfied = true;
+        else if (upper[lit.col] >= lit.bound - tol) { ++open_count; open_lit = q; }
+      }
+    }
+    if (satisfied) continue;
+    const std::size_t snap = trail != nullptr ? trail->size() : 0;
+    if (open_count == 0) {
+      cc.age = 0;
+      ++stats_.conflict_cutoffs;
+      return fail(Cause::Kind::Conflict, k, snap);
+    }
+    if (open_count == 1) {
+      const Literal lit = cc.literals[open_lit];
+      if (lit.upper) {
+        record(lit.col, true, lit.bound, upper[lit.col], Reason::Conflict, k, snap, false);
+        upper[lit.col] = lit.bound;
+      } else {
+        record(lit.col, false, lit.bound, lower[lit.col], Reason::Conflict, k, snap, false);
+        lower[lit.col] = lit.bound;
+      }
+      cc.age = 0;
+      ++stats_.conflict_deductions;
+      deduced = true;
+      requeue(lit.col);
+      continue;
+    }
+    if (++cc.age >= options_.milp.conflict_max_age) {
+      cc.alive = false;
+      --alive_conflicts_;
+    }
+  }
+  if (!deduced || queue.empty() || visits >= max_visits) break;
+  }
   return true;
+}
+
+// --------------------------------------------------------------------------
+// Conflict analysis -- [CIP] chapter 11
+// --------------------------------------------------------------------------
+
+std::vector<BoundChange> BranchAndBound::flatten(
+    const std::shared_ptr<const TrailSegment>& segment, const std::vector<BoundChange>& local) {
+  std::vector<const TrailSegment*> chain;
+  for (const TrailSegment* s = segment.get(); s != nullptr; s = s->parent.get()) chain.push_back(s);
+  std::vector<BoundChange> out;
+  for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+    out.insert(out.end(), (*it)->changes.begin(), (*it)->changes.end());
+  }
+  out.insert(out.end(), local.begin(), local.end());
+  return out;
+}
+
+namespace {
+
+/// Per (column, side), the trail positions of its changes, ascending -- the
+/// lookup "which change set this bound, as of trail length t".
+class TrailIndex {
+ public:
+  explicit TrailIndex(const std::vector<BoundChange>& trail) {
+    for (std::size_t pos = 0; pos < trail.size(); ++pos) {
+      index_[key(trail[pos].col, trail[pos].upper)].push_back(pos);
+    }
+  }
+  /// The latest change of (col, side) before `snapshot`, or npos.
+  [[nodiscard]] std::size_t before(std::size_t col, bool upper, std::size_t snapshot) const {
+    const auto it = index_.find(key(col, upper));
+    if (it == index_.end()) return npos;
+    const auto& v = it->second;
+    auto lb = std::lower_bound(v.begin(), v.end(), snapshot);
+    if (lb == v.begin()) return npos;
+    return *(lb - 1);
+  }
+  static constexpr std::size_t npos = std::numeric_limits<std::size_t>::max();
+
+ private:
+  static std::size_t key(std::size_t col, bool upper) { return 2 * col + (upper ? 1 : 0); }
+  std::map<std::size_t, std::vector<std::size_t>> index_;
+};
+
+}  // namespace
+
+std::vector<std::size_t> BranchAndBound::propagation_conflict(
+    const std::vector<BoundChange>& trail, const Cause& cause) {
+  const model::CanonicalProblem& p = canon_.problem;
+  const std::size_t m = p.num_rows();
+  const TrailIndex index(trail);
+  std::vector<std::size_t> out;
+  auto add = [&](std::size_t col, bool upper, std::size_t snapshot) {
+    const std::size_t pos = index.before(col, upper, snapshot);
+    if (pos != TrailIndex::npos) out.push_back(pos);
+  };
+  switch (cause.kind) {
+    case Cause::Kind::RowMin:
+    case Cause::Kind::RowMax: {
+      // The bounds the violated activity bound was built from.
+      const bool max_side = cause.kind == Cause::Kind::RowMax;
+      auto visit = [&](std::size_t j, Real a) {
+        const bool upper_bound = max_side ? a > 0.0 : a < 0.0;
+        add(j, upper_bound, cause.snapshot);
+      };
+      if (cause.index < m) {
+        const auto& csr = p.A.csr;
+        for (std::size_t q = csr.slice_begin(cause.index); q < csr.slice_end(cause.index); ++q) {
+          visit(static_cast<std::size_t>(csr.indices()[q]), csr.values()[q]);
+        }
+      } else {
+        for (std::size_t j = 0; j < p.num_cols(); ++j) {
+          if (p.c[j] != 0.0) visit(j, p.c[j]);
+        }
+      }
+      break;
+    }
+    case Cause::Kind::Var:
+      add(cause.index, false, cause.snapshot);
+      add(cause.index, true, cause.snapshot);
+      break;
+    case Cause::Kind::Conflict:
+      for (const Literal& lit : conflicts_[cause.index].literals) {
+        // "x <= w" is false because of x's LOWER bound, "x >= w" of its upper.
+        add(lit.col, !lit.upper, cause.snapshot);
+      }
+      break;
+    case Cause::Kind::None:
+      break;
+  }
+  return out;
+}
+
+/// [CIP] Algorithm 11.1, in activity form. The Farkas ray y of the dual
+/// simplex aggregates the rows into sum_j alpha_j x_j + sum_{i ineq} y_i s_i
+/// = y'b (s_i >= 0 the slacks); over the node's bounds its activity cannot
+/// reach y'b -- that gap d > 0 is [CIP]'s infeasibility measure. Local bound
+/// changes are relaxed, latest first and one change at a time ("always
+/// relaxing to the previously active bound"), while d stays positive; the
+/// changes that could not be relaxed are the initial conflict set. The side
+/// of the proof is read off the numbers (min activity above y'b, or max below
+/// it) rather than assumed from the certificate's sign convention.
+std::vector<std::size_t> BranchAndBound::lp_conflict(const std::vector<BoundChange>& trail,
+                                                     const std::vector<Real>& ray,
+                                                     const std::vector<Real>& lower,
+                                                     const std::vector<Real>& upper) {
+  std::vector<std::size_t> out;
+  const model::CanonicalProblem& p = canon_.problem;
+  const std::size_t m = p.num_rows();
+  const std::size_t n = p.num_cols();
+  if (ray.size() != m) return out;
+  std::vector<Real> alpha(n, 0.0);
+  Real beta = 0.0;
+  const auto& csr = p.A.csr;
+  for (std::size_t i = 0; i < m; ++i) {
+    if (ray[i] == 0.0) continue;
+    beta += ray[i] * p.b[i];
+    for (std::size_t q = csr.slice_begin(i); q < csr.slice_end(i); ++q) {
+      alpha[static_cast<std::size_t>(csr.indices()[q])] += ray[i] * csr.values()[q];
+    }
+  }
+  // Slacks s_i in [0, inf): a positive y_i adds [0, inf) to the activity.
+  bool slack_pos = false, slack_neg = false;
+  for (std::size_t i = p.num_equality; i < m; ++i) {
+    if (ray[i] > 0.0) slack_pos = true;
+    if (ray[i] < 0.0) slack_neg = true;
+  }
+  Real min_act = 0.0, max_act = 0.0;
+  bool min_ok = !slack_neg, max_ok = !slack_pos;
+  for (std::size_t j = 0; j < n; ++j) {
+    const Real a = alpha[j];
+    if (std::fabs(a) <= 1e-12) continue;
+    const Real lo = a > 0.0 ? lower[j] : upper[j];
+    const Real hi = a > 0.0 ? upper[j] : lower[j];
+    if (is_finite_bound(lo)) min_act += a * lo; else min_ok = false;
+    if (is_finite_bound(hi)) max_act += a * hi; else max_ok = false;
+  }
+  const Real tol = 1e-9 * (1.0 + std::fabs(beta));
+  bool max_side = false;
+  Real d = 0.0;
+  if (min_ok && min_act > beta + tol) {
+    d = min_act - beta;
+  } else if (max_ok && max_act < beta - tol) {
+    d = beta - max_act;
+    max_side = true;
+  } else {
+    return out;  // not a usable proof numerically; skip the analysis
+  }
+
+  const TrailIndex index(trail);
+  // Columns whose relevant bound is local, deepest latest change first.
+  std::vector<std::pair<std::size_t, std::size_t>> order;  // (latest position, column)
+  for (std::size_t j = 0; j < n; ++j) {
+    const Real a = alpha[j];
+    if (std::fabs(a) <= 1e-12) continue;
+    const bool upper_side = max_side ? a > 0.0 : a < 0.0;
+    const std::size_t pos = index.before(j, upper_side, trail.size());
+    if (pos != TrailIndex::npos) order.emplace_back(pos, j);
+  }
+  std::sort(order.rbegin(), order.rend());
+  for (const auto& [latest, j] : order) {
+    const Real a = std::fabs(alpha[j]);
+    const bool upper_side = max_side ? alpha[j] > 0.0 : alpha[j] < 0.0;
+    std::size_t pos = latest;
+    while (pos != TrailIndex::npos) {
+      const BoundChange& e = trail[pos];
+      if (e.reason == Reason::Global || e.depth == 0) {
+        // Not a local change, but it may rest on the objective cutoff: the
+        // analysis decides (and drops it).
+        out.push_back(pos);
+        break;
+      }
+      if (!is_finite_bound(e.old_value)) {
+        out.push_back(pos);
+        break;
+      }
+      const Real relaxed = d - a * std::fabs(e.value - e.old_value);
+      if (relaxed <= tol) {
+        out.push_back(pos);  // needed: relaxing it would lose the proof
+        break;
+      }
+      d = relaxed;
+      pos = index.before(j, upper_side, pos);
+    }
+  }
+  return out;
+}
+
+/// [CIP] 11.1.1 and 11.3: resolve the conflict set through the conflict
+/// graph, deepest level first. At each depth level, the latest resolvable
+/// change is replaced by its reasons until one change remains at that level
+/// -- its first unique implication point -- and the set is then emitted as a
+/// conflict constraint: "one FUIP conflict constraint for every depth level",
+/// at most 10 per conflict. Changes at depth 0 and changes that met a global
+/// bound hold everywhere and are dropped. Reconvergence constraints and
+/// non-chronological backtracking are not implemented: every open node is
+/// propagated against all conflicts when it is selected, which prunes the
+/// same subtrees, only when they are reached.
+bool BranchAndBound::cause_uses_cutoff(const Cause& cause) const {
+  const std::size_t m = canon_.problem.num_rows();
+  if (cause.kind == Cause::Kind::RowMin || cause.kind == Cause::Kind::RowMax) {
+    return cause.index >= m;
+  }
+  if (cause.kind == Cause::Kind::Conflict) return conflicts_[cause.index].uses_cutoff;
+  return false;
+}
+
+void BranchAndBound::trim_conflict_pool() {
+  const auto& opt = options_.milp;
+  const std::size_t size = std::clamp<std::size_t>(
+      canon_.problem.num_cols() + canon_.problem.num_rows(), opt.conflict_pool_min,
+      opt.conflict_pool_max);
+  while (alive_conflicts_ >= size && oldest_alive_ < conflicts_.size()) {
+    if (conflicts_[oldest_alive_].alive) {
+      conflicts_[oldest_alive_].alive = false;
+      --alive_conflicts_;
+    }
+    ++oldest_alive_;
+  }
+}
+
+void BranchAndBound::analyze_conflict(const std::vector<BoundChange>& trail,
+                                      std::vector<std::size_t> initial, bool uses_cutoff) {
+  ++stats_.conflicts_analyzed;
+  const model::CanonicalProblem& p = canon_.problem;
+  const std::size_t m = p.num_rows();
+  const TrailIndex index(trail);
+
+  // Whether a change that holds without branching -- a global bound, or a
+  // deduction at the root -- still rests on the objective cutoff. Global
+  // bounds are tightened only by root reduced cost strengthening (Algorithm
+  // 7.11), which is cutoff reasoning; a reduced-cost leaf is too; a row
+  // deduction is if it used the objective row or any reason that did.
+  // Dropping such a change from a conflict is right -- it holds everywhere
+  // the cutoff does -- but the conflict then holds only under the cutoff.
+  // Missing this made valid-looking conflicts that excluded worse-than-
+  // incumbent points while claiming to exclude nothing; the per-conflict
+  // enumeration check in milp_test found it.
+  std::map<std::size_t, bool> cutoff_memo;
+  std::function<bool(std::size_t)> rests_on_cutoff = [&](std::size_t pos) -> bool {
+    auto it = cutoff_memo.find(pos);
+    if (it != cutoff_memo.end()) return it->second;
+    cutoff_memo[pos] = false;  // guards against cycles; set properly below
+    const BoundChange& e = trail[pos];
+    bool result = false;
+    if (e.reason == Reason::Global || e.reason == Reason::Leaf) {
+      result = true;
+    } else if (e.reason == Reason::Row) {
+      if (e.source >= m) {
+        result = true;
+      } else {
+        const auto& csr = p.A.csr;
+        for (std::size_t q = csr.slice_begin(e.source); q < csr.slice_end(e.source) && !result;
+             ++q) {
+          const auto k = static_cast<std::size_t>(csr.indices()[q]);
+          if (k == e.col) continue;
+          const bool upper_bound = e.from_lambda ? csr.values()[q] > 0.0 : csr.values()[q] < 0.0;
+          const std::size_t r = index.before(k, upper_bound, e.snapshot);
+          if (r != TrailIndex::npos) result = rests_on_cutoff(r);
+        }
+      }
+    } else if (e.reason == Reason::Conflict) {
+      result = conflicts_[e.source].uses_cutoff;
+      for (const Literal& lit : conflicts_[e.source].literals) {
+        if (result) break;
+        if (lit.col == e.col && lit.upper == e.upper) continue;
+        const std::size_t r = index.before(lit.col, !lit.upper, e.snapshot);
+        if (r != TrailIndex::npos) result = rests_on_cutoff(r);
+      }
+    }
+    cutoff_memo[pos] = result;
+    return result;
+  };
+
+  std::set<std::size_t> set;
+  auto insert = [&](std::size_t pos) {
+    if (pos == TrailIndex::npos) return;
+    const BoundChange& e = trail[pos];
+    if (e.reason == Reason::Global || e.depth == 0) {
+      if (rests_on_cutoff(pos)) uses_cutoff = true;
+      return;
+    }
+    set.insert(pos);
+  };
+  for (std::size_t pos : initial) insert(pos);
+  if (set.empty()) return;
+
+  // Reasons of a propagated change: the bounds its row (or conflict) read.
+  auto resolve = [&](std::size_t pos) {
+    const BoundChange& e = trail[pos];
+    set.erase(pos);
+    if (e.reason == Reason::Row && e.source >= m) uses_cutoff = true;
+    if (e.reason == Reason::Conflict && conflicts_[e.source].uses_cutoff) uses_cutoff = true;
+    if (e.reason == Reason::Row) {
+      auto visit = [&](std::size_t k, Real a) {
+        if (k == e.col) return;
+        const bool upper_bound = e.from_lambda ? a > 0.0 : a < 0.0;
+        insert(index.before(k, upper_bound, e.snapshot));
+      };
+      if (e.source < m) {
+        const auto& csr = p.A.csr;
+        for (std::size_t q = csr.slice_begin(e.source); q < csr.slice_end(e.source); ++q) {
+          visit(static_cast<std::size_t>(csr.indices()[q]), csr.values()[q]);
+        }
+      } else {
+        for (std::size_t j = 0; j < p.num_cols(); ++j) {
+          if (p.c[j] != 0.0) visit(j, p.c[j]);
+        }
+      }
+    } else if (e.reason == Reason::Conflict) {
+      for (const Literal& lit : conflicts_[e.source].literals) {
+        if (lit.col == e.col && lit.upper == e.upper) continue;  // the literal it enforced
+        insert(index.before(lit.col, !lit.upper, e.snapshot));
+      }
+    }
+  };
+
+  auto emit = [&]() {
+    // Latest change per (column, side): it implies the earlier ones.
+    std::map<std::pair<std::size_t, bool>, std::size_t> latest;
+    for (std::size_t pos : set) {
+      auto key = std::make_pair(trail[pos].col, trail[pos].upper);
+      auto it = latest.find(key);
+      if (it == latest.end() || it->second < pos) latest[key] = pos;
+    }
+    ConflictConstraint cc;
+    cc.uses_cutoff = uses_cutoff;
+    for (const auto& [key, pos] : latest) {
+      if (trail[pos].reason == Reason::Leaf) cc.uses_cutoff = true;  // a reduced-cost bound
+    }
+    cc.cutoff_value = incumbent_objective_;
+    for (const auto& [key, pos] : latest) {
+      const BoundChange& e = trail[pos];
+      const Real s = integer_scale_[e.col];
+      // (11.14): the negation of each bound change, strict for integers
+      // (x < v  ->  x <= v - 1 in original units), relaxed to equality for
+      // continuous columns.
+      Real bound = e.value;
+      if (s != 0.0) {
+        const Real v = std::round(s * e.value);
+        bound = (e.upper ? v + 1.0 : v - 1.0) / s;
+      }
+      cc.literals.push_back(Literal{e.col, !e.upper, bound});
+    }
+    if (cc.literals.empty()) return false;
+    trim_conflict_pool();
+    if (stats_.conflict_log != nullptr) {
+      ConflictRecord rec;
+      rec.uses_cutoff = cc.uses_cutoff;
+      rec.incumbent = have_incumbent_ ? incumbent_.objective : 0.0;
+      for (const Literal& lit : cc.literals) {
+        rec.literals.push_back(ConflictRecord::Literal{original_of_[lit.col], lit.upper,
+                                                       lit.bound * scale_of_[lit.col]});
+      }
+      stats_.conflict_log->push_back(std::move(rec));
+    }
+    conflicts_.push_back(std::move(cc));
+    ++alive_conflicts_;
+    ++stats_.conflict_constraints;
+    return true;
+  };
+
+  std::size_t max_depth = 0;
+  for (std::size_t pos : set) max_depth = std::max(max_depth, trail[pos].depth);
+  std::size_t emitted = 0;
+  std::set<std::size_t> last;
+  for (std::size_t d = max_depth; d >= 1 && emitted < 10; --d) {
+    for (;;) {
+      std::size_t at_level = 0;
+      std::size_t candidate = TrailIndex::npos;
+      for (auto it = set.rbegin(); it != set.rend(); ++it) {
+        const BoundChange& e = trail[*it];
+        if (e.depth != d) continue;
+        ++at_level;
+        if (candidate == TrailIndex::npos &&
+            (e.reason == Reason::Row || e.reason == Reason::Conflict)) {
+          candidate = *it;
+        }
+      }
+      if (at_level <= 1 || candidate == TrailIndex::npos) break;
+      resolve(candidate);
+    }
+    if (set.empty()) break;
+    if (set != last) {
+      if (emit()) ++emitted;
+      last = set;
+    }
+  }
 }
 
 /// [CIP] Algorithm 7.11. With c_R, x_R, r_R the root LP's objective, point and
@@ -1636,15 +2218,43 @@ core::Expected<Solution> BranchAndBound::run() {
     // [CIP] chapter 7: the node's bounds, intersected with the global ones,
     // propagated to a fixed point before the LP sees them. A node proven empty
     // here is pruned exactly as an infeasible LP would prune it.
+    // [CIP] chapter 11: this node's own bound changes, on top of the trail
+    // it inherited. Recorded only when conflicts are analyzed.
+    const bool conflicts_on = m.propagation && m.conflict_analysis;
+    std::vector<BoundChange> local;
+    TrailWriter writer{&local, node.trail ? node.trail->end() : 0, node.depth};
     if (m.propagation) {
+      std::size_t empty_col = n;
       for (std::size_t j = 0; j < n; ++j) {
-        node.lower[j] = std::max(node.lower[j], global_lower_[j]);
-        node.upper[j] = std::min(node.upper[j], global_upper_[j]);
+        if (global_lower_[j] > node.lower[j]) {
+          if (conflicts_on) {
+            local.push_back(BoundChange{j, false, global_lower_[j], node.lower[j], node.depth,
+                                        Reason::Global, 0, writer.size(), false});
+          }
+          node.lower[j] = global_lower_[j];
+        }
+        if (global_upper_[j] < node.upper[j]) {
+          if (conflicts_on) {
+            local.push_back(BoundChange{j, true, global_upper_[j], node.upper[j], node.depth,
+                                        Reason::Global, 0, writer.size(), false});
+          }
+          node.upper[j] = global_upper_[j];
+        }
+        if (empty_col == n && node.lower[j] > node.upper[j]) empty_col = j;
       }
-      bool empty = false;
-      for (std::size_t j = 0; j < n && !empty; ++j) empty = node.lower[j] > node.upper[j];
-      if (empty || !propagate(node.lower, node.upper)) {
+      Cause cause;
+      bool feasible = empty_col == n;
+      if (!feasible) {
+        cause = Cause{Cause::Kind::Var, empty_col, writer.size()};
+      } else {
+        feasible = propagate(node.lower, node.upper, conflicts_on ? &writer : nullptr, &cause);
+      }
+      if (!feasible) {
         ++stats_.propagation_cutoffs;
+        if (conflicts_on && cause.kind != Cause::Kind::None) {
+          const auto trail = flatten(node.trail, local);
+          analyze_conflict(trail, propagation_conflict(trail, cause), cause_uses_cutoff(cause));
+        }
         continue;
       }
     }
@@ -1656,7 +2266,17 @@ core::Expected<Solution> BranchAndBound::run() {
     stats_.node_lp_iterations += lp->iterations;
     ++solved_node_lps_;
 
-    if (lp->status == SolverStatus::Infeasible) continue;
+    if (lp->status == SolverStatus::Infeasible) {
+      if (conflicts_on && !lp->infeasibility_certificate.empty()) {
+        const auto trail = flatten(node.trail, local);
+        // The node LP carries no objective row: its infeasibility proof is
+        // cutoff-free (reduced-cost bounds in the set still mark it).
+        analyze_conflict(trail,
+                         lp_conflict(trail, lp->infeasibility_certificate, node.lower, node.upper),
+                         false);
+      }
+      continue;
+    }
     if (lp->status == SolverStatus::Unbounded) {
       if (stats_.nodes == 1) {
         return core::make_error(core::ErrorCode::Unbounded,
@@ -1766,6 +2386,10 @@ core::Expected<Solution> BranchAndBound::run() {
             continue;
           }
           if (u < node.upper[j]) {
+            if (conflicts_on) {
+              local.push_back(BoundChange{j, true, u, node.upper[j], node.depth, Reason::Leaf, 0,
+                                          writer.size(), false});
+            }
             node.upper[j] = u;
             ++stats_.local_redcost_tightenings;
           }
@@ -1778,6 +2402,10 @@ core::Expected<Solution> BranchAndBound::run() {
             continue;
           }
           if (l > node.lower[j]) {
+            if (conflicts_on) {
+              local.push_back(BoundChange{j, false, l, node.lower[j], node.depth, Reason::Leaf, 0,
+                                          writer.size(), false});
+            }
             node.lower[j] = l;
             ++stats_.local_redcost_tightenings;
           }
@@ -1795,6 +2423,14 @@ core::Expected<Solution> BranchAndBound::run() {
     // pushed" that way. Section 6.3 applies it during plunging. The thesis
     // gives no rule for a value equal to the root's; up is taken then.
     const bool up_first = c.value >= root_values_[c.column];
+    std::shared_ptr<const TrailSegment> own_segment;
+    if (conflicts_on) {
+      auto seg = std::make_shared<TrailSegment>();
+      seg->parent = node.trail;
+      seg->base = node.trail ? node.trail->end() : 0;
+      seg->changes = std::move(local);
+      own_segment = std::move(seg);
+    }
     for (int side = 0; side < 2; ++side) {
       const bool up = side == 0 ? up_first : !up_first;
       if (up ? c.up_infeasible : c.down_infeasible) continue;
@@ -1814,6 +2450,18 @@ core::Expected<Solution> BranchAndBound::run() {
       child.depth = node.depth + 1;
       child.warm = basis;
       child.origin = Origin{c.column, up, up ? c.frac_up : c.frac_down, lp->objective, true};
+      if (conflicts_on) {
+        // The branching decision: the first vertex of the child's depth level.
+        auto seg = std::make_shared<TrailSegment>();
+        seg->parent = own_segment;
+        seg->base = own_segment->end();
+        const std::size_t j = ic.canonical;
+        seg->changes.push_back(up ? BoundChange{j, false, child.lower[j], node.lower[j],
+                                                child.depth, Reason::Branch, 0, seg->base, false}
+                                  : BoundChange{j, true, child.upper[j], node.upper[j],
+                                                child.depth, Reason::Branch, 0, seg->base, false});
+        child.trail = std::move(seg);
+      }
       children.push_back(open.insert(std::move(child)));
     }
   }
@@ -1883,7 +2531,9 @@ core::Expected<Solution> solve_milp(const Problem& problem, const Options& optio
   const auto start = std::chrono::steady_clock::now();
   MilpStatistics local;
   MilpStatistics& stats = statistics != nullptr ? *statistics : local;
+  auto* const conflict_log = stats.conflict_log;  // a hook the caller set, not a statistic
   stats = MilpStatistics{};
+  stats.conflict_log = conflict_log;
 
   if (!problem.has_discrete()) return solve_lp(problem, options);
   if (problem.has_quadratic()) {
@@ -1978,7 +2628,8 @@ core::Expected<Solution> solve_milp(const Problem& problem, const Options& optio
     for (const IntegerColumn& ic : integers) integer_scale[ic.canonical] = ic.scale;
     std::vector<Real> lo(canon->problem.col_lower.data(), canon->problem.col_lower.data() + n);
     std::vector<Real> hi(canon->problem.col_upper.data(), canon->problem.col_upper.data() + n);
-    SeparationInput in{&canon->problem, &integer_scale, &lo, &hi};
+    SeparationInput in{&canon->problem, &integer_scale, &lo, &hi,
+                       options.milp.cut_violation_margin};
     CmirState cmir_state;
     model::Options lp_options = options;
     lp_options.simplex.method = model::Method::DualSimplex;

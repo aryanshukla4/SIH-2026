@@ -39,10 +39,12 @@ Real mir_function(Real d, Real f) {
   return std::floor(d) + std::max(fd - f, 0.0) / (1.0 - f);
 }
 
-/// A cut is "violated" when its left side exceeds the right by more than this.
-/// OURS: [CIP] and [W] compare against zero; a positive margin keeps cuts that
-/// are violated only by rounding out of the LP.
-bool violated(Real lhs, Real rhs) { return lhs - rhs > 1e-6 * std::max(1.0, std::fabs(rhs)); }
+/// A cut is "violated" when its left side exceeds the right by more than
+/// `margin` (MilpOptions::cut_violation_margin, OURS -- [CIP] and [W] compare
+/// against zero), relative to max(1, |rhs|).
+bool violated(Real lhs, Real rhs, Real margin) {
+  return lhs - rhs > margin * std::max(1.0, std::fabs(rhs));
+}
 
 /// Integer bounds of an integer column in ORIGINAL units, or infinite.
 Real int_lower(Real lb, Real s) {
@@ -267,7 +269,7 @@ std::vector<Cut> separate_gomory(const SeparationInput& in, const simplex::Simpl
     Cut cut = builder.finish();
     if (cut.terms.empty()) continue;
     if (!scale_integral(cut, scale)) continue;
-    if (violated(activity(cut, lp.x), cut.rhs)) out.push_back(std::move(cut));
+    if (violated(activity(cut, lp.x), cut.rhs, in.violation_margin)) out.push_back(std::move(cut));
   }
   return out;
 }
@@ -287,6 +289,7 @@ class CmirSeparator {
         upper_(*in.upper),
         x_(lp.x),
         y_(lp.y),
+        margin_(in.violation_margin),
         state_(state),
         n_(p_.num_cols()),
         m_(p_.num_rows()),
@@ -672,7 +675,7 @@ class CmirSeparator {
     }
     cut = builder_.finish();
     if (cut.terms.empty()) return false;
-    return violated(activity(cut, x_), cut.rhs);
+    return violated(activity(cut, x_), cut.rhs, margin_);
   }
 
   const model::CanonicalProblem& p_;
@@ -681,6 +684,7 @@ class CmirSeparator {
   const std::vector<Real>& upper_;
   const std::vector<Real>& x_;
   const std::vector<Real>& y_;
+  Real margin_;
   CmirState& state_;
   std::size_t n_;
   std::size_t m_;
