@@ -45,7 +45,9 @@
 //             backtracking, rotating fractionality, coefficient, line search
 //             and pseudocost diving (9.2.1, 9.2.2, 9.2.4, 9.2.5) under the 5%
 //             iteration quota. No domain propagation (step 6): this engine
-//             has none.
+//             has none. At the root, the objective feasibility pump (9.3.3,
+//             Berthold 2006 Algorithm 3 stages 1-2, SCIP's +-1/0 costs for
+//             general integers) and RENS (9.1.1) on this same search.
 //
 // WHAT THE SEARCH WORKS ON. The model is canonicalized and scaled ONCE, at the
 // root, and a node is just a set of canonical column bounds. Canonicalization
@@ -110,6 +112,14 @@ struct MilpStatistics {
   std::size_t dive_lp_iterations = 0;
   std::size_t dive_solutions = 0;
   std::size_t rounding_solutions = 0;
+  /// Feasibility pump rounds (LP solves) and whether it found a point; RENS
+  /// sub-MIP nodes and whether it improved the incumbent. Their LP work is
+  /// NOT in node_lp_iterations.
+  std::size_t pump_rounds = 0;
+  std::size_t pump_lp_iterations = 0;
+  std::size_t pump_solutions = 0;
+  std::size_t rens_nodes = 0;
+  std::size_t rens_solutions = 0;
 };
 
 /// Solves a mixed-integer LINEAR program. A model with no discrete columns is
