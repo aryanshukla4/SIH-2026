@@ -40,6 +40,12 @@
 //             `e_Q = c_Q + sum min{Psi- f-, Psi+ f+}`; plunge limits and the
 //             0.25 gap abort from section 6.3; child order by Martin's rule
 //             (section 6.1). Pure best first (section 6.2) remains selectable.
+//   heuristics [CIP] chapter 9: simple rounding (9.1.2) on every node LP,
+//             and the generic dive of Algorithm 9.1 with one-level
+//             backtracking, rotating fractionality, coefficient, line search
+//             and pseudocost diving (9.2.1, 9.2.2, 9.2.4, 9.2.5) under the 5%
+//             iteration quota. No domain propagation (step 6): this engine
+//             has none.
 //
 // WHAT THE SEARCH WORKS ON. The model is canonicalized and scaled ONCE, at the
 // root, and a node is just a set of canonical column bounds. Canonicalization
@@ -89,7 +95,8 @@ struct MilpStatistics {
   std::size_t unreliable_nodes = 0;
   /// Root cover/GCD cuts appended before the search.
   std::size_t root_cuts = 0;
-  /// Integer-feasible node LPs that improved the incumbent, and the node count
+  /// Points that improved the incumbent (integral node LPs and heuristics
+  /// alike), and the node count
   /// at which the first one was found. Node selection ([CIP] chapter 6) is
   /// judged on these as much as on the bound.
   std::size_t incumbents = 0;
@@ -97,6 +104,12 @@ struct MilpStatistics {
   /// Nodes chosen by continuing a plunge (a child or sibling of the node just
   /// processed) rather than from the leaf queue.
   std::size_t plunge_steps = 0;
+  /// [CIP] chapter 9: dives started, the LP iterations they spent (NOT part
+  /// of node_lp_iterations), and incumbents found by each heuristic.
+  std::size_t dives = 0;
+  std::size_t dive_lp_iterations = 0;
+  std::size_t dive_solutions = 0;
+  std::size_t rounding_solutions = 0;
 };
 
 /// Solves a mixed-integer LINEAR program. A model with no discrete columns is

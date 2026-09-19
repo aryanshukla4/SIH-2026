@@ -337,6 +337,22 @@ struct MilpOptions {
   /// [CIP] section 6.3: 0.25.
   Real plunge_max_gap = 0.25;
 
+  /// Primal heuristics, [CIP] chapter 9: simple rounding after every node LP
+  /// (9.1.2) and diving (Algorithm 9.1, section 9.2).
+  bool heuristics = true;
+
+  /// Diving's LP iterations may not exceed this fraction of the node-LP
+  /// iterations: "we demand that this number must stay below 5% of the
+  /// current total number of simplex iterations used for solving the regular
+  /// LP relaxations" ([CIP] section 9.2).
+  Real dive_quota = 0.05;
+
+  /// Added to the quota above. NOT from the thesis: at the root the node-LP
+  /// total is one LP's worth, so a pure 5% would forbid the first dive
+  /// outright. The per-heuristic offsets SCIP uses are in Berthold's diploma
+  /// thesis ([CIP] reference [41]), which this code has not seen.
+  std::size_t dive_allowance = 1000;
+
   /// `eta_rel`: pseudocosts count as reliable once both directions have been
   /// observed at least this often. Thesis section 5.7: 8. Zero turns
   /// reliability branching into plain pseudocost branching.
