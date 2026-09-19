@@ -8,6 +8,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <tuple>
 #include <utility>
@@ -17,6 +18,7 @@
 #include "sovsolve/solver/LpSolve.hpp"
 #include "sovsolve/solver/MilpCuts.hpp"
 #include "sovsolve/solver/MilpPresolve.hpp"
+#include "sovsolve/solver/MilpSeparators.hpp"
 #include "sovsolve/solver/Scaler.hpp"
 #include "sovsolve/solver/SolutionReconstructor.hpp"
 #include "sovsolve/solver/simplex/PrimalSimplex.hpp"
@@ -304,6 +306,14 @@ class BranchAndBound {
 
   core::Expected<Solution> run();
 
+  /// Root cuts were appended to the canonical problem: solutions are rebuilt
+  /// against `plain`, the same model without them (MilpSolve.cpp, stage 8b).
+  void set_reconstruction(const model::CanonicalResult* plain) { plain_ = plain; }
+  /// The cut loop's last basis, so the root LP resumes instead of restarting.
+  void set_root_basis(simplex::Basis basis) {
+    root_basis_ = std::make_shared<const Basis>(std::move(basis));
+  }
+
  private:
   core::Expected<SimplexResult> solve_with(const std::vector<Real>& lower,
                                            const std::vector<Real>& upper,
@@ -377,6 +387,8 @@ class BranchAndBound {
   std::vector<std::size_t> original_of_;
   std::vector<Real> scale_of_;
   std::size_t last_improvement_node_ = 0;
+  const model::CanonicalResult* plain_ = nullptr;
+  std::shared_ptr<const Basis> root_basis_;
 
   // --- domain propagation, [CIP] chapter 7 ----------------------------------
   /// Global bounds: the root's, tightened by root reduced cost strengthening.
@@ -609,6 +621,18 @@ Real BranchAndBound::estimate(const std::vector<Candidate>& candidates, Real bou
 }
 
 core::Expected<Solution> BranchAndBound::incumbent_solution(const SimplexResult& lp) {
+  if (plain_ != nullptr) {
+    // Cut rows are appended at the END (MilpSeparators.hpp), so the plain
+    // model's rows and logicals are a prefix: truncate and rebuild against it.
+    const std::size_t n = plain_->problem.num_cols();
+    const std::size_t m0 = plain_->problem.num_rows();
+    SimplexResult r = lp;
+    r.x.resize(n + m0);
+    r.y.resize(m0);
+    r.reduced_cost.resize(n + m0);
+    const Solution canonical = simplex::to_canonical_solution(plain_->problem, r);
+    return reconstruct_solution(working_, plain_->problem, plain_->transforms, canonical);
+  }
   const Solution canonical = simplex::to_canonical_solution(canon_.problem, lp);
   return reconstruct_solution(working_, canon_.problem, canon_.transforms, canonical);
 }
@@ -1520,6 +1544,7 @@ core::Expected<Solution> BranchAndBound::run() {
     }
     root.bound = -kInf;
     root.estimate = -kInf;
+    root.warm = root_basis_;
     open.insert(std::move(root));
   }
 
@@ -1940,7 +1965,79 @@ core::Expected<Solution> solve_milp(const Problem& problem, const Options& optio
     integers.push_back(IntegerColumn{j, orig, column_scale[j]});
   }
 
+  // ---- Root cutting planes (stage 8b): cut-and-branch, [CIP] 8.10. ----
+  // Rounds of: solve the LP, separate GMI and c-MIR cuts against it, select
+  // by [CIP] Algorithm 3.2, append the selected cuts as rows. Stops at
+  // `cut_rounds` (Wolter's MAXROUNDS = 15), an integral or non-optimal LP, or
+  // a round that selects nothing.
+  std::optional<model::CanonicalResult> plain;
+  std::optional<simplex::Basis> cut_basis;
+  if ((options.milp.gomory_cuts || options.milp.cmir_cuts) && !integers.empty()) {
+    const std::size_t n = canon->problem.num_cols();
+    std::vector<Real> integer_scale(n, 0.0);
+    for (const IntegerColumn& ic : integers) integer_scale[ic.canonical] = ic.scale;
+    std::vector<Real> lo(canon->problem.col_lower.data(), canon->problem.col_lower.data() + n);
+    std::vector<Real> hi(canon->problem.col_upper.data(), canon->problem.col_upper.data() + n);
+    SeparationInput in{&canon->problem, &integer_scale, &lo, &hi};
+    CmirState cmir_state;
+    model::Options lp_options = options;
+    lp_options.simplex.method = model::Method::DualSimplex;
+    for (std::size_t round = 0; round < options.milp.cut_rounds; ++round) {
+      auto lp = simplex::solve_simplex(canon->problem, lp_options,
+                                       cut_basis.has_value() ? &*cut_basis : nullptr);
+      if (!lp.has_value()) return lp.error();
+      if (lp->status != SolverStatus::Optimal) break;
+      if (round == 0) stats.root_bound_before_cuts = lp->objective;
+      stats.root_bound_after_cuts = lp->objective;
+      bool integral = true;
+      for (const IntegerColumn& ic : integers) {
+        const Real v = ic.scale * lp->x[ic.canonical];
+        if (std::fabs(v - std::round(v)) > options.milp.integer_tolerance) {
+          integral = false;
+          break;
+        }
+      }
+      if (integral) break;
+
+      std::vector<Cut> cuts;
+      if (options.milp.gomory_cuts) {
+        auto g = separate_gomory(in, *lp);
+        stats.gomory_cuts += g.size();
+        for (auto& c : g) cuts.push_back(std::move(c));
+      }
+      if (options.milp.cmir_cuts) {
+        auto c = separate_cmir(in, *lp, round, cmir_state);
+        stats.cmir_cuts += c.size();
+        for (auto& k : c) cuts.push_back(std::move(k));
+      }
+      const std::vector<Real> x(lp->x.begin(), lp->x.begin() + static_cast<std::ptrdiff_t>(n));
+      // [CIP] 3.3.8: at most 2000 cuts enter per root round.
+      std::vector<Cut> chosen = select_cuts(std::move(cuts), canon->problem, x, 2000);
+      if (chosen.empty()) break;
+
+      if (!plain.has_value()) {
+        // The cut-free model, for rebuilding solutions. Canonicalization and
+        // scaling are deterministic, so this is the model the search began on.
+        auto again = model::canonicalize(working, options);
+        if (!again.has_value()) return again.error();
+        if (const auto st = scale(again->problem, options, again->transforms); !st.ok()) {
+          return st.error();
+        }
+        plain = std::move(*again);
+      }
+      simplex::Basis basis = lp->basis;
+      if (const auto st = append_cuts(canon->problem, chosen, &basis); !st.ok()) {
+        return st.error();
+      }
+      cut_basis = std::move(basis);
+      stats.cuts_added += chosen.size();
+      ++stats.cut_rounds;
+    }
+  }
+
   BranchAndBound search(working, *canon, std::move(integers), options, stats);
+  if (plain.has_value()) search.set_reconstruction(&*plain);
+  if (cut_basis.has_value()) search.set_root_basis(std::move(*cut_basis));
   auto result = search.run();
   if (!result.has_value()) return result.error();
 

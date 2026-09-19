@@ -45,6 +45,10 @@ Each module has one job and uses the shared project types.
   with reliability branching (Achterberg-Koch-Martin; Achterberg's thesis
   ch. 5). Its enumeration oracle found a dual simplex bug on first run --
   the bound-flipping exit called a feasible LP infeasible -- now fixed.
+- Added Module 28 stage 8b: root cutting planes -- Gomory (conservative, per
+  Wolter 6.1) and c-MIR (Wolter's fast separator), CIP Algorithm 3.2
+  selection, 15 cut-and-branch rounds. timtab1's root bound 28694 -> 421697,
+  mas76 reaches its optimum; enlight_hard loses its incumbent -- recorded.
 - Added Module 28 stage 8a: local reduced cost strengthening ([CIP] 8.8)
   at every node. mas74 and gen-ip054 improve, glass4 worsens. Cuts proper
   wait on Wolter's thesis for the details [CIP] leaves out.
@@ -2164,3 +2168,92 @@ NOT the c-MIR aggregation row score ("depends on the dual solution, the
 density, and the slack") nor the conservative Gomory criteria. Both are in
 Wolter's diploma thesis ([CIP] reference [218]) and Marchand and Wolsey
 (2001); requested rather than invented.
+
+28, stage 8b -- root cutting planes: Gomory mixed integer and c-MIR.
+
+SOURCE ADDED: [W] K. Wolter, "Implementation of Cutting Plane Separators for
+Mixed Integer Programs", diploma thesis, TU Berlin / ZIB (2006) -- [CIP]'s
+reference [218]. It supplies what [CIP] left out: the c-MIR aggregation row
+score and the GMI numerical safeguards. New module: solver/MilpSeparators.
+
+WHERE. Cut-and-branch, as [CIP] 8.10 measures SCIP's default: rounds at the
+root only, in canonical space, before the search. Each round solves the LP
+(warm), separates, selects, and APPENDS the selected cuts as inequality rows
+-- at the end, so every existing row, column and logical keeps its index and
+the basis extends by the new logicals. Up to 15 rounds ([W] MAXROUNDS); stops
+on an integral or non-optimal LP or a round that selects nothing. The root
+node then resumes from the loop's last basis. Solutions are rebuilt against a
+cut-free copy of the canonical model (canonicalization is deterministic), the
+cut rows being a suffix that is simply truncated.
+
+INTEGRALITY IN ORIGINAL UNITS. A canonical column is x_original / s, so both
+separators work in v_j = s_j x_j and translate cuts back.
+
+GMI, [CIP] (8.4)-(8.5) -- the MIR of Proposition 8.3 on a simplex tableau
+row: for each basic integer column with fractional part >= 0.05 ([W] 6.1),
+the row B^-1 e_r' Ahat from a fresh factorization of the optimal basis (none
+if it needs repair), nonbasics substituted onto the bound they rest on, MIR
+with delta = 1, logicals back-substituted as b - A x. [W] 6.1's safeguard, the
+"conservative" Gomory [CIP] 8.10 found better than SCIP's aggressive default:
+each integer coefficient must be p/q with q <= 1000; the cut is multiplied by
+lcm/gcd and DISCARDED if that exceeds 1000.
+
+c-MIR, [W] chapter 3, the "resulting algorithm (fast version)": starting rows
+by CONSSCORE; Algorithm 3.2 aggregation with Score Type 3 (dual value,
+density, tightness, 0.9^l), MAXAGGR = 5, MAXCONTS = 20, factor ratio <= 10^4;
+Algorithm 3.3 bound substitution (Criteria F3, S3 -- closer simple bound;
+this engine has no variable bounds); Algorithm 3.4 cut generation
+(Procedure 1, extended delta set, MAXTESTDELTA = 10, delta/2,4,8, then extra
+complementation), f in [0.05, 0.95]; MAXFAILS = 150 (+ early-round bonus),
+MAXCUTS = 100 per round.
+READING, stated in the code: Score Type 3's dual term prints as
+"max{max{db_i/||(c,d)||, 1.0}, 0.0001}", whose outer floor could never bind;
+read as max{min{...,1}, 1e-4}, the only form in which every constant matters.
+
+SELECTION, [CIP] Algorithm 3.2: score = efficacy + 0.1 parallelism +
+orthogonality, minimum orthogonality 0.5, at most 2000 per root round.
+OURS: a cut counts as violated only by more than 1e-6 (relative), where
+[CIP]/[W] compare against zero.
+
+TESTS (milp_test): the 9-variable oracle with cuts on and off, both exact,
+requiring GMI and c-MIR cuts to be generated, cuts to enter, the root bound
+to improve somewhere and never to worsen. A NEW MIXED-INTEGER ORACLE --
+three integer and three continuous columns (bounds [0,5], [-3,4], [0,inf)),
+optimum by enumerating the integer points and solving the continuous LP at
+each -- because the pure-integer oracle has no continuous structural columns
+and so never exercises c-MIR's bound substitution; one mutant survived until
+it existed. Tests of single components (plunging, rounding, pump, RENS) now
+run without cuts, which otherwise solve those small programs at the root and
+leave the component nothing to do. Mutants caught: MIR function's 1-f, the
+GMI continuous term's sign, a complemented integer's constant, the slack
+back-substitution sign, the c-MIR upper-bound substitution sign (via the
+mixed oracle), the GMI floor.
+
+WHY SOME INSTANCES GET NO CUTS, checked rather than assumed: on pk1 every GMI
+row fails [W]'s scaling test (coefficients like -0.4634 and 0.9898, whose
+denominators exceed 1000 -- determinants of a 45-row integer basis), and no
+c-MIR aggregation yields a violated inequality. [W]'s own c-MIR table shows
+pk1, mas74 and mas76 at 0.00% gap closed with 0 cuts. gen-ip002 and
+assign1-5-8: likewise nothing violated.
+
+MEASURED, MIPLIB, 20000 nodes, defaults, cuts off -> on:
+
+    instance       root bound off -> on       incumbent off -> on         optimum
+    timtab1        28694 -> 421697            1104166 -> 904188           764772
+                   (final bound 250801 -> 493450; 13s -> 98s)
+    mas76          38893.9 -> 38997.7         40560.1 -> 40005.05 OPTIMAL 40005.05
+    markshare_4_0  -3082 -> -3082 (no move)   10 -> 3                     1
+    glass4         8.000024e8 -> 8.000030e8   2.6900e9 -> 2.4500e9        1.2000e9
+    mas74          10482.8 -> 10549.5         12925.3 -> 12800.2          11801.19
+    gen-ip054      6765.2 -> 6766.6           6922.4 -> 6920.6            6840.97
+    neos5          13 -> 13.30                15 -> 15 (26.8s vs 9.6s)    15
+    enlight_hard   (no root bound gain)       37 -> NONE (WORSE), 3s->17s 37
+    pk1, gen-ip002, assign1-5-8: no cuts generated; unchanged
+
+timtab1 is the case cuts exist for: 15 rounds, 790 cuts, the root bound
+14.7x higher, the search's bound doubled and a much better incumbent.
+enlight_hard REGRESSES -- no incumbent at all -- exactly as [CIP] 8.10 warns:
+on enlight "cutting planes deteriorate the performance, because they
+increase the size of the LP relaxations" of a pure feasibility problem.
+Cuts stay on by default (SCIP's measured default; 6 of 11 improve here);
+--mip-gomory=0 --mip-cmir=0 turns them off per instance.
