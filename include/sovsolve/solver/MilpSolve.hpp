@@ -129,6 +129,9 @@ struct MilpStatistics {
   std::size_t propagation_tightenings = 0;
   std::size_t propagation_cutoffs = 0;
   std::size_t redcost_tightenings = 0;
+  /// [CIP] 8.8: LOCAL bounds tightened at a node by its own LP's reduced
+  /// costs, inherited by its subtree.
+  std::size_t local_redcost_tightenings = 0;
 };
 
 /// Solves a mixed-integer LINEAR program. A model with no discrete columns is

@@ -549,6 +549,7 @@ int main(int argc, char** argv) {
       std::printf("propagation_tightenings=%zu\n", milp_stats.propagation_tightenings);
       std::printf("propagation_cutoffs=%zu\n", milp_stats.propagation_cutoffs);
       std::printf("redcost_tightenings=%zu\n", milp_stats.redcost_tightenings);
+      std::printf("local_redcost_tightenings=%zu\n", milp_stats.local_redcost_tightenings);
     }
   }
 
