@@ -7,6 +7,7 @@ add_library(sovsolve_solver STATIC
   SolutionQuality.cpp
   Iis.cpp
   DualBound.cpp
+  MilpCanonicalPresolve.cpp
   MilpCuts.cpp
   MilpSeparators.cpp
   MilpSolve.cpp

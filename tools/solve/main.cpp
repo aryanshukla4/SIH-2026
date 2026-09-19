@@ -133,6 +133,8 @@ void print_usage(const char* argv0) {
       "  --mip-dive-allowance=N  MilpOptions::dive_allowance (default 1000)\n"
       "  --mip-prop-row-visits=N  MilpOptions::propagation_row_visits (default 20)\n"
       "  --mip-cut-margin=X    MilpOptions::cut_violation_margin (default 1e-6)\n"
+      "  --mip-presolve=0|1    MilpOptions::presolve (default 1): CIP ch. 10\n"
+      "  --mip-presolve-rounds=N  MilpOptions::presolve_rounds (default 20, OURS)\n"
       "  --mip-gomory=0|1      MilpOptions::gomory_cuts (default 1)\n"
       "  --mip-cmir=0|1        MilpOptions::cmir_cuts (default 1)\n"
       "  --mip-cut-rounds=N    MilpOptions::cut_rounds (default 15)\n"
@@ -260,6 +262,10 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.milp.dive_allowance = static_cast<std::size_t>(std::stoul(val));
     } else if (key == "mip-conflicts") {
       options.milp.conflict_analysis = (val != "0");
+    } else if (key == "mip-presolve") {
+      options.milp.presolve = (val != "0");
+    } else if (key == "mip-presolve-rounds") {
+      options.milp.presolve_rounds = static_cast<std::size_t>(std::stoul(val));
     } else if (key == "mip-gomory") {
       options.milp.gomory_cuts = (val != "0");
     } else if (key == "mip-cmir") {
@@ -575,6 +581,11 @@ int main(int argc, char** argv) {
       std::printf("propagation_cutoffs=%zu\n", milp_stats.propagation_cutoffs);
       std::printf("redcost_tightenings=%zu\n", milp_stats.redcost_tightenings);
       std::printf("local_redcost_tightenings=%zu\n", milp_stats.local_redcost_tightenings);
+      std::printf("presolve_rounds=%zu\n", milp_stats.presolve_rounds);
+      std::printf("presolve_bounds=%zu\n", milp_stats.presolve_bounds);
+      std::printf("presolve_coefficients=%zu\n", milp_stats.presolve_coefficients);
+      std::printf("presolve_rows_removed=%zu\n", milp_stats.presolve_rows_removed);
+      std::printf("presolve_fixed=%zu\n", milp_stats.presolve_fixed);
       std::printf("cut_rounds=%zu\n", milp_stats.cut_rounds);
       std::printf("gomory_cuts=%zu\n", milp_stats.gomory_cuts);
       std::printf("cmir_cuts=%zu\n", milp_stats.cmir_cuts);
