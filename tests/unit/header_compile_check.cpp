@@ -48,6 +48,7 @@
 #include "sovsolve/solver/simplex/SolveSimplex.hpp"
 #include "sovsolve/solver/pdlp/DualityGap.hpp"
 #include "sovsolve/solver/pdlp/Infeasibility.hpp"
+#include "sovsolve/solver/pdlp/IterationBackend.hpp"
 #include "sovsolve/solver/pdlp/MatVec.hpp"
 #include "sovsolve/solver/pdlp/Pdlp.hpp"
 #include "sovsolve/solver/pdlp/PdlpSolution.hpp"

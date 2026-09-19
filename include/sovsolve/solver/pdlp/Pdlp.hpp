@@ -161,6 +161,7 @@
 #include "sovsolve/core/Vector.hpp"
 #include "sovsolve/model/Canonical.hpp"
 #include "sovsolve/model/Options.hpp"
+#include "sovsolve/solver/pdlp/IterationBackend.hpp"
 #include "sovsolve/solver/pdlp/MatVec.hpp"
 
 namespace sovsolve::solver::pdlp {
@@ -220,6 +221,14 @@ struct PdlpResult {
 [[nodiscard]] core::Expected<PdlpResult> solve_pdlp(
     const model::CanonicalProblem& problem, const model::Options& options,
     MatVec& matvec);
+
+/// The same, with the ITERATE also held by a caller-supplied implementation
+/// (IterationBackend.hpp) -- the device-resident path. `matvec` still serves the
+/// cold path (termination, restarts, certificates, once per `check_interval`);
+/// `backend` serves every iteration in between.
+[[nodiscard]] core::Expected<PdlpResult> solve_pdlp(
+    const model::CanonicalProblem& problem, const model::Options& options,
+    MatVec& matvec, IterationBackend& backend);
 
 }  // namespace sovsolve::solver::pdlp
 
