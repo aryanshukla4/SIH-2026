@@ -585,6 +585,7 @@ int main(int argc, char** argv) {
       std::printf("conflict_constraints=%zu\n", milp_stats.conflict_constraints);
       std::printf("conflict_deductions=%zu\n", milp_stats.conflict_deductions);
       std::printf("conflict_cutoffs=%zu\n", milp_stats.conflict_cutoffs);
+      std::printf("conflict_checks=%zu\n", milp_stats.conflict_checks);
     }
   }
 

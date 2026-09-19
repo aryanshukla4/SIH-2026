@@ -45,6 +45,10 @@ Each module has one job and uses the shared project types.
   with reliability branching (Achterberg-Koch-Martin; Achterberg's thesis
   ch. 5). Its enumeration oracle found a dual simplex bug on first run --
   the bound-flipping exit called a feasible LP infeasible -- now fixed.
+- Added Module 28 stage 9b: watched literals for conflict propagation
+  ([CIP] 7.4), incremental across nodes. Checks 185M -> 100M on gen-ip054;
+  ~30% overhead remains there (structural). Records that wall times on this
+  machine vary 3.5x on identical runs.
 - Added Module 28 stage 9: conflict analysis ([CIP] ch. 11, pool per Witzig
   et al. 2017). enlight_hard and pk1 reach their optima at 60 s; gen-ip054,
   timtab1, glass4 lose node rate to a pool scanned at every node (watched
@@ -2340,3 +2344,33 @@ implementation scans the whole pool at every node. SCIP propagates set-
 covering-like constraints with watched literals ([CIP] 7.4), looking at a
 conflict only when a watched variable changes: the fix for that overhead,
 and the next step. Default ON; --mip-conflicts=0 turns it off.
+
+28, stage 9b -- watched literals for conflicts, and what the overhead is.
+
+[CIP] 7.4's two-watched-literal scheme (Algorithm 7.7), generalized from 0/1
+fixings to bound disjunctions: a conflict is examined only when a column it
+watches has tightened; replacements prefer the literal whose falsifying
+branch direction has been explored least (pseudocost counts). Watches are
+checked against the bounds the PREVIOUS node's propagation ended with (dives:
+the node they start from), plus a recheck list of conflicts left with a false
+watch. One-literal conflicts go straight into the global bounds. The
+analysis's trail index is a flat sorted array. New statistic: conflict_checks.
+Missing a deduction here can only weaken pruning, never make it unsound; the
+per-conflict soundness test still passes.
+
+MEASURED, honestly: on gen-ip054, 150000 nodes, conflicts on vs off at
+identical LP work (664k iterations). Profiled: the analysis itself costs
+0.14 s in total; the cost is propagation. Conflict checks: 185M (pool scanned
+per node) -> 106M (watched, vs the root) -> 100M (vs the previous node, dives
+included) -- about 670 a node, for 7 useful deductions. The time overhead
+remains roughly 30%, pinned to one core (15.0 vs 20.2 s, 21.7 vs 26.3 s).
+It is structural: 30 columns and a pool of at least 1000 conflicts ([WBH]'s
+minimum) put ~270 conflicts on every column. Left here, not tuned further.
+Default stays ON ([CIP]'s): it is what solves enlight_hard; --mip-conflicts=0
+for instances like gen-ip054.
+
+MEASUREMENT WARNING, for every timing in this file: this machine (i5-12450H,
+performance + efficiency cores, Balanced power plan) varied 3.5x on IDENTICAL
+deterministic runs (15.7 s to 54.1 s). Pinning to one core cut that to about
+1.3x. Deterministic counts (nodes, LP iterations, conflict_checks) are the
+reliable measures; wall times need pinning and repetition.
