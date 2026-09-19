@@ -240,6 +240,31 @@ class BranchAndBound {
     // short, iteration-capped estimate -- that cleanup would be most of its
     // cost. Node LPs, which must be exact, keep it.
     probe_lp_.simplex.cost_perturbation = false;
+
+    const model::CanonicalProblem& p = canon_.problem;
+    root_lower_.assign(p.col_lower.data(), p.col_lower.data() + p.num_cols());
+    root_upper_.assign(p.col_upper.data(), p.col_upper.data() + p.num_cols());
+    down_locks_.assign(integers_.size(), 0);
+    up_locks_.assign(integers_.size(), 0);
+    binary_.assign(integers_.size(), 0);
+    const auto& csc = p.A.csc;
+    for (std::size_t k = 0; k < integers_.size(); ++k) {
+      const std::size_t j = integers_[k].canonical;
+      for (std::size_t q = csc.slice_begin(j); q < csc.slice_end(j); ++q) {
+        const auto row = static_cast<std::size_t>(csc.indices()[q]);
+        const Real a = csc.values()[q];
+        if (row < p.num_equality) {
+          ++down_locks_[k];
+          ++up_locks_[k];
+        } else if (a > 0.0) {
+          ++up_locks_[k];
+        } else if (a < 0.0) {
+          ++down_locks_[k];
+        }
+      }
+      const Real s = integers_[k].scale;
+      binary_[k] = static_cast<char>(s * root_lower_[j] == 0.0 && s * root_upper_[j] == 1.0);
+    }
   }
 
   core::Expected<Solution> run();
@@ -256,6 +281,21 @@ class BranchAndBound {
   [[nodiscard]] Real estimate(const std::vector<Candidate>& candidates, Real bound) const;
   [[nodiscard]] core::Expected<Solution> incumbent_solution(const SimplexResult& lp);
 
+  // --- incumbent ------------------------------------------------------------
+  [[nodiscard]] bool dominated(Real bound) const;
+  /// Adopt `lp`'s point if it beats the incumbent. `objective` is canonical.
+  [[nodiscard]] core::Status offer_incumbent(const SimplexResult& lp, Real objective);
+
+  // --- primal heuristics, [CIP] chapter 9 ------------------------------------
+  [[nodiscard]] core::Status simple_rounding(const SimplexResult& lp, std::size_t* counter);
+  [[nodiscard]] core::Status dive(const Node& node, const SimplexResult& lp);
+  [[nodiscard]] bool dive_budget_left() const;
+  /// Offer an integer point for the canonical STRUCTURAL values `x`, after
+  /// checking it against every row and bound -- a heuristic's point is a
+  /// claim, and only a checked claim may prune.
+  [[nodiscard]] core::Status offer_point(const SimplexResult& base, const std::vector<Real>& x,
+                                         bool* accepted);
+
   Problem& working_;
   model::CanonicalResult& canon_;
   std::vector<IntegerColumn> integers_;
@@ -269,6 +309,23 @@ class BranchAndBound {
   /// Every integer column's ORIGINAL-space value in the root LP, for Martin's
   /// child-selection rule ([CIP] section 6.1).
   std::vector<Real> root_values_;
+
+  bool have_incumbent_ = false;
+  Real incumbent_objective_ = kInf;  ///< canonical (minimization) objective
+  Solution incumbent_;
+
+  /// [CIP] Definition 3.3 / Example 3.4, per integer column: the rows that
+  /// block moving it down and up. Canonical rows are `A_E x = b_E` (lock
+  /// both ways) and `A_I x <= b_I` (a positive coefficient locks up, a
+  /// negative one down). Scaling is positive, so directions carry over.
+  std::vector<std::size_t> down_locks_;
+  std::vector<std::size_t> up_locks_;
+  std::vector<char> binary_;
+  /// The root's canonical column bounds, against which a heuristic point is
+  /// checked. `canon_.problem`'s own bounds are overwritten by every solve.
+  std::vector<Real> root_lower_;
+  std::vector<Real> root_upper_;
+  std::size_t next_dive_rule_ = 0;
 };
 
 Real BranchAndBound::elapsed() const {
@@ -485,6 +542,296 @@ core::Expected<Solution> BranchAndBound::incumbent_solution(const SimplexResult&
   return reconstruct_solution(working_, canon_.problem, canon_.transforms, canonical);
 }
 
+bool BranchAndBound::dominated(Real bound) const {
+  // A node cannot improve on the incumbent: its bound is no better, or within
+  // the gap tolerance of it.
+  if (!have_incumbent_) return false;
+  const Real gap =
+      std::fabs(incumbent_objective_ - bound) / (1.0 + std::fabs(incumbent_objective_));
+  return bound >= incumbent_objective_ || gap < options_.milp.gap_tolerance;
+}
+
+core::Status BranchAndBound::offer_incumbent(const SimplexResult& lp, Real objective) {
+  if (have_incumbent_ && objective >= incumbent_objective_) return core::Status::Ok();
+  auto solution = incumbent_solution(lp);
+  if (!solution.has_value()) return solution.error();
+  if (!have_incumbent_) stats_.first_incumbent_node = stats_.nodes;
+  ++stats_.incumbents;
+  have_incumbent_ = true;
+  incumbent_objective_ = objective;
+  incumbent_ = std::move(*solution);
+  return core::Status::Ok();
+}
+
+// --------------------------------------------------------------------------
+// Primal heuristics, [CIP] chapter 9
+// --------------------------------------------------------------------------
+
+core::Status BranchAndBound::offer_point(const SimplexResult& base, const std::vector<Real>& x,
+                                         bool* accepted) {
+  *accepted = false;
+  const model::CanonicalProblem& p = canon_.problem;
+  const std::size_t n = p.num_cols();
+  const std::size_t rows = p.num_rows();
+  const Real tol = options_.milp.integer_tolerance;
+
+  for (std::size_t j = 0; j < n; ++j) {
+    if (x[j] < root_lower_[j] - tol * (1.0 + std::fabs(root_lower_[j]))) return core::Status::Ok();
+    if (x[j] > root_upper_[j] + tol * (1.0 + std::fabs(root_upper_[j]))) return core::Status::Ok();
+  }
+  for (const IntegerColumn& ic : integers_) {
+    const Real v = ic.scale * x[ic.canonical];
+    if (std::fabs(v - std::round(v)) > tol) return core::Status::Ok();
+  }
+
+  SimplexResult candidate = base;
+  const auto& csr = p.A.csr;
+  for (std::size_t i = 0; i < rows; ++i) {
+    Real activity = 0.0;
+    for (std::size_t q = csr.slice_begin(i); q < csr.slice_end(i); ++q) {
+      activity += csr.values()[q] * x[static_cast<std::size_t>(csr.indices()[q])];
+    }
+    const Real b = p.b[i];
+    const Real slack = b - activity;
+    const Real allowed = tol * (1.0 + std::fabs(b));
+    if (i < p.num_equality ? std::fabs(slack) > allowed : slack < -allowed) {
+      return core::Status::Ok();
+    }
+    // The logical of row i: fixed at zero on an equality, the slack `s` on an
+    // inequality (Basis.hpp's `[A | I]` form).
+    candidate.x[n + i] = i < p.num_equality ? 0.0 : std::max(slack, 0.0);
+  }
+  Real objective = 0.0;
+  for (std::size_t j = 0; j < n; ++j) {
+    candidate.x[j] = x[j];
+    objective += p.c[j] * x[j];
+  }
+  if (have_incumbent_ && objective >= incumbent_objective_) return core::Status::Ok();
+  candidate.objective = objective;
+  *accepted = true;
+  return offer_incumbent(candidate, objective);
+}
+
+/// [CIP] section 9.1.2: "If zeta-_j = 0, we can safely set x_j := floor(x_j)
+/// without violating any linear constraint. On the other hand, if
+/// zeta+_j = 0, we can set x_j := ceil(x_j). The heuristic will succeed if all
+/// fractional variables have either" lock at zero.
+core::Status BranchAndBound::simple_rounding(const SimplexResult& lp, std::size_t* counter) {
+  const std::vector<Candidate> fractional_columns = fractional(lp);
+  if (fractional_columns.empty()) return core::Status::Ok();
+  std::vector<Real> x(lp.x.begin(), lp.x.begin() + static_cast<std::ptrdiff_t>(
+                                                         canon_.problem.num_cols()));
+  for (const Candidate& c : fractional_columns) {
+    const IntegerColumn& ic = integers_[c.column];
+    Real target = 0.0;
+    if (down_locks_[c.column] == 0) {
+      target = std::floor(c.value);
+    } else if (up_locks_[c.column] == 0) {
+      target = std::ceil(c.value);
+    } else {
+      return core::Status::Ok();
+    }
+    x[ic.canonical] = target / ic.scale;
+  }
+  bool accepted = false;
+  if (const auto st = offer_point(lp, x, &accepted); !st.ok()) return st;
+  if (accepted && counter != nullptr) ++*counter;
+  return core::Status::Ok();
+}
+
+bool BranchAndBound::dive_budget_left() const {
+  const auto& m = options_.milp;
+  const Real quota = m.dive_quota * static_cast<Real>(stats_.node_lp_iterations) +
+                     static_cast<Real>(m.dive_allowance);
+  return static_cast<Real>(stats_.dive_lp_iterations) < quota;
+}
+
+/// [CIP] Algorithm 9.1, the generic dive, from the node's optimal LP:
+///
+///   2. no fractional integer column: the LP point is integral -- offer it;
+///   3. simple rounding, for an intermediate solution;
+///   4. choose a fractional column and a direction (the four rules below);
+///   5. tighten its bound;  6. [domain propagation: none in this engine];
+///   7. resolve with the dual simplex from the current basis -- it stays dual
+///      feasible, only a bound moved;
+///   8. if infeasible, undo, take the OPPOSITE rounding and resolve (the
+///      "one level of backtracking");
+///   9. still infeasible: stop.
+///
+/// Also stopped by the 5% iteration quota, by an LP without a trustworthy
+/// optimum, and by an LP bound that can no longer beat the incumbent.
+///
+/// Step 4, the rules, rotated one per dive:
+///   fractionality (9.2.2)  smallest min{f-, f+}, to the nearest integer;
+///   coefficient   (9.2.1)  smallest min{zeta-, zeta+}, toward the smaller
+///                          lock; ties by the smaller rounding distance;
+///   line search   (9.2.4)  x below its root value: round down, ratio
+///                          f- / (x_root - x); above: up, f+ / (x - x_root);
+///                          smallest ratio -- "the first variable" the line
+///                          from the root LP point through x hits an integer;
+///   pseudocost    (9.2.5)  direction from the root (+-0.4), then the
+///                          fraction (< 0.3 down, > 0.7 up), then the smaller
+///                          pseudocost; select the maximum of
+///                          f+ (1 + Psi+)/(1 + Psi-) going down, or
+///                          f- (1 + Psi-)/(1 + Psi+) going up.
+/// Common to all ([CIP] 9.2): columns with a zero lock are left to simple
+/// rounding, and binaries are preferred over general integers. A rule with no
+/// usable column (line search when every column sits at its root value)
+/// falls back to fractionality.
+///
+/// READING, pseudocost diving: the extracted text lost its floor/ceiling
+/// marks; the factor that goes with rounding DOWN is taken as f+ = ceil - x,
+/// because the thesis says the measure "prefers variables that are close to
+/// their rounded value" -- rounding down, that is a LARGE f+.
+core::Status BranchAndBound::dive(const Node& node, const SimplexResult& lp) {
+  if (!dive_budget_left()) return core::Status::Ok();
+  ++stats_.dives;
+  const std::size_t rule = next_dive_rule_++ % 4;
+
+  std::vector<Real> lower = node.lower;
+  std::vector<Real> upper = node.upper;
+  SimplexResult current = lp;
+
+  for (;;) {
+    const std::vector<Candidate> cands = fractional(current);
+    if (cands.empty()) {
+      bool accepted = false;
+      std::vector<Real> x(current.x.begin(),
+                          current.x.begin() + static_cast<std::ptrdiff_t>(
+                                                  canon_.problem.num_cols()));
+      if (const auto st = offer_point(current, x, &accepted); !st.ok()) return st;
+      if (accepted) ++stats_.dive_solutions;
+      return core::Status::Ok();
+    }
+    if (const auto st = simple_rounding(current, &stats_.dive_solutions); !st.ok()) return st;
+
+    // Columns a dive should choose among.
+    std::vector<const Candidate*> pool;
+    for (const Candidate& c : cands) {
+      if (down_locks_[c.column] > 0 && up_locks_[c.column] > 0) pool.push_back(&c);
+    }
+    if (pool.empty()) {
+      for (const Candidate& c : cands) pool.push_back(&c);
+    }
+    bool any_binary = false;
+    for (const Candidate* c : pool) any_binary = any_binary || binary_[c->column] != 0;
+    if (any_binary) {
+      std::vector<const Candidate*> binaries;
+      for (const Candidate* c : pool) {
+        if (binary_[c->column] != 0) binaries.push_back(c);
+      }
+      pool.swap(binaries);
+    }
+
+    const Candidate* pick = nullptr;
+    bool up = false;
+    auto nearest = [](const Candidate& c) { return c.frac_up < c.frac_down; };
+    auto by_fractionality = [&]() {
+      Real best = kInf;
+      for (const Candidate* c : pool) {
+        const Real f = std::min(c->frac_down, c->frac_up);
+        if (f < best) {
+          best = f;
+          pick = c;
+          up = nearest(*c);
+        }
+      }
+    };
+    if (rule == 0) {
+      by_fractionality();
+    } else if (rule == 1) {
+      std::size_t best_locks = std::numeric_limits<std::size_t>::max();
+      Real best_distance = kInf;
+      for (const Candidate* c : pool) {
+        const std::size_t dl = down_locks_[c->column];
+        const std::size_t ul = up_locks_[c->column];
+        const bool go_up = ul < dl || (ul == dl && nearest(*c));
+        const std::size_t locks = std::min(dl, ul);
+        const Real distance = go_up ? c->frac_up : c->frac_down;
+        if (locks < best_locks || (locks == best_locks && distance < best_distance)) {
+          best_locks = locks;
+          best_distance = distance;
+          pick = c;
+          up = go_up;
+        }
+      }
+    } else if (rule == 2) {
+      Real best = kInf;
+      for (const Candidate* c : pool) {
+        const Real root = root_values_[c->column];
+        Real ratio = kInf;
+        bool go_up = false;
+        if (c->value < root) {
+          ratio = c->frac_down / (root - c->value);
+        } else if (c->value > root) {
+          ratio = c->frac_up / (c->value - root);
+          go_up = true;
+        } else {
+          continue;
+        }
+        if (ratio < best) {
+          best = ratio;
+          pick = c;
+          up = go_up;
+        }
+      }
+      if (pick == nullptr) by_fractionality();
+    } else {
+      Real best = -kInf;
+      for (const Candidate* c : pool) {
+        const Real root = root_values_[c->column];
+        const Real psi_down = pseudocosts_.value(c->column, false);
+        const Real psi_up = pseudocosts_.value(c->column, true);
+        bool go_up = false;
+        if (c->value < root - 0.4) {
+          go_up = false;
+        } else if (c->value > root + 0.4) {
+          go_up = true;
+        } else if (c->frac_down < 0.3) {
+          go_up = false;
+        } else if (c->frac_down > 0.7) {
+          go_up = true;
+        } else {
+          go_up = !(psi_down < psi_up);
+        }
+        const Real score = go_up ? c->frac_down * (1.0 + psi_down) / (1.0 + psi_up)
+                                 : c->frac_up * (1.0 + psi_up) / (1.0 + psi_down);
+        if (score > best) {
+          best = score;
+          pick = c;
+          up = go_up;
+        }
+      }
+    }
+    if (pick == nullptr) return core::Status::Ok();
+
+    const IntegerColumn& ic = integers_[pick->column];
+    const std::size_t j = ic.canonical;
+    const Real saved_lower = lower[j];
+    const Real saved_upper = upper[j];
+    core::Expected<SimplexResult> next = core::make_error(core::ErrorCode::NumericalError, "");
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      const bool go_up = attempt == 0 ? up : !up;  // attempt 1 is step 8
+      lower[j] = saved_lower;
+      upper[j] = saved_upper;
+      if (go_up) {
+        lower[j] = std::max(lower[j], std::ceil(pick->value) / ic.scale);
+      } else {
+        upper[j] = std::min(upper[j], std::floor(pick->value) / ic.scale);
+      }
+      if (lower[j] > upper[j]) continue;
+      next = solve_with(lower, upper, node_lp_, &current.basis);
+      if (!next.has_value()) return next.error();
+      stats_.dive_lp_iterations += next->iterations;
+      if (next->status != SolverStatus::Infeasible) break;
+    }
+    if (!next.has_value() || next->status != SolverStatus::Optimal) return core::Status::Ok();
+    if (dominated(next->objective)) return core::Status::Ok();
+    current = std::move(*next);
+    if (!dive_budget_left()) return core::Status::Ok();
+  }
+}
+
 core::Expected<Solution> BranchAndBound::run() {
   const auto& m = options_.milp;
   const std::size_t n = canon_.problem.num_cols();
@@ -503,20 +850,10 @@ core::Expected<Solution> BranchAndBound::run() {
     open.insert(std::move(root));
   }
 
-  bool have_incumbent = false;
-  Real incumbent_objective = kInf;  // canonical (minimization) objective
-  Solution incumbent;
   bool closed = false;
   Real closing_bound = 0.0;
 
-  // A node cannot improve on the incumbent: its bound is no better, or within
-  // the gap tolerance of it.
-  auto dominated = [&](Real bound) {
-    if (!have_incumbent) return false;
-    const Real gap =
-        std::fabs(incumbent_objective - bound) / (1.0 + std::fabs(incumbent_objective));
-    return bound >= incumbent_objective || gap < m.gap_tolerance;
-  };
+  auto dominated = [this](Real bound) { return this->dominated(bound); };
 
   // PLUNGING, [CIP] section 6.3. `children` are the open children of the node
   // just processed, `siblings` the open siblings of it. A plunge continues
@@ -543,9 +880,9 @@ core::Expected<Solution> BranchAndBound::run() {
       auto admissible = [&](OpenNodes::Id id) {
         if (!open.contains(id)) return false;
         if (plunge_steps >= max_steps) return false;
-        if (plunge_steps < min_steps || !have_incumbent) return true;
+        if (plunge_steps < min_steps || !have_incumbent_) return true;
         const Real lower = open.lower_bound();
-        const Real width = incumbent_objective - lower;
+        const Real width = incumbent_objective_ - lower;
         if (!(width > 0.0)) return false;
         return (open.at(id).bound - lower) / width <= m.plunge_max_gap;
       };
@@ -578,7 +915,7 @@ core::Expected<Solution> BranchAndBound::run() {
     // within the gap) nothing open can -- which is what makes stopping a proof.
     if (dominated(open.lower_bound())) {
       closed = true;
-      closing_bound = std::min(open.lower_bound(), incumbent_objective);
+      closing_bound = std::min(open.lower_bound(), incumbent_objective_);
       break;
     }
 
@@ -639,14 +976,19 @@ core::Expected<Solution> BranchAndBound::run() {
 
     std::vector<Candidate> candidates = fractional(*lp);
     if (candidates.empty()) {
-      auto solution = incumbent_solution(*lp);
-      if (!solution.has_value()) return solution.error();
-      if (!have_incumbent) stats_.first_incumbent_node = stats_.nodes;
-      ++stats_.incumbents;
-      have_incumbent = true;
-      incumbent_objective = lp->objective;
-      incumbent = std::move(*solution);
+      if (const auto st = offer_incumbent(*lp, lp->objective); !st.ok()) return st.error();
       continue;
+    }
+
+    // [CIP] chapter 9. Simple rounding "is applied after the solving of every
+    // LP"; a dive follows while the iteration quota allows. Both only ever
+    // ADD an incumbent -- the node itself is branched on as before.
+    if (m.heuristics) {
+      if (const auto st = simple_rounding(*lp, &stats_.rounding_solutions); !st.ok()) {
+        return st.error();
+      }
+      if (const auto st = dive(node, *lp); !st.ok()) return st.error();
+      if (dominated(lp->objective)) continue;
     }
 
     const std::size_t pick = select(candidates, node, *lp);
@@ -693,11 +1035,11 @@ core::Expected<Solution> BranchAndBound::run() {
   // than assumed to be zero.
   const bool maximize = working_.sense == core::ObjSense::Maximize;
   const Real sign = maximize ? -1.0 : 1.0;
-  const Real offset = have_incumbent ? incumbent.objective - sign * incumbent_objective : 0.0;
+  const Real offset = have_incumbent_ ? incumbent_.objective - sign * incumbent_objective_ : 0.0;
   auto to_original = [sign, offset](Real canonical) { return sign * canonical + offset; };
 
   Solution result;
-  if (have_incumbent) result = std::move(incumbent);
+  if (have_incumbent_) result = std::move(incumbent_);
 
   const bool sound = stats_.unreliable_nodes == 0;
   if (closed && sound) {
@@ -705,13 +1047,13 @@ core::Expected<Solution> BranchAndBound::run() {
     result.best_bound = to_original(closing_bound);
   } else if (open.empty() && sound) {
     // Every node was solved or pruned on a trustworthy bound.
-    result.status = have_incumbent ? SolverStatus::Optimal : SolverStatus::Infeasible;
-    result.best_bound = have_incumbent ? result.objective : 0.0;
+    result.status = have_incumbent_ ? SolverStatus::Optimal : SolverStatus::Infeasible;
+    result.best_bound = have_incumbent_ ? result.objective : 0.0;
   } else {
     // A limit, or an unexplored subtree: report what is known, never a
     // verdict the search did not earn.
     result.status = SolverStatus::NotConverged;
-    result.best_bound = open.empty() ? (have_incumbent ? result.objective : 0.0)
+    result.best_bound = open.empty() ? (have_incumbent_ ? result.objective : 0.0)
                                      : to_original(open.lower_bound());
   }
   result.nodes_explored = stats_.nodes;

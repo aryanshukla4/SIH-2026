@@ -45,6 +45,10 @@ Each module has one job and uses the shared project types.
   with reliability branching (Achterberg-Koch-Martin; Achterberg's thesis
   ch. 5). Its enumeration oracle found a dual simplex bug on first run --
   the bound-flipping exit called a feasible LP infeasible -- now fixed.
+- Added Module 28 stage 5: primal heuristics ([CIP] ch. 9), simple rounding
+  on every node LP and four diving rules under the 5% quota. First incumbent
+  at node 1-2 on 9 of 11 MIPLIB instances; gen-ip002 solved for the first
+  time; pk1 incumbent 113 -> 25. markshare_4_0 got worse -- recorded.
 - Added Module 28 stage 4: node selection ([CIP] ch. 6, interleaved best
   estimate / best first with plunging) and dual steepest edge pricing
   (Koberstein 3.3, 8.2.2.1). Incumbents on 8 of 11 MIPLIB instances (was 2);
@@ -1825,3 +1829,78 @@ READING IT.
     gen-ip002 -- [CIP] leaves finding solutions mainly to primal
     heuristics (chapter 9, diving), which do not exist here yet. That is
     the next MILP item.
+
+28, stage 5 -- primal heuristics, [CIP] chapter 9.
+
+Stage 4 left three instances with no integer point after 20000 nodes, and
+[CIP] 6.3 says why: SCIP leaves "the identification of primal solutions ...
+to the primal heuristics, namely the diving heuristics". Two are added.
+
+SIMPLE ROUNDING (9.1.2), after every node LP. Variable locks per [CIP]
+Definition 3.3 / Example 3.4, on the canonical rows: an equality locks both
+directions, `A_I x <= b_I` locks up for a positive coefficient and down for
+a negative one. A column with no down-lock is rounded down, one with no
+up-lock up; if every fractional column has one of the two, the point is
+integral and feasible.
+
+DIVING, [CIP] Algorithm 9.1: from the node's LP, repeatedly round one
+fractional column by tightening its bound and resolve with the dual simplex
+from the current basis, running simple rounding at every step; if the LP
+turns infeasible, undo and take the opposite rounding once (step 8); stop on
+infeasibility, on an LP that cannot beat the incumbent, or on the quota.
+Four selection rules, rotated one per dive: fractionality (9.2.2),
+coefficient (9.2.1), line search (9.2.4, the thesis's most valuable dive at
+4%), pseudocost (9.2.5). Columns with a zero lock are left to simple
+rounding and binaries are preferred ([CIP] 9.2). Budget: dive LP iterations
+at most 5% of node-LP iterations ([CIP] 9.2) plus a fixed 1000.
+
+NOT FROM THE THESIS, stated: the 1000-iteration allowance (a pure 5% of one
+root LP forbids the first dive; SCIP's per-heuristic settings are in
+Berthold's diploma thesis, [CIP] reference [41], not available here); no
+domain propagation in step 6 (the engine has none); the pseudocost-diving
+score reads the down factor as f+ = ceil - x -- the extracted text lost the
+floor/ceiling marks, and only that reading matches "prefers variables that
+are close to their rounded value". Dives do not update pseudocosts.
+
+EVERY HEURISTIC POINT IS CHECKED before it may prune: bounds, integrality
+and every row, in canonical space, then the objective recomputed as c'x.
+A heuristic point is a claim; an unchecked infeasible one with a good
+objective would prune the true optimum.
+
+Tests (milp_test): simple rounding at a one-node limit finds the optimum of
+a covering row (and nothing is found with heuristics off); the 9-variable
+enumeration oracle, heuristics on and off, answer and bound exact, with
+dives run and points found. Mutants caught: rounding direction swapped;
+swapped with the row check removed (58 failures -- the check is what stops
+it); lock signs reversed on <= rows. Equivalent: dropping offer_incumbent's
+own objective test (every caller tests first).
+
+MEASURED, MIPLIB, reliability, interleaved, DSE, 20000 nodes, heuristics
+off -> on. Iteration counts are deterministic; wall times in this run were
+NOT reproducible against stage 4's identical configuration (neos5 16.8s
+here, 9.8s there, same pivot count) -- the machine was under other load,
+so times are indicative only.
+
+    instance       first incumbent node   best incumbent            (optimum*)
+    pk1            4800 -> 1              113 -> 25                 11
+    gen-ip054      4774 -> 2              7345.9 -> 7168.2          6840.97
+    mas74           664 -> 1              19320.6 -> 13248.3        11801
+    mas76           416 -> 1              42155.0 -> 40871.6        40005
+    gen-ip002      none -> 1              none -> -4675.0           -4783.73
+    assign1-5-8     778 -> 1              218 -> 213                212
+    neos5           119 -> 1              15 -> 15                  15
+    markshare_4_0    44 -> 1              5 -> 12  (WORSE)          1
+    glass4         2213 -> 2213           4.5e9 -> 4.5e9            1.2e9
+    timtab1        none -> none
+    enlight_hard   none -> none
+    (* from memory of MIPLIB, not checked)
+
+Dive LP iterations were 5-7% of node-LP iterations; time -5% to +68%
+(pk1 3.45s -> 5.78s). The lower bound moved up on pk1 (0 -> 1.90), mas74,
+mas76 and gen-ip054, because a better incumbent prunes more of the tree.
+markshare_4_0 ended with a worse incumbent: the heuristics changed the path
+(an early incumbent changes plunge aborts and pruning), and the path that
+found 5 was not taken. glass4, timtab1 and enlight_hard: dives ran to their
+quota and found nothing. [CIP] 9.5 ranks the feasibility pump (7%) and RENS
+(6%) above line search diving (4%); those are the remaining heuristics of
+consequence, and the pump needs the objective-diving machinery of 9.3.

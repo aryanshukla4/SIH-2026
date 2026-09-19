@@ -127,6 +127,8 @@ void print_usage(const char* argv0) {
       "                        MilpOptions::branching (default reliability). A\n"
       "                        MILP with --method=dual-simplex or primal-simplex\n"
       "                        runs the host branch-and-bound (module.txt 28).\n"
+      "  --mip-heuristics=0|1  MilpOptions::heuristics (default 1): CIP ch. 9\n"
+      "                        simple rounding and diving\n"
       "  --mip-cuts=0|1        MilpOptions::root_cuts (default 1): root cover/GCD\n"
       "                        cuts before the host branch-and-bound\n"
       "  --mip-int-tol=X       MilpOptions::integer_tolerance         (default 1e-6,\n"
@@ -236,6 +238,8 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.simplex.dual_steepest_edge = (val != "0");
     } else if (key == "perturb") {
       options.simplex.cost_perturbation = (val != "0");
+    } else if (key == "mip-heuristics") {
+      options.milp.heuristics = (val != "0");
     } else if (key == "mip-cuts") {
       options.milp.root_cuts = (val != "0");
     } else if (key == "node-selection") {
@@ -524,6 +528,10 @@ int main(int argc, char** argv) {
       std::printf("incumbents=%zu\n", milp_stats.incumbents);
       std::printf("first_incumbent_node=%zu\n", milp_stats.first_incumbent_node);
       std::printf("plunge_steps=%zu\n", milp_stats.plunge_steps);
+      std::printf("dives=%zu\n", milp_stats.dives);
+      std::printf("dive_lp_iterations=%zu\n", milp_stats.dive_lp_iterations);
+      std::printf("dive_solutions=%zu\n", milp_stats.dive_solutions);
+      std::printf("rounding_solutions=%zu\n", milp_stats.rounding_solutions);
     }
   }
 
