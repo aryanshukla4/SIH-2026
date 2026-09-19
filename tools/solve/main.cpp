@@ -127,6 +127,8 @@ void print_usage(const char* argv0) {
       "                        MilpOptions::branching (default reliability). A\n"
       "                        MILP with --method=dual-simplex or primal-simplex\n"
       "                        runs the host branch-and-bound (module.txt 28).\n"
+      "  --mip-pump=0|1        MilpOptions::feasibility_pump (default 1)\n"
+      "  --mip-rens=0|1        MilpOptions::rens (default 1)\n"
       "  --mip-heuristics=0|1  MilpOptions::heuristics (default 1): CIP ch. 9\n"
       "                        simple rounding and diving\n"
       "  --mip-cuts=0|1        MilpOptions::root_cuts (default 1): root cover/GCD\n"
@@ -238,6 +240,10 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.simplex.dual_steepest_edge = (val != "0");
     } else if (key == "perturb") {
       options.simplex.cost_perturbation = (val != "0");
+    } else if (key == "mip-pump") {
+      options.milp.feasibility_pump = (val != "0");
+    } else if (key == "mip-rens") {
+      options.milp.rens = (val != "0");
     } else if (key == "mip-heuristics") {
       options.milp.heuristics = (val != "0");
     } else if (key == "mip-cuts") {
@@ -532,6 +538,11 @@ int main(int argc, char** argv) {
       std::printf("dive_lp_iterations=%zu\n", milp_stats.dive_lp_iterations);
       std::printf("dive_solutions=%zu\n", milp_stats.dive_solutions);
       std::printf("rounding_solutions=%zu\n", milp_stats.rounding_solutions);
+      std::printf("pump_rounds=%zu\n", milp_stats.pump_rounds);
+      std::printf("pump_lp_iterations=%zu\n", milp_stats.pump_lp_iterations);
+      std::printf("pump_solutions=%zu\n", milp_stats.pump_solutions);
+      std::printf("rens_nodes=%zu\n", milp_stats.rens_nodes);
+      std::printf("rens_solutions=%zu\n", milp_stats.rens_solutions);
     }
   }
 

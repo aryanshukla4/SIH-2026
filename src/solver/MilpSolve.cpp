@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <set>
@@ -17,6 +18,7 @@
 #include "sovsolve/solver/MilpPresolve.hpp"
 #include "sovsolve/solver/Scaler.hpp"
 #include "sovsolve/solver/SolutionReconstructor.hpp"
+#include "sovsolve/solver/simplex/PrimalSimplex.hpp"
 #include "sovsolve/solver/simplex/SimplexSolution.hpp"
 #include "sovsolve/solver/simplex/SolveSimplex.hpp"
 
@@ -35,6 +37,7 @@ using simplex::Basis;
 using simplex::SimplexResult;
 
 constexpr Real kInf = std::numeric_limits<Real>::infinity();
+constexpr std::size_t kNoColumn = std::numeric_limits<std::size_t>::max();
 
 // --------------------------------------------------------------------------
 // The integer columns, as the search sees them
@@ -247,6 +250,16 @@ class BranchAndBound {
     down_locks_.assign(integers_.size(), 0);
     up_locks_.assign(integers_.size(), 0);
     binary_.assign(integers_.size(), 0);
+    original_of_.assign(p.num_cols(), kNoColumn);
+    scale_of_.assign(p.num_cols(), 1.0);
+    for (const auto& rec : canon_.transforms.records()) {
+      if (rec.kind == model::TransformKind::KeepColumn) {
+        original_of_[static_cast<std::size_t>(rec.secondary)] =
+            static_cast<std::size_t>(rec.primary);
+      } else if (rec.kind == model::TransformKind::ColumnScaling) {
+        scale_of_[static_cast<std::size_t>(rec.primary)] = rec.value;
+      }
+    }
     const auto& csc = p.A.csc;
     for (std::size_t k = 0; k < integers_.size(); ++k) {
       const std::size_t j = integers_[k].canonical;
@@ -290,6 +303,11 @@ class BranchAndBound {
   [[nodiscard]] core::Status simple_rounding(const SimplexResult& lp, std::size_t* counter);
   [[nodiscard]] core::Status dive(const Node& node, const SimplexResult& lp);
   [[nodiscard]] bool dive_budget_left() const;
+  [[nodiscard]] core::Status feasibility_pump(const SimplexResult& root);
+  [[nodiscard]] core::Status rens(const SimplexResult& root);
+  /// Canonical structural point of an ORIGINAL-space solution of `working_`,
+  /// or false if some canonical column cannot be recovered.
+  [[nodiscard]] bool to_canonical(const Solution& original, std::vector<Real>& x) const;
   /// Offer an integer point for the canonical STRUCTURAL values `x`, after
   /// checking it against every row and bound -- a heuristic's point is a
   /// claim, and only a checked claim may prune.
@@ -326,6 +344,11 @@ class BranchAndBound {
   std::vector<Real> root_lower_;
   std::vector<Real> root_upper_;
   std::size_t next_dive_rule_ = 0;
+  /// Canonical column -> original column and scale (`x_original = s x`);
+  /// `kNoColumn` for a column with no original (a range column).
+  std::vector<std::size_t> original_of_;
+  std::vector<Real> scale_of_;
+  std::size_t last_improvement_node_ = 0;
 };
 
 Real BranchAndBound::elapsed() const {
@@ -557,6 +580,7 @@ core::Status BranchAndBound::offer_incumbent(const SimplexResult& lp, Real objec
   if (!solution.has_value()) return solution.error();
   if (!have_incumbent_) stats_.first_incumbent_node = stats_.nodes;
   ++stats_.incumbents;
+  last_improvement_node_ = stats_.nodes;
   have_incumbent_ = true;
   incumbent_objective_ = objective;
   incumbent_ = std::move(*solution);
@@ -877,6 +901,344 @@ core::Status BranchAndBound::dive(const Node& node, const SimplexResult& lp) {
   }
 }
 
+// --------------------------------------------------------------------------
+// The objective feasibility pump -- Berthold 2006, Algorithm 3; [CIP] 9.3.3
+// --------------------------------------------------------------------------
+
+namespace {
+
+/// A fixed-seed generator: the pump's random choices must not make two runs
+/// of the same model differ.
+struct Lcg {
+  std::uint64_t state = 0x2545F4914F6CDD1DULL;
+  Real uniform() {
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    return static_cast<Real>(state >> 11) * (1.0 / 9007199254740992.0);
+  }
+};
+
+/// [B] Definition 3.2 / [CIP] (9.1): round to the nearest integer.
+Real round_half_up(Real v) { return std::floor(v + 0.5); }
+
+}  // namespace
+
+/// The pump alternates two sequences ([B] 3.1.2): x_tilde, integral on S, the
+/// rounding of the last LP point; and x_bar, feasible for the LP, the point of
+/// the LP polyhedron closest to x_tilde in the L1 distance over S --
+///
+///     Delta_S(x, x~) = sum_{j in S, x~_j = l_j} (x_j - l_j)
+///                    + sum_{j in S, x~_j = u_j} (u_j - x_j) + ...
+///
+/// -- until they meet. Stage 1 takes S = the binaries, stage 2 S = all
+/// integer columns, starting from the stage-1 rounding whose LP point was
+/// closest ([B] Algorithm 3). Stage 3, a sub-MIP enumeration, is skipped, as
+/// SCIP skips it ([CIP] 9.3.3) and as Berthold's own measurements did.
+///
+/// GENERAL INTEGERS: SCIP's form, not (3.2)'s. "It does not add auxiliary
+/// variables d_j ... Instead, we set the objective coefficient to +1, -1, or
+/// 0, depending on whether we want to round the variable down or up, or leave
+/// it on its integral value" ([CIP] 9.3.3). So every round changes COSTS only,
+/// the previous basis stays primal feasible, and the primal simplex resumes
+/// from it -- "a change in the objective function does not destroy primal
+/// feasibility" ([CIP] 9.3).
+///
+/// OBJECTIVE PUMP ([B] Definition 3.3): the LP minimizes
+///     (1 - alpha) Delta + alpha (||Delta|| / ||c||) c'x,
+/// alpha_0 = 1, alpha <- 0.95 alpha per round.
+///
+/// CYCLES ([B] Algorithm 3 steps 4-7): a 1-cycle (x~ unchanged) flips the T
+/// most fractional columns (f > 0.02) of S, T uniform in [10, 30]; a longer
+/// cycle -- x~ already seen with alpha within 0.005 -- is broken by a "random
+/// perturbation". Berthold does not specify that perturbation beyond
+/// "shifts some of the variables' values ... randomly up or down, instead of
+/// rounding them as usual"; here it flips T RANDOMLY chosen columns of S to
+/// the other side. That choice is ours; the original is in Fischetti, Glover
+/// and Lodi's paper ([B] reference [24]), not in hand.
+///
+/// Every candidate goes through offer_point: a rounding that violates a row
+/// is rejected there, never trusted.
+core::Status BranchAndBound::feasibility_pump(const SimplexResult& root) {
+  const auto& m = options_.milp;
+  model::CanonicalProblem& p = canon_.problem;
+  const std::size_t n = p.num_cols();
+  if (integers_.empty()) return core::Status::Ok();
+
+  Real c_norm = 0.0;
+  for (std::size_t j = 0; j < n; ++j) c_norm += p.c[j] * p.c[j];
+  c_norm = std::sqrt(c_norm);
+
+  // The pump's costs replace the true ones ONLY for the duration of each LP
+  // solve: offer_point and the solution reconstruction read `p.c`, and a
+  // candidate scored against the pump objective would be a wrong incumbent.
+  const std::vector<Real> true_costs(p.c.data(), p.c.data() + n);
+
+  Lcg rng;
+  model::Options lp_options = node_lp_;
+  lp_options.simplex.cost_perturbation = false;
+
+  bool any_general = false;
+  for (std::size_t k = 0; k < integers_.size(); ++k) any_general |= binary_[k] == 0;
+
+  auto value = [&](const SimplexResult& r, std::size_t k) {
+    return integers_[k].scale * r.x[integers_[k].canonical];
+  };
+
+  SimplexResult x_bar = root;
+  // Stage-2 start: the stage-1 LP point closest to its rounding.
+  SimplexResult best_stage1 = root;
+  Real best_stage1_distance = kInf;
+
+  for (int stage = 1; stage <= 2; ++stage) {
+    if (stage == 2 && !any_general) break;  // "the algorithm will skip Stage 2 for MBPs"
+    std::vector<std::size_t> S;
+    for (std::size_t k = 0; k < integers_.size(); ++k) {
+      if (stage == 2 || binary_[k] != 0) S.push_back(k);
+    }
+    if (S.empty()) continue;
+    if (stage == 2) x_bar = best_stage1;
+
+    const std::size_t max_rounds = stage == 1 ? m.fp_max_rounds_stage1 : m.fp_max_rounds_stage2;
+    const std::size_t max_stalls = stage == 1 ? m.fp_max_stalls_stage1 : m.fp_max_stalls_stage2;
+    Real alpha = 1.0;
+    std::size_t perturbations = 0;
+    std::map<std::vector<Real>, std::vector<Real>> visited;
+    std::vector<Real> fractionality_history;
+    std::vector<Real> previous;  // x~_{t-1}, over S
+    std::vector<Real> tilde(S.size());
+    for (std::size_t i = 0; i < S.size(); ++i) tilde[i] = round_half_up(value(x_bar, S[i]));
+
+    for (std::size_t t = 0;; ++t) {
+      if (elapsed() >= m.time_limit_seconds) return core::Status::Ok();
+
+      // Step 4-5: a 1-cycle.
+      if (!previous.empty() && tilde == previous) {
+        std::vector<std::pair<Real, std::size_t>> by_fraction;
+        for (std::size_t i = 0; i < S.size(); ++i) {
+          const Real v = value(x_bar, S[i]);
+          const Real f = std::fabs(v - round_half_up(v));
+          if (f > 0.02) by_fraction.emplace_back(-f, i);
+        }
+        std::sort(by_fraction.begin(), by_fraction.end());
+        const auto T = static_cast<std::size_t>(10 + std::floor(rng.uniform() * 21.0));
+        for (std::size_t q = 0; q < std::min(T, by_fraction.size()); ++q) {
+          const std::size_t i = by_fraction[q].second;
+          const Real v = value(x_bar, S[i]);
+          tilde[i] = tilde[i] > v ? std::floor(v) : std::ceil(v);
+        }
+      }
+      // Steps 6-7: a longer cycle.
+      auto seen = [&]() {
+        auto it = visited.find(tilde);
+        if (it == visited.end()) return false;
+        for (Real a : it->second) {
+          if (std::fabs(a - alpha) <= 0.005) return true;
+        }
+        return false;
+      };
+      while (seen()) {
+        if (stage == 2 && ++perturbations > 100) return core::Status::Ok();  // "goto Stage 3"
+        const auto T = static_cast<std::size_t>(10 + std::floor(rng.uniform() * 21.0));
+        for (std::size_t q = 0; q < T; ++q) {
+          const auto i = static_cast<std::size_t>(rng.uniform() * static_cast<Real>(S.size()));
+          const std::size_t col = std::min(i, S.size() - 1);
+          const Real v = value(x_bar, S[col]);
+          tilde[col] = tilde[col] > v ? std::floor(v) : std::ceil(v);
+          if (tilde[col] == round_half_up(v)) tilde[col] += tilde[col] > v ? -1.0 : 1.0;
+          const IntegerColumn& ic = integers_[S[col]];
+          const Real lo = ic.scale * root_lower_[ic.canonical];
+          const Real hi = ic.scale * root_upper_[ic.canonical];
+          tilde[col] = std::clamp(tilde[col], std::ceil(lo - 1e-9), std::floor(hi + 1e-9));
+        }
+        if (stage == 1 && perturbations++ > 1000) return core::Status::Ok();
+      }
+
+      // Step 8: is x~ (the LP point with S rounded) feasible for the MIP?
+      {
+        std::vector<Real> x(x_bar.x.begin(), x_bar.x.begin() + static_cast<std::ptrdiff_t>(n));
+        for (std::size_t i = 0; i < S.size(); ++i) {
+          x[integers_[S[i]].canonical] = tilde[i] / integers_[S[i]].scale;
+        }
+        bool accepted = false;
+        if (const auto st = offer_point(x_bar, x, &accepted); !st.ok()) return st;
+        if (accepted) {
+          ++stats_.pump_solutions;
+          return core::Status::Ok();
+        }
+      }
+      visited[tilde].push_back(alpha);                      // step 9
+      if (t > 0) alpha *= m.fp_alpha_factor;                // step 10
+      if (t >= max_rounds) break;                           // step 11
+
+      // Step 12: the LP closest to x~ under the combined objective.
+      std::vector<Real> delta(n, 0.0);
+      Real delta_norm = 0.0;
+      for (std::size_t i = 0; i < S.size(); ++i) {
+        const IntegerColumn& ic = integers_[S[i]];
+        const Real v = value(x_bar, S[i]);
+        const Real lo = ic.scale * root_lower_[ic.canonical];
+        const Real hi = ic.scale * root_upper_[ic.canonical];
+        Real direction = 0.0;  // +1: minimize x (push down), -1: push up
+        if (tilde[i] <= lo) {
+          direction = 1.0;
+        } else if (tilde[i] >= hi) {
+          direction = -1.0;
+        } else if (v > tilde[i]) {
+          direction = 1.0;
+        } else if (v < tilde[i]) {
+          direction = -1.0;
+        }
+        // Per ORIGINAL unit: x_original = s x_canonical.
+        delta[ic.canonical] = direction * ic.scale;
+        delta_norm += delta[ic.canonical] * delta[ic.canonical];
+      }
+      delta_norm = std::sqrt(delta_norm);
+      const Real weight = c_norm > 0.0 ? alpha * delta_norm / c_norm : 0.0;
+      for (std::size_t j = 0; j < n; ++j) {
+        p.c[j] = (1.0 - alpha) * delta[j] + weight * true_costs[j];
+        p.col_lower[j] = root_lower_[j];
+        p.col_upper[j] = root_upper_[j];
+      }
+      auto next = simplex::solve_primal_simplex(p, lp_options, &x_bar.basis);
+      for (std::size_t j = 0; j < n; ++j) p.c[j] = true_costs[j];
+      if (!next.has_value()) return next.error();
+      ++stats_.pump_rounds;
+      stats_.pump_lp_iterations += next->iterations;
+      if (next->status != SolverStatus::Optimal) return core::Status::Ok();
+      previous = tilde;
+      x_bar = std::move(*next);
+
+      Real distance = 0.0;
+      Real fractionality = 0.0;
+      for (std::size_t i = 0; i < S.size(); ++i) {
+        const Real v = value(x_bar, S[i]);
+        distance += std::fabs(v - previous[i]);
+        fractionality += std::fabs(v - round_half_up(v));
+      }
+      if (stage == 1 && distance < best_stage1_distance) {
+        best_stage1_distance = distance;
+        best_stage1 = x_bar;
+      }
+      // Step 13: the LP point already IS the rounding.
+      if (distance <= m.integer_tolerance) {
+        if (stage == 2) {
+          bool accepted = false;
+          std::vector<Real> x(x_bar.x.begin(), x_bar.x.begin() + static_cast<std::ptrdiff_t>(n));
+          if (const auto st = offer_point(x_bar, x, &accepted); !st.ok()) return st;
+          if (accepted) ++stats_.pump_solutions;
+          return core::Status::Ok();
+        }
+        break;
+      }
+      // Step 14: stalling -- not 10% less fractional than maxStalls rounds ago.
+      fractionality_history.push_back(fractionality);
+      if (fractionality_history.size() > max_stalls &&
+          fractionality >
+              0.9 * fractionality_history[fractionality_history.size() - 1 - max_stalls]) {
+        break;
+      }
+      for (std::size_t i = 0; i < S.size(); ++i) tilde[i] = round_half_up(value(x_bar, S[i]));
+    }
+  }
+  return core::Status::Ok();
+}
+
+// --------------------------------------------------------------------------
+// RENS -- [CIP] 9.1.1, Berthold 2006 section 3.2.1 and Algorithm 4
+// --------------------------------------------------------------------------
+
+bool BranchAndBound::to_canonical(const Solution& original, std::vector<Real>& x) const {
+  const model::CanonicalProblem& p = canon_.problem;
+  const std::size_t n = p.num_cols();
+  if (original.x.size() != working_.num_cols()) return false;
+  x.assign(n, 0.0);
+  std::vector<std::size_t> unmapped;
+  for (std::size_t j = 0; j < n; ++j) {
+    if (original_of_[j] == kNoColumn) {
+      unmapped.push_back(j);
+      continue;
+    }
+    x[j] = original.x[original_of_[j]] / scale_of_[j];
+  }
+  // A range column t of `a'x + t = b` (Canonical.hpp) has no original; it is
+  // whatever makes its own equality row hold.
+  const auto& csc = p.A.csc;
+  const auto& csr = p.A.csr;
+  for (const std::size_t j : unmapped) {
+    if (csc.slice_end(j) - csc.slice_begin(j) != 1) return false;
+    const auto row = static_cast<std::size_t>(csc.indices()[csc.slice_begin(j)]);
+    const Real coef = csc.values()[csc.slice_begin(j)];
+    if (row >= p.num_equality || coef == 0.0) return false;
+    Real rest = 0.0;
+    for (std::size_t q = csr.slice_begin(row); q < csr.slice_end(row); ++q) {
+      const auto k = static_cast<std::size_t>(csr.indices()[q]);
+      if (k != j) rest += csr.values()[q] * x[k];
+    }
+    x[j] = (p.b[row] - rest) / coef;
+  }
+  return true;
+}
+
+/// "Create a sub-MIP of the original MIP by changing the bounds of all
+/// integer variables to l_j = floor(x_j) and u_j = ceil(x_j)" ([B] 3.2.1),
+/// x the root LP optimum -- so an integer column integral in x is FIXED -- and
+/// solve it. Every feasible point of the sub-MIP is a rounding of x, and its
+/// optimum is the best rounding any pure rounding heuristic could produce.
+///
+/// The sub-MIP is solved by THIS branch-and-bound (solve_milp), on a copy of
+/// the model with the integer bounds changed, and with RENS and the pump off
+/// inside it; root cuts are also off, as [B] ran the sub-problem with
+/// "expensive presolving strategies and heuristics ... deactivated". The
+/// "after presolving" size test uses this project's canonicalization, which
+/// substitutes out every fixed column.
+core::Status BranchAndBound::rens(const SimplexResult& root) {
+  const auto& m = options_.milp;
+  model::Problem sub = working_.clone();
+  std::size_t fractional_count = 0;
+  for (std::size_t k = 0; k < integers_.size(); ++k) {
+    const IntegerColumn& ic = integers_[k];
+    const Real v = ic.scale * root.x[ic.canonical];
+    Real lo = std::floor(v);
+    Real hi = std::ceil(v);
+    if (std::fabs(v - std::round(v)) <= m.integer_tolerance) {
+      lo = hi = std::round(v);
+    } else {
+      ++fractional_count;
+    }
+    sub.col_lower[ic.original] = std::max(sub.col_lower[ic.original], lo);
+    sub.col_upper[ic.original] = std::min(sub.col_upper[ic.original], hi);
+  }
+  if (static_cast<Real>(fractional_count) >
+      m.rens_max_fractional_ratio * static_cast<Real>(integers_.size())) {
+    return core::Status::Ok();
+  }
+  auto sub_canon = model::canonicalize(sub, options_);
+  if (!sub_canon.has_value()) return core::Status::Ok();  // e.g. proven empty
+  if (static_cast<Real>(sub_canon->problem.num_cols()) >
+      (1.0 - m.rens_min_reduction) * static_cast<Real>(canon_.problem.num_cols())) {
+    return core::Status::Ok();
+  }
+
+  model::Options sub_options = options_;
+  sub_options.milp.rens = false;
+  sub_options.milp.feasibility_pump = false;
+  sub_options.milp.root_cuts = false;
+  sub_options.milp.node_limit = m.rens_node_limit;
+  sub_options.milp.stall_node_limit = m.rens_stall_nodes;
+  sub_options.milp.time_limit_seconds = std::max(0.0, m.time_limit_seconds - elapsed());
+  MilpStatistics sub_stats;
+  auto result = solve_milp(sub, sub_options, &sub_stats);
+  stats_.rens_nodes += sub_stats.nodes;
+  if (!result.has_value()) return core::Status::Ok();  // a failed heuristic is not an error
+  if (sub_stats.incumbents == 0) return core::Status::Ok();
+
+  std::vector<Real> x;
+  if (!to_canonical(*result, x)) return core::Status::Ok();
+  bool accepted = false;
+  if (const auto st = offer_point(root, x, &accepted); !st.ok()) return st;
+  if (accepted) ++stats_.rens_solutions;
+  return core::Status::Ok();
+}
+
 core::Expected<Solution> BranchAndBound::run() {
   const auto& m = options_.milp;
   const std::size_t n = canon_.problem.num_cols();
@@ -954,6 +1316,10 @@ core::Expected<Solution> BranchAndBound::run() {
 
   while (!open.empty()) {
     if (stats_.nodes >= m.node_limit || elapsed() >= m.time_limit_seconds) break;
+    if (m.stall_node_limit > 0 && have_incumbent_ &&
+        stats_.nodes - last_improvement_node_ >= m.stall_node_limit) {
+      break;
+    }
 
     // The global lower bound is the smallest bound of any open node, whatever
     // order they are PROCESSED in. Once it cannot beat the incumbent (or is
@@ -1031,6 +1397,17 @@ core::Expected<Solution> BranchAndBound::run() {
     if (m.heuristics) {
       if (const auto st = simple_rounding(*lp, &stats_.rounding_solutions); !st.ok()) {
         return st.error();
+      }
+      if (stats_.nodes == 1) {
+        // Root only, both ([CIP] 9.1.1 for RENS; the pump as a start
+        // heuristic, so only while nothing has been found).
+        if (m.feasibility_pump && !have_incumbent_) {
+          if (const auto st = feasibility_pump(*lp); !st.ok()) return st.error();
+        }
+        if (m.rens) {
+          if (const auto st = rens(*lp); !st.ok()) return st.error();
+        }
+        if (dominated(lp->objective)) continue;
       }
       if (const auto st = dive(node, *lp); !st.ok()) return st.error();
       if (dominated(lp->objective)) continue;
