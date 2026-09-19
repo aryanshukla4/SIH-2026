@@ -8,13 +8,15 @@ namespace sovsolve::solver::simplex::detail {
 using core::is_finite_bound;
 
 SimplexEngine::SimplexEngine(const model::CanonicalProblem& problem,
-                             const model::Options& options)
+                             const model::Options& options,
+                             const std::vector<Real>* costs)
     : matrix_(problem),
       opt_(options.simplex),
       time_limit_(options.limits.time_limit_seconds),
       m_(problem.num_rows()),
       n_(problem.num_cols()),
       total_(problem.num_cols() + problem.num_rows()) {
+  matrix_.set_costs(costs);
   lower_.assign(total_, 0.0);
   upper_.assign(total_, 0.0);
   value_.assign(total_, 0.0);
