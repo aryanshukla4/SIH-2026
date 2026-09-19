@@ -45,6 +45,11 @@ Each module has one job and uses the shared project types.
   with reliability branching (Achterberg-Koch-Martin; Achterberg's thesis
   ch. 5). Its enumeration oracle found a dual simplex bug on first run --
   the bound-flipping exit called a feasible LP infeasible -- now fixed.
+- Added Module 28 stage 4: node selection ([CIP] ch. 6, interleaved best
+  estimate / best first with plunging) and dual steepest edge pricing
+  (Koberstein 3.3, 8.2.2.1). Incumbents on 8 of 11 MIPLIB instances (was 2);
+  Netlib dual simplex pivots -55%. The lower bound at a fixed node count got
+  worse on 9 of 11 -- recorded.
 - Added Module 28 stage 3: cost perturbation in the dual simplex (Koberstein
   thesis section 6.3.1), against the dual degeneracy that made pk1's node LPs
   take thousands of pivots. pk1: 125 -> 15.5 pivots per node, 5.5x faster at
@@ -1673,3 +1678,150 @@ problem that was not stalling. Recorded rather than tuned away.
 
 Still no incumbents on these runs: node selection ([CIP] chapter 6) remains
 the next MILP item, and dual steepest edge ([Koberstein] 3.3) the next LP one.
+
+28, stage 4 -- node selection and dual steepest edge.
+
+Both from papers already in hand, transcribed rather than derived:
+[CIP] chapter 6 for the first, Koberstein sections 3.3 and 8.2.2.1 for the
+second.
+
+NODE SELECTION. The search processed nodes best-first only ([CIP] 6.2): it
+always expanded the lowest-bound leaf, whose LP is "usually far away from
+integrality", and so it almost never reached an integer point. It now runs
+SCIP's default, [CIP] 6.6, interleaved best estimate / best first with
+plunging:
+
+  PLUNGE    after a node branches, take its child, else its sibling (6.3).
+            At least 0.1 dmax and at most 0.5 dmax steps per plunge, dmax the
+            deepest node processed; past the minimum, abort once the next
+            node's gap (c_Q - c_lower)/(c_upper - c_lower) exceeds 0.25.
+  CHILD     Martin's rule (6.1): the child that pushes the branching variable
+            FURTHER from its root LP value first. Equal to the root value:
+            up (the thesis gives no rule for the tie).
+  LEAF      when a plunge ends, the best-ESTIMATE leaf (6.4, Forrest et al.:
+            e_Q = c_Q + sum_j min{Psi-_j f-_j, Psi+_j f+_j}), except every
+            10th plunge, which takes the best-BOUND leaf so the global dual
+            bound keeps moving (6.6, bestfreq = 10).
+  TIES      equal bounds by estimate, then deeper first (6.2).
+
+One reading is stated in the code: e_Q needs the node's LP solution, so an
+unsolved child inherits its parent's estimate, as it inherits its bound.
+The open leaves are held in one pool with two ordered indexes (bound,
+estimate). Since nodes are no longer processed in bound order, the proof of
+optimality now checks the GLOBAL lower bound (the smallest open bound)
+against the incumbent, and a node selected out of order is pruned by its own
+bound. --node-selection=best-first restores the old rule.
+
+Tests: the milp_test enumeration oracle runs every branching rule under both
+selections, and a second oracle on 9-variable programs (trees deep enough for
+plunges of several steps, mid-search incumbents and the gap abort) checks
+answer, bound and that plunging actually happened.
+
+DUAL STEEPEST EDGE. The dual simplex priced by the largest violation
+(Dantzig). It now picks the row maximizing violation^2 / beta_r, (3.53), with
+beta_r = ||B^-T e_r||^2 the weight of Forrest and Goldfarb's "Dual algorithm
+I". The update, per pivot, in the thesis's order (8.2.2.1):
+
+  beta_r   recomputed exactly as rho_r'rho_r (rho_r is already there from
+           the pivot row), then beta_r' = beta_r / alpha_qr^2, (3.47a), with
+           alpha_qr from the FTRAN'd column;
+  tau      = B^-1 rho_r, (3.49) -- the one extra FTRAN per iteration;
+  others   beta_i' = beta_i + alpha_qi (alpha_qi beta_r' + kappa tau_i),
+           kappa = -2/alpha_qr -- the reorganized form (8.1), which the
+           thesis found clearly more accurate than (3.50);
+  floor    max{beta, 1e-4}, "as recommended in [26]".
+
+Weights start at 1 (exact for the all-logical basis). They are kept per slot
+with the variable they belong to, so a basis repair's swapped-in logical
+restarts at 1 instead of inheriting a stranger's weight, and they leave the
+solver in w space on the Basis (Basis::dse_weights) -- the thesis's own
+layout -- so they pass untouched through the primal cleanup and into both
+children of a node: "the default is to reuse the weights of the last
+LP-iteration". --dse=0 restores Dantzig.
+
+Tests (dual_simplex_test): from a logical start with no repair the
+recurrence is EXACT, bound flips included (a flip does not change B), so
+every carried weight is compared to ||B^-T e_r||^2 recomputed by dense
+elimination on B's definition -- 1e-9 relative, over 20 random LPs. Five
+mutants, all caught: kappa's sign, the tau term dropped, beta_r not divided
+by alpha^2, the slot's owner not moved to the entering variable, and tau
+FTRAN'd from the pivot column instead of rho. A second test requires the
+same status and objective under both pricings and a different path on some.
+
+MEASURED, NETLIB, dual simplex, Dantzig -> DSE (perturbation on in both):
+every objective identical to all printed digits.
+
+    instance   iterations        time
+    25fv47     12555 ->  6027    1.378s -> 0.645s
+    80bau3b     5440 ->  3358    0.444s -> 0.214s
+    greenbea   15312 ->  4683    7.293s -> 1.141s
+    e226         423 ->   266
+    etamacro     933 ->   574    0.015s -> 0.028s  (slower per pivot)
+    israel       195 ->   124
+    stair        635 ->   450
+    shell        541 ->   492
+    adlittle     117 ->    90
+    standata     113 ->   105
+    afiro, avgas, chip: unchanged (2-13 pivots)
+
+Total over these LPs: 36285 -> 16190 pivots, -55%; Koberstein 9.4 reports
+-43.9% on his set. etamacro is faster in pivots and slower in time -- the
+extra FTRAN per pivot costs more than the saved pivots on a model that small.
+
+MEASURED, MIPLIB, reliability branching, 20000 nodes. bf/dantzig is the
+engine before this stage, il/dantzig adds node selection, il/dse is the new
+default. "none" = no integer point found.
+
+    instance      config      time    pivots/node  incumbent   lower bound
+    pk1           bf/dantzig   4.18s  15.5         none        4.958
+                  il/dantzig   3.60s  14.2         107         0
+                  il/dse       3.51s   9.5         113         0
+    gen-ip054     bf/dantzig   2.13s   5.4         none        6787.3
+                  il/dantzig   1.78s   5.4         7156.8      6775.8
+                  il/dse       1.65s   4.4         7345.9      6775.9
+    timtab1       bf/dantzig   5.62s   4.4         none        360679
+                  il/dantzig   4.91s   3.4         none        202926
+                  il/dse       5.19s   3.2         none        197386
+    mas74         bf/dantzig   2.17s   7.1         none        11082.7
+                  il/dantzig   2.05s   7.8         21931.5     10821.9
+                  il/dse       2.34s   7.4         19320.6     10830.8
+    mas76         bf/dantzig   2.40s   6.0         43413.0     39427.5
+                  il/dantzig   2.56s   6.6         43490.1     39194.3
+                  il/dse       2.20s   6.6         42155.0     39207.2
+    glass4        bf/dantzig  20.40s  16.2         none        8.00005e8
+                  il/dantzig  25.84s  12.8         3.20003e9   8.00003e8
+                  il/dse      28.44s  11.0         4.50005e9   8.00003e8
+    enlight_hard  bf/dantzig   2.84s   3.9         none        21
+                  il/dantzig   2.74s   4.5         none        18
+                  il/dse       2.69s   3.3         none        18
+    gen-ip002     bf/dantzig   2.56s   7.8         none        -4813.8
+                  il/dantzig   2.08s   7.4         none        -4828.7
+                  il/dse       2.07s   5.4         none        -4828.7
+    markshare_4_0 bf/dantzig   1.62s   3.0         22          0
+                  il/dantzig   1.68s   2.8         8           0
+                  il/dse       1.34s   2.7         5           0
+    neos5         bf/dantzig  26.30s  45.2         none        14
+                  il/dantzig  22.76s  49.0         15          13.875
+                  il/dse       9.76s  20.3         15          14
+    assign1-5-8   bf/dantzig  37.53s  33.6         none        195.14
+                  il/dantzig  32.70s  30.0         219         191.97
+                  il/dse      34.45s  23.9         218         192.09
+
+READING IT.
+  - Incumbents: 2 of 11 instances under best-first, 8 of 11 now. neos5's
+    15 is (from memory of MIPLIB, not checked) its optimum; markshare_4_0
+    22 -> 5 (optimum 1).
+  - DSE lowers pivots per node on 10 of 11 and time on 7 of 11; neos5 is
+    the large one, 22.8s -> 9.8s.
+  - THE COST, as [CIP] 6.6 warns for estimate-driven rules: the lower bound
+    at a fixed node count is WORSE on 9 of 11 (equal on the other 2) -- pk1 stays at its root bound
+    0 (best first reached 4.96), timtab1 falls from 360679 to 197386. Only
+    one plunge in ten starts from the best-bound leaf, and plunges leave
+    many open nodes at shallow bounds behind them. Best first is still the
+    better rule for PROVING a bound; the new default is the better one for
+    FINDING solutions, which is what closes a gap once pruning can start.
+  - glass4 is slower (20.4s -> 28.4s) and its incumbents are far from the
+    optimum (~1.2e9). Still no incumbent on timtab1, enlight_hard,
+    gen-ip002 -- [CIP] leaves finding solutions mainly to primal
+    heuristics (chapter 9, diving), which do not exist here yet. That is
+    the next MILP item.
