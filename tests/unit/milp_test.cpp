@@ -481,6 +481,54 @@ void test_heuristics_never_change_the_answer() {
   CHECK(dives > 0);
   CHECK(found > 0);
 }
+
+/// The root heuristics -- feasibility pump and RENS -- on their own: dives
+/// are given no budget, so any heuristic point comes from these two or from
+/// simple rounding. Answers stay exact under enumeration (both only ADD
+/// incumbents, and every point is checked before it may prune), and both
+/// must actually run and, somewhere across the seeds, produce a point.
+/// The first run of this test caught the pump scoring its candidates against
+/// its OWN objective (the costs were swapped in for the whole pump instead of
+/// only for each LP solve): wrong optima, fractional objective values.
+void test_pump_and_rens_never_change_the_answer() {
+  std::size_t pump_rounds = 0;
+  std::size_t rens_nodes = 0;
+  std::size_t pump_found = 0;
+  std::size_t rens_found = 0;
+  for (unsigned seed = 1; seed <= 20; ++seed) {
+    const RandomIp ip = make_random_ip(seed * 32452843u, 9, 4);
+    Real expected = 0.0;
+    const bool has_solution = enumerate(ip, expected);
+    model::Problem problem;
+    if (!parse(to_lp(ip), problem)) continue;
+    model::Options o = options_for(BranchingRule::Reliability);
+    o.milp.dive_quota = 0.0;
+    o.milp.dive_allowance = 0;
+    solver::MilpStatistics stats;
+    auto result = solver::solve_milp(problem, o, &stats);
+    CHECK(result.has_value());
+    if (!result.has_value()) continue;
+    if (has_solution) {
+      CHECK(result->status == SolverStatus::Optimal);
+      CHECK_NEAR(result->objective, expected, 1e-6);
+      CHECK_NEAR(result->best_bound, result->objective, 1e-6);
+    } else {
+      CHECK(result->status == SolverStatus::Infeasible);
+    }
+    CHECK_EQ(stats.dives, std::size_t{0});
+    pump_rounds += stats.pump_rounds;
+    rens_nodes += stats.rens_nodes;
+    pump_found += stats.pump_solutions;
+    rens_found += stats.rens_solutions;
+  }
+  CHECK(pump_rounds > 0);
+  CHECK(rens_nodes > 0);
+  // Each separately: a RENS whose points are all rejected (say, mapped back
+  // to canonical space with the wrong scale) must not hide behind the pump.
+  // Measured with the code as written: pump 11 points, RENS 3.
+  CHECK(pump_found > 0);
+  CHECK(rens_found > 0);
+}
 }  // namespace
 
 int main() {
@@ -488,6 +536,7 @@ int main() {
   test_node_selection_on_deeper_trees();
   test_simple_rounding_at_the_root();
   test_heuristics_never_change_the_answer();
+  test_pump_and_rens_never_change_the_answer();
   test_tiny_knapsack();
   test_integer_infeasible();
   test_maximization_sign();

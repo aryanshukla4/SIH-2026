@@ -353,6 +353,39 @@ struct MilpOptions {
   /// thesis ([CIP] reference [41]), which this code has not seen.
   std::size_t dive_allowance = 1000;
 
+  /// The objective feasibility pump at the root ([CIP] 9.3.3; Berthold,
+  /// "Primal Heuristics for Mixed Integer Programs", ZIB 2006, section 3.1.2
+  /// and Algorithm 3). Run only while there is no incumbent: it is a START
+  /// heuristic. Parameters are Berthold's (his "FP095", the setting he
+  /// recommends): alpha_0 = 1 reduced by `fp_alpha_factor` per round, cycle
+  /// test on alpha within 0.005, stage limits 10000/2000 rounds and 70/600
+  /// stalls (a stall: fractionality not reduced by 10%), T in [10, 30]
+  /// columns flipped on a 1-cycle.
+  bool feasibility_pump = true;
+  Real fp_alpha_factor = 0.95;
+  std::size_t fp_max_rounds_stage1 = 10000;
+  std::size_t fp_max_rounds_stage2 = 2000;
+  std::size_t fp_max_stalls_stage1 = 70;
+  std::size_t fp_max_stalls_stage2 = 600;
+
+  /// RENS at the root ([CIP] 9.1.1; Berthold section 3.2.1): fix the integral
+  /// integer columns of the root LP, bound the fractional ones to
+  /// [floor, ceil], and solve that sub-MIP with this same branch-and-bound.
+  /// [CIP]: "abort the sub-MIP solving process after either a total of 5000
+  /// nodes has been processed or no improvement of the sub-MIP incumbent has
+  /// been found for 500 consecutive nodes"; skip if more than half the
+  /// integer columns are fractional; proceed only if presolving the sub-MIP
+  /// removes at least 25% of the columns.
+  bool rens = true;
+  std::size_t rens_node_limit = 5000;
+  std::size_t rens_stall_nodes = 500;
+  Real rens_max_fractional_ratio = 0.5;
+  Real rens_min_reduction = 0.25;
+
+  /// Stop once this many nodes pass without an improved incumbent (0 = off).
+  /// The RENS sub-MIP's stalling limit; available to any run.
+  std::size_t stall_node_limit = 0;
+
   /// `eta_rel`: pseudocosts count as reliable once both directions have been
   /// observed at least this often. Thesis section 5.7: 8. Zero turns
   /// reliability branching into plain pseudocost branching.

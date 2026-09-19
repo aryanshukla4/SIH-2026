@@ -45,6 +45,10 @@ Each module has one job and uses the shared project types.
   with reliability branching (Achterberg-Koch-Martin; Achterberg's thesis
   ch. 5). Its enumeration oracle found a dual simplex bug on first run --
   the bound-flipping exit called a feasible LP infeasible -- now fixed.
+- Added Module 28 stage 6: objective feasibility pump and RENS at the root
+  ([CIP] 9.3.3, 9.1.1; Berthold Algorithms 3 and 4). RENS improves mas76
+  (gap 2.9% -> 0.29%), gen-ip054 and gen-ip002; the pump finds points but
+  none better. The oracle caught a pump bug on first run -- fixed.
 - Added Module 28 stage 5b: Berthold's diving loop (promising dives run past
   the quota, non-trivial direction, vectorlength diving). timtab1 finds its
   first solution; assign1-5-8 reaches its optimum 212. All MIPLIB optima in
@@ -1964,3 +1968,67 @@ single thread) reported timtab1 "Optimal" at 764774 and mas76 at
 true optimum. A solver's "Optimal" is a gap statement; the solu file's =opt=
 is the reference. HiGHS also left pk1 (gap 58%), gen-ip054 and mas74 open
 in 300 s.
+
+28, stage 6 -- the objective feasibility pump and RENS, at the root.
+
+[CIP] 9.5 ranks them the two most valuable heuristics (7% and 6% of solve
+time); line search diving, already in, is third. Sources: [CIP] 9.3.3 and
+9.1.1, and Berthold [B] section 3.1.2 (Algorithm 3) and 3.2.1 (Algorithm 4).
+
+FEASIBILITY PUMP. Alternate x~ (the LP point rounded on S) and x_bar (the LP
+point closest to x~ in L1 over S) until they meet. Stage 1 S = binaries,
+stage 2 S = all integers from the stage-1 point closest to its rounding;
+stage 3 skipped, as SCIP skips it ([CIP] 9.3.3). The OBJECTIVE pump ([B]
+Definition 3.3): minimize (1-alpha) Delta + alpha (||Delta||/||c||) c'x,
+alpha_0 = 1, times 0.95 per round -- [B]'s FP095, the setting he measured
+best. [B]'s limits: 10000/2000 rounds, 70/600 stalls at 10%, a 1-cycle flips
+T in [10,30] of the most fractional (f > 0.02), a cycle within alpha 0.005
+is perturbed, stage 2 gives up after 100 perturbations. SCIP's form for
+general integers -- cost +1/-1/0 by desired direction, no d_j columns --
+so each round changes costs only and the primal simplex resumes from the
+last basis. Run once, at the root, only while no incumbent exists.
+OURS, stated: the random perturbation flips T random columns of S; [B] only
+says "shifts some of the variables' values ... randomly up or down" and the
+original is in Fischetti-Glover-Lodi ([B] reference [24]), not in hand.
+
+RENS. Fix every integer column integral in the root LP, bound the rest to
+[floor, ceil], solve that sub-MIP with this same branch-and-bound: 5000
+nodes, stop after 500 without improvement (new MilpOptions::stall_node_limit),
+pump/RENS/cuts off inside it. Skipped if more than half the integers are
+fractional or if canonicalizing the sub-MIP removes under 25% of the columns
+([CIP] 9.1.1). Its point comes back in original space and is mapped to
+canonical space (range columns solved from their own row), then checked like
+every heuristic point.
+
+A BUG THE ORACLE CAUGHT on the first run: the pump swapped its own costs into
+the canonical problem for its whole duration, and offer_point and the
+solution reconstruction read those costs -- candidates were scored against
+the pump objective, and milp_test's enumeration reported wrong optima with
+fractional values. The costs are now swapped only around each LP solve.
+
+Tests (milp_test): the 9-variable enumeration oracle with dives disabled, so
+points come from the pump and RENS; answers exact, pump and RENS each run and
+each find points (measured: pump 11, RENS 3 over 20 seeds). Mutants:
+P1 the cost-scoping bug above -- caught (140 failures); P3 RENS mapped back
+with the scale inverted -- caught; P4 RENS fixing nothing -- caught.
+P2 pump direction flipped -- SURVIVES: on binaries, pushing away from the
+rounding still drives every column to a bound, so the flipped pump finds as
+many points (11) on these models. It is a quality defect this oracle cannot
+see; recorded, not hidden.
+
+MEASURED, MIPLIB, 20000 nodes, everything else default, pump+RENS off -> on.
+Incumbents deterministic; wall times noisy again this session and not used.
+
+    instance       incumbent off -> on        optimum         found by
+    mas76          41170.2 -> 40121.9         40005.05        RENS (gap 2.9% -> 0.29%)
+    gen-ip054      6970.5 -> 6871.7           6840.97         RENS (gap 1.9% -> 0.45%)
+    gen-ip002      -4674.3 -> -4724.5         -4783.73        RENS
+    pk1, mas74, markshare_4_0: unchanged (pump and/or RENS found points,
+        none better than the dives')
+    neos5, assign1-5-8: unchanged, already optimal
+    glass4, timtab1: unchanged -- pump 323 / 756 rounds, nothing feasible
+    enlight_hard: still none -- pump 607 rounds, RENS skipped/empty
+
+RENS earns its place; the pump, on this set, finds points but no better ones
+than the dives already had. enlight_hard remains without an incumbent after
+every heuristic in [CIP] chapter 9 that this engine can run.
