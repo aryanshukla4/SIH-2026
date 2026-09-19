@@ -38,6 +38,7 @@
 #include "sovsolve/solver/Presolver.hpp"
 #include "sovsolve/solver/Scaler.hpp"
 #include "sovsolve/solver/pdlp/DualityGap.hpp"
+#include "sovsolve/solver/pdlp/Infeasibility.hpp"
 #include "sovsolve/solver/pdlp/MatVec.hpp"
 #include "sovsolve/solver/pdlp/Pdlp.hpp"
 #include "tests/TestMain.hpp"
@@ -513,11 +514,13 @@ End
 /// The failure mode that matters more than a missed detection: a FEASIBLE
 /// model must never be declared infeasible.
 ///
-/// The certificate tolerance is the only thing standing between the two, and
-/// the margin is not generous -- measured on this corpus, 1e-6 gives no false
-/// verdicts while 1e-4 gives four (25fv47, israel and stair reported
-/// Infeasible, 80bau3b Unbounded, all of them actually Optimal). This pins the
-/// default on the safe side of that cliff.
+/// History worth keeping. Under the OLD test (candidate normalized by its size,
+/// constraints against an absolute epsilon) 1e-4 gave four false verdicts on
+/// the Windows build, 1e-6 gave none there -- and one on the Linux build,
+/// israel, which is why "none" was not a finding. Under arXiv 2102.04592
+/// (50)/(51), measured on BOTH builds with scripts/cert_sweep.sh at 30000
+/// iterations: 1e-4 gives one (greenbea Unbounded), 1e-6 and 1e-8 give none,
+/// and gas11 is detected at all three -- where the old test missed it at 1e-8.
 void test_no_false_verdicts_on_feasible_models() {
   const char* instances[] = {"/netlib/afiro.mps", "/netlib/adlittle.mps"};
   for (const char* name : instances) {
@@ -545,6 +548,180 @@ void test_no_false_verdicts_on_feasible_models() {
   }
 }
 
+
+/// THE REGRESSION THAT MOTIVATED arXiv 2102.04592 (50)/(51) HERE.
+///
+/// The certificate test used to divide a candidate by its own SIZE and then
+/// compare each constraint against an absolute epsilon. That accepts
+/// almost-flat rays. This model is built so the difference is exact:
+///
+///     min -1e-5 x   s.t.  1e-7 x <= 1,   x free
+///
+/// It is BOUNDED -- the optimum is x = 1e7, objective -100. The candidate
+/// `v = 1` improves the objective by 1e-5 and violates the row by 1e-7:
+///
+///     old test   violation 1e-7 <= 1e-6, rate 1e-5 > 1e-6  ->  "Unbounded"
+///     (51)       violation / improvement = 1e-2 > 1e-6      ->  rejected
+///
+/// Exactly the shape that sent a nearly converged israel to a false
+/// `Infeasible` on the Linux build. A genuine ray, by contrast, has zero
+/// violation and must still be accepted, and both halves are checked so the
+/// test cannot pass by the detector simply refusing everything.
+void test_flat_rays_are_rejected() {
+  auto canonical = [](const char* text, model::CanonicalResult& out) {
+    auto parsed = io::parseProblem(text, io::FileFormat::Lp);
+    if (!parsed.has_value()) return false;
+    model::Options o;
+    o.log.level = model::LogOptions::Level::Silent;
+    auto canon = model::canonicalize(parsed.value(), o);
+    if (!canon.has_value()) return false;
+    out = std::move(canon.value());
+    return true;
+  };
+
+  model::CanonicalResult flat;
+  CHECK(canonical(R"(Minimize
+ obj: - 0.00001 x
+Subject To
+ r: 0.0000001 x <= 1
+Bounds
+ x free
+End
+)",
+                  flat));
+  {
+    const model::CanonicalProblem& p = flat.problem;
+    CHECK_EQ(p.num_cols(), std::size_t{1});
+    solver::pdlp::HostMatVec mv(p);
+    solver::pdlp::InfeasibilityDetector detector(p, mv);
+    core::RealVector v_x(p.num_cols(), 1.0);
+    core::RealVector v_y(p.num_rows(), 0.0);
+    // Rejected at every tolerance this project uses or has used.
+    for (Real tol : {1e-4, 1e-6, 1e-8}) {
+      CHECK(detector.classify(v_x, v_y, tol) == solver::pdlp::CertificateKind::None);
+    }
+    // And it stays rejected however the candidate is scaled -- (51) is a
+    // ratio, so a huge or tiny `v` must not change the answer. The old test
+    // normalized by size and so was insensitive to this; the point is that
+    // the NEW one is too, for the right reason.
+    for (Real scale : {1e-8, 1e8}) {
+      core::RealVector scaled(p.num_cols(), scale);
+      CHECK(detector.classify(scaled, v_y, 1e-6) == solver::pdlp::CertificateKind::None);
+    }
+  }
+
+  // A GENUINE ray: unbounded along (1, 1), zero violation.
+  model::CanonicalResult genuine;
+  CHECK(canonical(R"(Minimize
+ obj: -x - y
+Subject To
+ c1: x - y <= 1
+ c2: -x + y <= 1
+Bounds
+ x >= 0
+ y >= 0
+End
+)",
+                  genuine));
+  {
+    const model::CanonicalProblem& p = genuine.problem;
+    solver::pdlp::HostMatVec mv(p);
+    solver::pdlp::InfeasibilityDetector detector(p, mv);
+    core::RealVector v_x(p.num_cols(), 1.0);
+    core::RealVector v_y(p.num_rows(), 0.0);
+    CHECK(detector.classify(v_x, v_y, 1e-8) ==
+          solver::pdlp::CertificateKind::DualInfeasible);
+  }
+
+  // A GENUINE dual ray: x + y >= 10 against x + y <= 4. The `>=` row
+  // canonicalizes to `-x - y <= -10`, so both duals are non-positive and
+  // `v_y = (-1, -1)` gives K'v = 0 with objective rate 10 - 4 = 6.
+  model::CanonicalResult infeasible;
+  CHECK(canonical(R"(Minimize
+ obj: x + y
+Subject To
+ c1: x + y >= 10
+ c2: x + y <= 4
+Bounds
+ 0 <= x <= 100
+ 0 <= y <= 100
+End
+)",
+                  infeasible));
+  {
+    const model::CanonicalProblem& p = infeasible.problem;
+    CHECK_EQ(p.num_equality, std::size_t{0});
+    solver::pdlp::HostMatVec mv(p);
+    solver::pdlp::InfeasibilityDetector detector(p, mv);
+    core::RealVector v_x(p.num_cols(), 0.0);
+    core::RealVector v_y(p.num_rows(), -1.0);
+    CHECK(detector.classify(v_x, v_y, 1e-8) ==
+          solver::pdlp::CertificateKind::PrimalInfeasible);
+  }
+
+  // The two remaining conditions, each found untested by mutation: deleting
+  // either left every check above passing.
+  //
+  // (a) (51)'s BOX condition. `min -x` over `0 <= x <= 1` with an unrelated row:
+  // `v_x = e_x` improves the objective and touches no row, so only the box's
+  // recession cone -- {0} for a boxed column -- says it is not a ray. The model
+  // is bounded (optimum -1).
+  model::CanonicalResult boxed;
+  CHECK(canonical(R"(Minimize
+ obj: -x
+Subject To
+ r: y <= 5
+Bounds
+ 0 <= x <= 1
+ y free
+End
+)",
+                  boxed));
+  {
+    const model::CanonicalProblem& p = boxed.problem;
+    solver::pdlp::HostMatVec mv(p);
+    solver::pdlp::InfeasibilityDetector detector(p, mv);
+    core::RealVector v_x(p.num_cols(), 0.0);
+    v_x[0] = 1.0;  // x, which is boxed
+    core::RealVector v_y(p.num_rows(), 0.0);
+    CHECK(detector.classify(v_x, v_y, 1e-6) == solver::pdlp::CertificateKind::None);
+  }
+
+  // (b) (50)'s SIGN condition. Add a redundant `x + y <= 200` to the
+  // infeasible model and put a large WRONG-SIGNED dual on it. Its projection
+  // onto `y <= 0` is the genuine certificate above -- but the candidate the
+  // sequence produced is not near one, and quietly substituting the projection
+  // would report a certificate that was never observed. The distance moved is
+  // charged to the residual, so this is rejected while the projected vector
+  // itself is accepted.
+  model::CanonicalResult signs;
+  CHECK(canonical(R"(Minimize
+ obj: x + y
+Subject To
+ c1: x + y >= 10
+ c2: x + y <= 4
+ c3: x + y <= 200
+Bounds
+ 0 <= x <= 100
+ 0 <= y <= 100
+End
+)",
+                  signs));
+  {
+    const model::CanonicalProblem& p = signs.problem;
+    CHECK_EQ(p.num_rows(), std::size_t{3});
+    solver::pdlp::HostMatVec mv(p);
+    solver::pdlp::InfeasibilityDetector detector(p, mv);
+    core::RealVector v_x(p.num_cols(), 0.0);
+    core::RealVector wrong(p.num_rows(), -1.0);
+    wrong[2] = 1000.0;
+    CHECK(detector.classify(v_x, wrong, 1e-6) == solver::pdlp::CertificateKind::None);
+    core::RealVector right(p.num_rows(), -1.0);
+    right[2] = 0.0;
+    CHECK(detector.classify(v_x, right, 1e-6) ==
+          solver::pdlp::CertificateKind::PrimalInfeasible);
+  }
+}
 }  // namespace
 
 int main() {
@@ -558,6 +735,7 @@ int main() {
   test_agrees_with_simplex();
   test_normalized_duality_gap_properties();
   test_certificates_without_presolve();
+  test_flat_rays_are_rejected();
   test_no_false_verdicts_on_feasible_models();
   return ::sovsolve::test::report("pdlp_test");
 }
