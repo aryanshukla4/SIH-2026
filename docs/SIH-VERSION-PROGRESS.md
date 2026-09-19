@@ -286,6 +286,10 @@ change the canonical shape between parent and child, and a basis index space can
 survive that. So of the three problems this version was meant to address, two are fixed
 and the third is unblocked but not yet delivered.
 
+*(Later update: dual steepest edge pricing and cost perturbation were both added once
+branch-and-bound made the dual simplex the bottleneck, and the host branch-and-bound of
+Module 28 warm-starts every node from its parent's basis. See module.txt, section 28.)*
+
 **How to say it simply:** *"Pehle humare paas sirf ek hi tarika tha LP solve karne ka, aur
 19 mein se sirf 6–7 problems theek se solve ho rahe the. Ab humne ek doosra, bilkul alag
 algorithm khud se banaya — simplex — aur ab 19 ke 19 solve ho rahe hain. Aur ek problem

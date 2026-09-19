@@ -178,6 +178,17 @@ struct Basis {
   /// w-index of the variable occupying each basic slot, length m.
   /// `basic[r]` is the variable whose value is row r of the FTRAN/BTRAN space.
   std::vector<Index> basic;
+  /// Dual steepest edge weights `beta = ||B^-T e_r||^2` of the basic
+  /// variables, indexed in augmented (w) space -- length n+m, or empty when
+  /// none are known. Koberstein section 8.2.2.1 keeps them in w space "in such
+  /// a way that weight i is assigned to the position corresponding to the
+  /// index B(i) of the associated basic variable", which is what lets them
+  /// survive a change of slot order -- and here, a primal simplex cleanup that
+  /// never reads them, and a branch-and-bound child that inherits its parent's
+  /// basis ("the default is to reuse the weights of the last LP-iteration").
+  /// Entries of nonbasic variables are meaningless. A heuristic's state, not
+  /// part of the basis's identity: `validate()` ignores it.
+  std::vector<Real> dse_weights;
 
   [[nodiscard]] std::size_t num_rows() const noexcept { return basic.size(); }
   [[nodiscard]] std::size_t num_total() const noexcept { return status.size(); }

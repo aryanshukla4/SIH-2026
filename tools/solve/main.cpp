@@ -85,6 +85,8 @@ void print_usage(const char* argv0) {
       "                        finish a dual run that ended without a verdict\n"
       "                        by handing its basis to the primal simplex)\n"
       "  --bound-flipping=0|1  SimplexOptions::bound_flipping    (default 1)\n"
+      "  --dse=0|1             SimplexOptions::dual_steepest_edge (default 1):\n"
+      "                        Koberstein 3.3; 0 = Dantzig pricing\n"
       "  --perturb=0|1         SimplexOptions::cost_perturbation (default 1):\n"
       "                        Koberstein 6.3.1, against dual degeneracy\n"
       "  --simplex-tol-primal=X  SimplexOptions::primal_feasibility_tolerance\n"
@@ -117,6 +119,10 @@ void print_usage(const char* argv0) {
       "  --minres-max-iter=N   IpmOptions::minres_max_iterations      (default 5000 --\n"
       "                        measured necessary, see Options.hpp)\n"
       "  --presolve=0|1        PresolveOptions::enabled               (default 1)\n"
+      "  --node-selection=best-first|interleaved\n"
+      "                        MilpOptions::node_selection (default interleaved):\n"
+      "                        CIP ch. 6 best estimate + plunging, best-bound\n"
+      "                        every 10th plunge\n"
       "  --branching=most-fractional|pseudocost|reliability\n"
       "                        MilpOptions::branching (default reliability). A\n"
       "                        MILP with --method=dual-simplex or primal-simplex\n"
@@ -226,10 +232,22 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       gpu_resident = (val != "0");
     } else if (key == "gpu-spmv-timing") {
       gpu_spmv_timing = (val != "0");
+    } else if (key == "dse") {
+      options.simplex.dual_steepest_edge = (val != "0");
     } else if (key == "perturb") {
       options.simplex.cost_perturbation = (val != "0");
     } else if (key == "mip-cuts") {
       options.milp.root_cuts = (val != "0");
+    } else if (key == "node-selection") {
+      if (val == "best-first") {
+        options.milp.node_selection = sovsolve::model::NodeSelection::BestFirst;
+      } else if (val == "interleaved") {
+        options.milp.node_selection = sovsolve::model::NodeSelection::Interleaved;
+      } else {
+        std::fprintf(stderr, "unknown --node-selection: %s (best-first, interleaved)\n",
+                     val.c_str());
+        return false;
+      }
     } else if (key == "branching") {
       if (val == "most-fractional") {
         options.milp.branching = sovsolve::model::BranchingRule::MostFractional;
@@ -503,6 +521,9 @@ int main(int argc, char** argv) {
       std::printf("strong_branching_fixings=%zu\n", milp_stats.strong_branching_fixings);
       std::printf("unreliable_nodes=%zu\n", milp_stats.unreliable_nodes);
       std::printf("root_cuts=%zu\n", milp_stats.root_cuts);
+      std::printf("incumbents=%zu\n", milp_stats.incumbents);
+      std::printf("first_incumbent_node=%zu\n", milp_stats.first_incumbent_node);
+      std::printf("plunge_steps=%zu\n", milp_stats.plunge_steps);
     }
   }
 

@@ -59,7 +59,11 @@ class DualSolver : public SimplexEngine {
   /// Empty unless this run ended with `Step::Infeasible`.
   std::vector<Real> certificate_;
 
-  [[nodiscard]] std::size_t choose_leaving(Real& delta, Real& sigma) const;
+  [[nodiscard]] std::size_t choose_leaving(Real& delta, Real& sigma);
+  void init_weights();
+  [[nodiscard]] Real weight(std::size_t slot);
+  void update_weights(std::size_t leaving_slot, std::size_t entering);
+  void export_weights();
   [[nodiscard]] bool collect_candidates(Real sigma);
   void apply_flips();
 
@@ -71,6 +75,14 @@ class DualSolver : public SimplexEngine {
   std::vector<Index> offenders_;
   std::vector<Index> single_;
   Real current_bound_ = 0.0;  ///< artificial bound magnitude currently installed
+
+  // Dual steepest edge (Koberstein section 3.3), per SLOT. `weight_owner_[r]`
+  // is the variable slot r's weight belongs to: a basis repair swaps a
+  // logical into a slot without a pivot, and a weight must not be read for a
+  // variable it was not computed for -- such a slot restarts at 1.
+  std::vector<Real> weights_;
+  std::vector<Index> weight_owner_;
+  std::vector<Real> tau_;  ///< B^-1 rho_r, the one extra FTRAN per iteration
 };
 
 // --------------------------------------------------------------------------
@@ -225,30 +237,119 @@ void DualSolver::on_refactorized(bool repaired) {
 // The iteration
 // --------------------------------------------------------------------------
 
-std::size_t DualSolver::choose_leaving(Real& delta, Real& sigma) const {
-  // Dantzig pricing: the largest bound violation, unweighted. Dual steepest
-  // edge divides this by a reference-framework norm so the choice is violation
-  // per unit of dual movement; it needs weight updates threaded through every
-  // pivot, and a provably correct iteration is worth more first than a fast
-  // one.
+// --------------------------------------------------------------------------
+// Dual steepest edge weights
+// --------------------------------------------------------------------------
+
+/// The floor Koberstein section 8.2.2.1 applies to every updated weight, "as
+/// recommended in [26]" (Forrest and Goldfarb): the update formula can round a
+/// small weight negative, and a non-positive weight would make its row's score
+/// infinite or meaningless.
+constexpr Real kMinWeight = 1e-4;
+
+void DualSolver::init_weights() {
+  // "If we start the dual simplex method with an all logical basis, then the
+  // dual steepest edge weights can be initialized with 1.0, which is the
+  // correct value" (chapter 7, on crash bases) -- B = I, so B^-T e_r = e_r. For any other
+  // basis the exact values cost up to m BTRANs; the thesis's branch-and-bound
+  // default is to "reuse the weights of the last LP-iteration" instead, which
+  // is what a warm start's `dse_weights` carries. A variable with no carried
+  // weight starts at 1.
+  weights_.assign(m_, 1.0);
+  weight_owner_.assign(basis_.basic.begin(), basis_.basic.end());
+  tau_.assign(m_, 0.0);
+  if (basis_.dse_weights.size() != total_) return;
+  for (std::size_t r = 0; r < m_; ++r) {
+    const Real w = basis_.dse_weights[static_cast<std::size_t>(basis_.basic[r])];
+    if (std::isfinite(w) && w >= kMinWeight) weights_[r] = w;
+  }
+}
+
+Real DualSolver::weight(std::size_t slot) {
+  if (weight_owner_[slot] != basis_.basic[slot]) {
+    weight_owner_[slot] = basis_.basic[slot];
+    weights_[slot] = 1.0;
+  }
+  return weights_[slot];
+}
+
+void DualSolver::update_weights(std::size_t leaving_slot, std::size_t entering) {
+  // Koberstein section 8.2.2.1, in its order:
+  //
+  //  1. "recompute the value of the weight beta_r = rho_r' rho_r by its
+  //     definition" -- rho_r = B^-T e_r is already in `rho_` from the pivot
+  //     row, and every other weight's update uses beta_r, so an exact one
+  //     stops error from accumulating through it;
+  //  2. beta_r' = beta_r / alpha_qr^2, (3.47a), with alpha_qr taken from the
+  //     FTRAN'd column -- "generally of higher numerical precision" than the
+  //     BTRAN version;
+  //  3. tau = B^-1 rho_r, (3.49), one extra FTRAN on the OLD basis;
+  //  4. every other weight by the reorganized (8.1),
+  //         beta_i' = beta_i + alpha_qi (alpha_qi beta_r' + kappa tau_i),
+  //         kappa = -2 / alpha_qr,
+  //     which the thesis found "worked substantially better" than (3.50)
+  //     because it divides before it squares;
+  //  5. floor at 1e-4.
+  const Real alpha_r = column_[leaving_slot];
+  Real beta_r = 0.0;
+  for (std::size_t i = 0; i < m_; ++i) beta_r += rho_[i] * rho_[i];
+
+  tau_.assign(rho_.begin(), rho_.end());
+  lu_.ftran(core::HostSpan<Real>(tau_.data(), tau_.size()));
+
+  const Real beta_r_new = std::max(beta_r / (alpha_r * alpha_r), kMinWeight);
+  const Real kappa = -2.0 / alpha_r;
+  for (std::size_t i = 0; i < m_; ++i) {
+    if (i == leaving_slot) continue;
+    const Real alpha_i = column_[i];
+    if (alpha_i == 0.0) continue;
+    const Real w = weight(i) + alpha_i * (alpha_i * beta_r_new + kappa * tau_[i]);
+    weights_[i] = std::max(w, kMinWeight);
+  }
+  weights_[leaving_slot] = beta_r_new;
+  weight_owner_[leaving_slot] = static_cast<Index>(entering);
+}
+
+void DualSolver::export_weights() {
+  basis_.dse_weights.assign(total_, 1.0);
+  for (std::size_t r = 0; r < m_; ++r) {
+    basis_.dse_weights[static_cast<std::size_t>(basis_.basic[r])] = weight(r);
+  }
+}
+
+std::size_t DualSolver::choose_leaving(Real& delta, Real& sigma) {
+  // Among the rows violated by more than the primal feasibility tolerance:
+  //
+  //   Dantzig             the largest violation;
+  //   dual steepest edge  the largest  violation^2 / beta_r,  Koberstein
+  //                       (3.53) -- violation per unit length of the dual
+  //                       edge it moves along, so the choice no longer
+  //                       depends on how the rows happen to be scaled
+  //                       (section 3.3, (3.51)).
+  //
+  // With bounds present the weights are those of the standard-form edges, not
+  // the exact bounded ones; the thesis keeps them anyway ("for most problems
+  // this additional effort does not pay off"), which makes (3.53) a heuristic.
+  const bool dse = opt_.dual_steepest_edge;
   std::size_t best = m_;
-  Real worst = opt_.primal_feasibility_tolerance;
+  Real best_score = 0.0;
   for (std::size_t r = 0; r < m_; ++r) {
     const auto bw = static_cast<std::size_t>(basis_.basic[r]);
     const Real xv = x_basic_[r];
-    const Real below = lower_[bw] - xv;
-    if (below > worst) {
-      worst = below;
-      best = r;
-      delta = below;
-      sigma = -1.0;
-    }
+    Real violation = lower_[bw] - xv;
+    Real side = -1.0;
     const Real above = xv - upper_[bw];
-    if (above > worst) {
-      worst = above;
+    if (above > violation) {
+      violation = above;
+      side = 1.0;
+    }
+    if (violation <= opt_.primal_feasibility_tolerance) continue;
+    const Real score = dse ? violation * violation / weight(r) : violation;
+    if (best == m_ || score > best_score) {
+      best_score = score;
       best = r;
-      delta = above;
-      sigma = 1.0;
+      delta = violation;
+      sigma = side;
     }
   }
   return best;
@@ -428,6 +529,8 @@ Step DualSolver::iterate() {
     return Step::Refactorize;
   }
 
+  if (opt_.dual_steepest_edge) update_weights(leaving_slot, entering);
+
   const Real step = residual / (sigma * alpha);
 
   for (std::size_t i = 0; i < m_; ++i) {
@@ -545,6 +648,7 @@ core::Expected<SimplexResult> DualSolver::run(const Basis* warm_start) {
     status = refactorize();
     if (!status.ok()) return status.error();
   }
+  if (opt_.dual_steepest_edge) init_weights();
 
   // Phase 1, run exactly once. Every column that dual feasibility wants on a
   // side it has no bound for -- and every free column, which has no bound at
@@ -662,6 +766,7 @@ core::Expected<SimplexResult> DualSolver::run(const Basis* warm_start) {
     outcome = core::SolverStatus::NotConverged;
   }
 
+  if (opt_.dual_steepest_edge) export_weights();
   SimplexResult packed = pack_result(outcome);
   if (outcome == core::SolverStatus::Infeasible) {
     packed.infeasibility_certificate = certificate_;
