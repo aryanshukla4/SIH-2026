@@ -391,11 +391,103 @@ void test_node_selection_on_deeper_trees() {
   CHECK(plunge_steps > 0);
 }
 
+
+/// [CIP] section 9.1.2 on the smallest case it applies to. The LP optimum
+/// puts a 3-coefficient column at 4/3 (objective 1.33); every column has a
+/// down-lock (the >= row) and no up-lock, so simple rounding rounds UP, to an
+/// integer point of objective 2, which is optimal (no single column reaches
+/// 4). The coefficients have gcd 1 so the MILP row tightening cannot make the
+/// LP integral first. With a one-node limit that point is the only incumbent
+/// the run can have -- and without heuristics the run has none.
+void test_simple_rounding_at_the_root() {
+  model::Problem p;
+  if (!parse(R"(Minimize
+ obj: x1 + x2 + x3
+Subject To
+ cover: 2 x1 + 3 x2 + 3 x3 >= 4
+Bounds
+ 0 <= x1 <= 5
+ 0 <= x2 <= 5
+ 0 <= x3 <= 5
+General
+ x1
+ x2
+ x3
+End
+)",
+             p)) {
+    return;
+  }
+  for (bool heuristics : {true, false}) {
+    model::Options o = options_for(BranchingRule::Reliability);
+    o.milp.heuristics = heuristics;
+    o.milp.node_limit = 1;
+    // Cuts could make the root LP integral, leaving nothing to round.
+    o.milp.root_cuts = false;
+    solver::MilpStatistics stats;
+    auto r = solver::solve_milp(p, o, &stats);
+    CHECK(r.has_value());
+    if (!r.has_value()) continue;
+    if (heuristics) {
+      CHECK_EQ(stats.rounding_solutions, std::size_t{1});
+      CHECK(stats.incumbents >= 1);
+      CHECK_NEAR(r->objective, 2.0, 1e-9);
+    } else {
+      CHECK_EQ(stats.incumbents, std::size_t{0});
+      CHECK_EQ(stats.dives, std::size_t{0});
+    }
+  }
+}
+
+/// Heuristics may only ADD incumbents, so the answer must not move: the
+/// 9-variable oracle, heuristics on and off, both exact. And they must
+/// actually run and find points somewhere -- otherwise "the answer did not
+/// change" is vacuous. Every point they offer is checked against the rows
+/// before it may prune (MilpSolve.cpp offer_point); an unchecked infeasible
+/// point with a good objective would prune the true optimum and show up here
+/// as a wrong answer.
+void test_heuristics_never_change_the_answer() {
+  std::size_t dives = 0;
+  std::size_t found = 0;
+  for (unsigned seed = 1; seed <= 20; ++seed) {
+    const RandomIp ip = make_random_ip(seed * 15485863u, 9, 4);
+    Real expected = 0.0;
+    const bool has_solution = enumerate(ip, expected);
+    model::Problem problem;
+    if (!parse(to_lp(ip), problem)) continue;
+    for (bool heuristics : {true, false}) {
+      model::Options o = options_for(BranchingRule::Reliability);
+      o.milp.heuristics = heuristics;
+      solver::MilpStatistics stats;
+      auto result = solver::solve_milp(problem, o, &stats);
+      CHECK(result.has_value());
+      if (!result.has_value()) continue;
+      if (has_solution) {
+        CHECK(result->status == SolverStatus::Optimal);
+        CHECK_NEAR(result->objective, expected, 1e-6);
+        CHECK_NEAR(result->best_bound, result->objective, 1e-6);
+      } else {
+        CHECK(result->status == SolverStatus::Infeasible);
+      }
+      if (heuristics) {
+        dives += stats.dives;
+        found += stats.dive_solutions + stats.rounding_solutions;
+      } else {
+        CHECK_EQ(stats.dives, std::size_t{0});
+        CHECK_EQ(stats.dive_solutions + stats.rounding_solutions, std::size_t{0});
+      }
+    }
+  }
+  CHECK(dives > 0);
+  CHECK(found > 0);
+}
 }  // namespace
 
 int main() {
   test_every_rule_matches_enumeration();
   test_node_selection_on_deeper_trees();
+  test_simple_rounding_at_the_root();
+  test_heuristics_never_change_the_answer();
   test_tiny_knapsack();
   test_integer_infeasible();
   test_maximization_sign();
