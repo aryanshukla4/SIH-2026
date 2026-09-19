@@ -276,10 +276,59 @@ struct PresolveOptions {
   bool enabled = true;
 };
 
+/// How branch-and-bound picks the variable to branch on (solver/MilpSolve.hpp).
+///
+/// Only the HOST branch-and-bound (Module 28, dual simplex) reads this. The
+/// GPU one (Module 22) always branches most-fractional, because the rules
+/// below need warm-started simplex probes that an interior-point method cannot
+/// provide.
+enum class BranchingRule : std::uint8_t {
+  /// Closest to one-half. Achterberg, Koch and Martin, "Branching rules
+  /// revisited" (2005), section 2.1: "in general not better than selecting the
+  /// variable randomly." Kept as the baseline every other rule is measured
+  /// against.
+  MostFractional,
+  /// History only: the average objective gain per unit of rounding observed on
+  /// past branchings. Reliability branching with `reliability = 0`.
+  Pseudocost,
+  /// Pseudocosts, with strong branching until each is reliable. The default
+  /// rule of SIP and SCIP, and the best performer in the paper's study.
+  Reliability,
+};
+
 /// Module 22 controls: branch-and-bound over the existing LP/QP relaxation
 /// solver (solve_problem, Solve.hpp), activated automatically whenever
 /// Problem::has_discrete() is true -- see solver/gpu/BranchAndBound.hpp.
 struct MilpOptions {
+  /// Module 28, the host branch-and-bound only. Every default below is the
+  /// value Achterberg's thesis "Constraint Integer Programming" (2007)
+  /// sections 5.2-5.7 gives for SCIP, which the thesis reports as tuned.
+  BranchingRule branching = BranchingRule::Reliability;
+
+  /// `eta_rel`: pseudocosts count as reliable once both directions have been
+  /// observed at least this often. Thesis section 5.7: 8. Zero turns
+  /// reliability branching into plain pseudocost branching.
+  Real reliability = 8.0;
+
+  /// `lambda`: strong branching stops once the best score has not changed for
+  /// this many consecutive candidates. Thesis section 5.4: 8.
+  std::size_t lookahead = 8;
+
+  /// `kappa`: at most this many strong-branching candidates per node, a
+  /// safeguard. Thesis section 5.4: 100.
+  std::size_t max_strong_candidates = 100;
+
+  /// `gamma`, the dual simplex iteration limit per strong-branching probe:
+  /// twice the average node LP's iterations, clamped to this range. Thesis
+  /// section 5.4: [10, 500].
+  std::size_t strong_iterations_min = 10;
+  std::size_t strong_iterations_max = 500;
+
+  /// `epsilon` in the product score `max{q-, eps} * max{q+, eps}`, thesis
+  /// equation (5.2). Keeps a zero gain in one direction from zeroing out the
+  /// comparison. Thesis: 1e-6.
+  Real score_epsilon = 1e-6;
+
   /// A column's relaxation value counts as integral once it is within this
   /// distance of the nearest integer.
   Real integer_tolerance = 1e-6;
