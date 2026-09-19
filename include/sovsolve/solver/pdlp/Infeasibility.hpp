@@ -114,9 +114,18 @@
 //                   the dual simplex's artificially-bounded phase 1
 //                   (module.txt section 23, bug 3).
 //
-// So the default is strict, the conditions are checked on the UNSCALED
-// canonical data, and where they do not hold the engine stays silent and lets
-// the iteration limit speak.
+// So the default is strict, and where the conditions do not hold the engine
+// stays silent and lets the iteration limit speak.
+//
+// WHAT "WITHIN A TOLERANCE" MEANS is not a free choice, and getting it wrong
+// is what produced a false verdict here. The reference defines it (section 6,
+// equations (50) and (51)): constraint violation PER UNIT OF OBJECTIVE
+// IMPROVEMENT must be at most epsilon. This file originally normalized the
+// candidate by its own SIZE instead, which accepts rays that are nearly flat
+// -- exactly what a nearly converged run on a FEASIBLE model produces -- and
+// the Linux build duly declared israel infeasible at 7600 iterations. Measured
+// on both builds after the fix (scripts/cert_sweep.sh): 1e-4 gives one false
+// verdict, 1e-6 and 1e-8 none, and gas11 is detected at all three.
 
 #ifndef SOVSOLVE_SOLVER_PDLP_INFEASIBILITY_HPP
 #define SOVSOLVE_SOLVER_PDLP_INFEASIBILITY_HPP
@@ -153,10 +162,15 @@ class InfeasibilityDetector {
 
   /// Tests `(v_x, v_y)` as both kinds of certificate.
   ///
-  /// The candidate is normalized internally, so callers may pass an unscaled
-  /// difference of iterates: every condition except the two strict
-  /// inequalities is scale-invariant, and those are tested relative to the
-  /// candidate's own magnitude.
+  /// The acceptance test is arXiv 2102.04592 section 6, (50) and (51): an
+  /// EPSILON-APPROXIMATE certificate, measuring constraint violation PER UNIT
+  /// OF OBJECTIVE IMPROVEMENT (Euclidean norm). Both are ratios, homogeneous of
+  /// degree zero in the candidate, so callers pass `z^{k+1} - z^k`, `z^k / k`
+  /// or the normalized average unscaled, and no normalization is done here.
+  ///
+  /// It replaced a test that normalized by the candidate's SIZE and compared
+  /// constraints to an absolute epsilon -- which accepted almost-flat rays, and
+  /// declared israel (feasible) infeasible on the Linux build. See the .cpp.
   ///
   /// Costs one `K'` product (for the primal-infeasibility test) and one `K`
   /// product (for the dual-infeasibility test).
@@ -174,7 +188,7 @@ class InfeasibilityDetector {
   std::size_t n_;
 
   core::RealVector scaled_x_;
-  core::RealVector scaled_y_;
+  core::RealVector scaled_y_;  ///< `v_y` projected onto its sign cone
   core::RealVector kt_v_;  ///< `K' v_y`
   core::RealVector k_v_;   ///< `K v_x`
 };
