@@ -20,9 +20,11 @@
 
 #include "sovsolve/core/Types.hpp"
 #include "sovsolve/io/Load.hpp"
+#include "sovsolve/model/Canonical.hpp"
 #include "sovsolve/model/Options.hpp"
 #include "sovsolve/model/Problem.hpp"
 #include "sovsolve/solver/LpSolve.hpp"
+#include "sovsolve/solver/MilpCanonicalPresolve.hpp"
 #include "sovsolve/solver/MilpSolve.hpp"
 #include "tests/TestMain.hpp"
 
@@ -949,6 +951,182 @@ void test_conflict_analysis_never_changes_the_answer() {
   CHECK(logged > 0);  // the per-conflict check above actually checked something
   CHECK(logged_sets > 0);
 }
+
+/// A random IP whose `<=` rows are pushed toward redundancy: the right-hand
+/// side is set a little below the row's maximum activity over the box, so
+/// [CIP] 10.1's step 1f (coefficient tightening, which needs the row to be
+/// redundant whenever one column is off its bound) and step 1d (deleting an
+/// inequality that can never be violated) actually get to fire. Plain random
+/// rows almost never meet either condition.
+RandomIp make_loose_ip(unsigned seed, int n, int m) {
+  RandomIp ip = make_random_ip(seed, n, m);
+  unsigned st = seed ^ 0x9e3779b9u;
+  for (std::size_t i = 0; i < ip.a.size(); ++i) {
+    st = st * 1664525u + 1013904223u;
+    if ((st >> 9) % 3 == 0) continue;  // keep some rows as they were
+    int max_act = 0;
+    for (std::size_t j = 0; j < ip.c.size(); ++j) {
+      const int v = ip.a[i][j];
+      max_act += v * (v > 0 ? ip.hi[j] : ip.lo[j]);
+    }
+    ip.sense[i] = 'L';
+    ip.rhs[i] = max_act - static_cast<int>((st >> 12) % 7u);
+  }
+  return ip;
+}
+
+/// Module 29 checked directly, below the search: the canonical model
+/// presolve_canonical returns is compared, point by point, with the original
+/// over EVERY integer point of the box. Three claims:
+///   - no point is ADDED: a point the presolved model accepts is feasible in
+///     the original (a wrong coefficient-tightening side, a row deleted that
+///     was not redundant, would add points);
+///   - no feasible point inside the FINAL box is lost: bound tightening and
+///     coefficient tightening are valid for every integer point; only dual
+///     fixing may remove feasible points, and it does so through the bounds;
+///   - the optimum survives (dual fixing keeps at least one optimal point).
+/// A PrimalInfeasible verdict must mean the original has no feasible point.
+void test_presolve_keeps_the_integer_points() {
+  std::size_t coefficients = 0, rows_removed = 0, bounds = 0, fixed = 0, compared = 0;
+  for (unsigned seed = 1; seed <= 60; ++seed) {
+    const RandomIp ip = seed % 2 == 0 ? make_loose_ip(seed * 40503u, 7, 4)
+                                      : make_random_ip(seed * 40503u, 7, 4);
+    model::Problem problem;
+    if (!parse(to_lp(ip), problem)) continue;
+    auto canon = model::canonicalize(problem);
+    CHECK(canon.has_value());
+    if (!canon.has_value()) continue;
+    model::CanonicalProblem& p = canon->problem;
+    const std::size_t n = ip.c.size();
+    CHECK_EQ(p.num_cols(), n);  // widths >= 2: no column is substituted out
+    if (p.num_cols() != n) continue;
+    std::vector<Real> integer_scale(n, 1.0);
+    solver::CanonicalPresolveStats ps;
+    const auto st = solver::presolve_canonical(p, integer_scale, 20, ps);
+    coefficients += ps.coefficients_tightened;
+    rows_removed += ps.rows_removed;
+    bounds += ps.bounds_tightened;
+    fixed += ps.columns_fixed;
+
+    const auto points = feasible_points(ip);
+    if (!st.ok()) {
+      CHECK(st.error().code == core::ErrorCode::PrimalInfeasible);
+      CHECK(points.empty());
+      continue;
+    }
+    auto presolved_accepts = [&](const std::vector<int>& x) {
+      for (std::size_t j = 0; j < n; ++j) {
+        if (x[j] < p.col_lower[j] - 1e-9 || x[j] > p.col_upper[j] + 1e-9) return false;
+      }
+      const auto& csr = p.A.csr;
+      for (std::size_t i = 0; i < p.num_rows(); ++i) {
+        Real act = 0.0;
+        for (std::size_t q = csr.slice_begin(i); q < csr.slice_end(i); ++q) {
+          act += csr.values()[q] * x[static_cast<std::size_t>(csr.indices()[q])];
+        }
+        const Real tol = 1e-9 * (1.0 + std::fabs(p.b[i]));
+        if (i < p.num_equality ? std::fabs(act - p.b[i]) > tol : act > p.b[i] + tol) {
+          return false;
+        }
+      }
+      return true;
+    };
+    auto in_final_box = [&](const std::vector<int>& x) {
+      for (std::size_t j = 0; j < n; ++j) {
+        if (x[j] < p.col_lower[j] - 1e-9 || x[j] > p.col_upper[j] + 1e-9) return false;
+      }
+      return true;
+    };
+
+    // Claim 1 over the whole box (odometer, as in enumerate()).
+    std::vector<int> x(ip.lo.begin(), ip.lo.end());
+    std::size_t added = 0;
+    bool has_presolved_point = false;
+    Real presolved_best = 0.0;
+    for (;;) {
+      if (presolved_accepts(x)) {
+        bool orig = true;
+        for (std::size_t i = 0; i < ip.a.size() && orig; ++i) {
+          int lhs = 0;
+          for (std::size_t j = 0; j < n; ++j) lhs += ip.a[i][j] * x[j];
+          orig = ip.sense[i] == 'L' ? lhs <= ip.rhs[i]
+                                    : (ip.sense[i] == 'G' ? lhs >= ip.rhs[i] : lhs == ip.rhs[i]);
+        }
+        if (!orig) ++added;
+        Real obj = 0.0;
+        for (std::size_t j = 0; j < n; ++j) obj += ip.c[j] * x[j];
+        if (!has_presolved_point || (ip.maximize ? obj > presolved_best : obj < presolved_best)) {
+          presolved_best = obj;
+        }
+        has_presolved_point = true;
+      }
+      std::size_t k = 0;
+      while (k < n && x[k] == ip.hi[k]) {
+        x[k] = ip.lo[k];
+        ++k;
+      }
+      if (k == n) break;
+      ++x[k];
+    }
+    CHECK_EQ(added, std::size_t{0});
+
+    // Claims 2 and 3.
+    std::size_t lost = 0;
+    Real best = 0.0;
+    for (std::size_t q = 0; q < points.size(); ++q) {
+      if (in_final_box(points[q].first) && !presolved_accepts(points[q].first)) ++lost;
+      if (q == 0 || (ip.maximize ? points[q].second > best : points[q].second < best)) {
+        best = points[q].second;
+      }
+    }
+    CHECK_EQ(lost, std::size_t{0});
+    CHECK(has_presolved_point == !points.empty());
+    if (has_presolved_point && !points.empty()) CHECK_NEAR(presolved_best, best, 1e-9);
+    ++compared;
+  }
+  CHECK(compared > 0);
+  CHECK(coefficients > 0);
+  CHECK(rows_removed > 0);
+  CHECK(bounds > 0);
+  CHECK(fixed > 0);
+}
+
+/// Module 29 through the search: presolve on and off must both reproduce
+/// enumeration, and with it off every presolve counter stays zero.
+void test_presolve_never_changes_the_answer() {
+  std::size_t reductions = 0;
+  for (unsigned seed = 1; seed <= 30; ++seed) {
+    const RandomIp ip = seed % 2 == 0 ? make_loose_ip(seed * 7368787u, 9, 4)
+                                      : make_random_ip(seed * 7368787u, 9, 4);
+    Real expected = 0.0;
+    const bool has_solution = enumerate(ip, expected);
+    model::Problem problem;
+    if (!parse(to_lp(ip), problem)) continue;
+    for (bool presolve : {true, false}) {
+      model::Options o = options_for(BranchingRule::Reliability);
+      o.milp.presolve = presolve;
+      solver::MilpStatistics stats;
+      auto result = solver::solve_milp(problem, o, &stats);
+      CHECK(result.has_value());
+      if (!result.has_value()) continue;
+      if (has_solution) {
+        CHECK(result->status == SolverStatus::Optimal);
+        CHECK_NEAR(result->objective, expected, 1e-6);
+        CHECK_NEAR(result->best_bound, result->objective, 1e-6);
+      } else {
+        CHECK(result->status == SolverStatus::Infeasible);
+      }
+      const std::size_t r = stats.presolve_bounds + stats.presolve_coefficients +
+                            stats.presolve_rows_removed + stats.presolve_fixed;
+      if (presolve) {
+        reductions += r;
+      } else {
+        CHECK_EQ(r, std::size_t{0});
+      }
+    }
+  }
+  CHECK(reductions > 0);
+}
 }  // namespace
 
 int main() {
@@ -962,6 +1140,8 @@ int main() {
   test_root_cuts_never_change_the_answer();
   test_root_cuts_on_mixed_programs();
   test_conflict_analysis_never_changes_the_answer();
+  test_presolve_keeps_the_integer_points();
+  test_presolve_never_changes_the_answer();
   test_tiny_knapsack();
   test_integer_infeasible();
   test_maximization_sign();

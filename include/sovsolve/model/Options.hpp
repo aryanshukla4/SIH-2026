@@ -395,6 +395,14 @@ struct MilpOptions {
   /// the work -- so this cap is OURS; stopping early is always safe.
   std::size_t propagation_row_visits = 20;
 
+  /// MIP presolve on the canonical model ([CIP] chapter 10, stage A:
+  /// Algorithm 10.1's linear-constraint presolving and Algorithm 10.14's dual
+  /// fixing). See MilpCanonicalPresolve.hpp.
+  bool presolve = true;
+  /// Presolve rounds, stopping earlier when a round changes nothing. [CIP]
+  /// runs its outer loop until no reduction is found; the cap is OURS.
+  std::size_t presolve_rounds = 20;
+
   /// Root cutting planes in canonical space, cut-and-branch as [CIP] 8.10
   /// measures SCIP's default: Gomory mixed integer cuts ([CIP] 8.3 with
   /// Wolter's section 6.1 safeguards) and complemented MIR cuts (Wolter
