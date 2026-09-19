@@ -11,6 +11,7 @@
 
 #include "sovsolve/model/Canonical.hpp"
 #include "sovsolve/solver/LpSolve.hpp"
+#include "sovsolve/solver/MilpCuts.hpp"
 #include "sovsolve/solver/MilpPresolve.hpp"
 #include "sovsolve/solver/Scaler.hpp"
 #include "sovsolve/solver/SolutionReconstructor.hpp"
@@ -608,6 +609,21 @@ core::Expected<Solution> solve_milp(const Problem& problem, const Options& optio
     }
     return st.error();
   }
+
+  // Root cover and GCD cuts, shared with Module 22 (MilpCuts.hpp). Separated
+  // against the LP relaxation, solved here by the same dual simplex the search
+  // uses. They are appended as ORIGINAL rows before canonicalization, so the
+  // search below sees them as ordinary constraints.
+  CutStatistics cut_stats;
+  if (options.milp.root_cuts) {
+    model::Options relaxation = options;
+    relaxation.simplex.method = model::Method::DualSimplex;
+    const auto st = add_root_cuts(working, [&relaxation](const Problem& p) {
+      return solve_lp(p, relaxation);
+    }, &cut_stats);
+    if (!st.ok()) return st.error();
+  }
+  stats.root_cuts = cut_stats.cuts;
 
   auto canon = model::canonicalize(working, options);
   if (!canon.has_value()) {

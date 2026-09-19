@@ -22,6 +22,7 @@
 #include "sovsolve/io/Load.hpp"
 #include "sovsolve/model/Options.hpp"
 #include "sovsolve/solver/LpSolve.hpp"
+#include "sovsolve/solver/MilpSolve.hpp"
 #ifdef SOVSOLVE_ENABLE_CUDA
 #include "sovsolve/solver/gpu/BranchAndBound.hpp"
 #include "sovsolve/solver/gpu/PdlpDevice.hpp"
@@ -114,6 +115,12 @@ void print_usage(const char* argv0) {
       "  --minres-max-iter=N   IpmOptions::minres_max_iterations      (default 5000 --\n"
       "                        measured necessary, see Options.hpp)\n"
       "  --presolve=0|1        PresolveOptions::enabled               (default 1)\n"
+      "  --branching=most-fractional|pseudocost|reliability\n"
+      "                        MilpOptions::branching (default reliability). A\n"
+      "                        MILP with --method=dual-simplex or primal-simplex\n"
+      "                        runs the host branch-and-bound (module.txt 28).\n"
+      "  --mip-cuts=0|1        MilpOptions::root_cuts (default 1): root cover/GCD\n"
+      "                        cuts before the host branch-and-bound\n"
       "  --mip-int-tol=X       MilpOptions::integer_tolerance         (default 1e-6,\n"
       "                        MILP only -- ignored for a pure LP/QP model)\n"
       "  --mip-node-limit=N    MilpOptions::node_limit                (default 100000)\n"
@@ -217,6 +224,21 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       gpu_resident = (val != "0");
     } else if (key == "gpu-spmv-timing") {
       gpu_spmv_timing = (val != "0");
+    } else if (key == "mip-cuts") {
+      options.milp.root_cuts = (val != "0");
+    } else if (key == "branching") {
+      if (val == "most-fractional") {
+        options.milp.branching = sovsolve::model::BranchingRule::MostFractional;
+      } else if (val == "pseudocost") {
+        options.milp.branching = sovsolve::model::BranchingRule::Pseudocost;
+      } else if (val == "reliability") {
+        options.milp.branching = sovsolve::model::BranchingRule::Reliability;
+      } else {
+        std::fprintf(stderr,
+                     "unknown --branching: %s (most-fractional, pseudocost, reliability)\n",
+                     val.c_str());
+        return false;
+      }
     } else if (key == "hsd-max-iter") {
       options.hsd.max_iterations = static_cast<std::size_t>(std::stoul(val));
     } else if (key == "hsd-cg-max-iter") {
@@ -394,7 +416,23 @@ int main(int argc, char** argv) {
   }
 #endif
 
-  auto solution = use_host_engine
+  // A MILP on a simplex method goes to Module 28's branch-and-bound. Before it
+  // existed this called solve_lp, which ignores integrality -- so a MILP asked
+  // for with --method=dual-simplex silently got its LP RELAXATION back.
+  const auto method = options.simplex.method;
+  const bool simplex_method = method == sovsolve::model::Method::DualSimplex ||
+                              method == sovsolve::model::Method::PrimalSimplex;
+  const bool host_milp = is_milp && simplex_method;
+  if (is_milp && use_host_engine && !simplex_method) {
+    std::fprintf(stderr,
+                 "note: this --method ignores integrality; solving the LP RELAXATION. "
+                 "Use --method=dual-simplex for branch-and-bound.\n");
+  }
+  sovsolve::solver::MilpStatistics milp_stats;
+
+  auto solution = host_milp
+                      ? sovsolve::solver::solve_milp(*problem, options, &milp_stats)
+                  : use_host_engine
                       ? sovsolve::solver::solve_lp(*problem, options, provider)
 #ifdef SOVSOLVE_ENABLE_CUDA
                       : sovsolve::solver::gpu::solve(*problem, options);
@@ -451,6 +489,17 @@ int main(int argc, char** argv) {
   if (is_milp) {
     std::printf("nodes_explored=%zu\n", solution->nodes_explored);
     std::printf("best_bound=%.10e\n", solution->best_bound);
+    if (host_milp) {
+      // The branching rules trade nodes against work per node, so nodes alone
+      // would flatter strong branching. These make the trade visible.
+      std::printf("node_lp_iterations=%zu\n", milp_stats.node_lp_iterations);
+      std::printf("strong_branching_probes=%zu\n", milp_stats.strong_branching_probes);
+      std::printf("strong_branching_iterations=%zu\n",
+                  milp_stats.strong_branching_iterations);
+      std::printf("strong_branching_fixings=%zu\n", milp_stats.strong_branching_fixings);
+      std::printf("unreliable_nodes=%zu\n", milp_stats.unreliable_nodes);
+      std::printf("root_cuts=%zu\n", milp_stats.root_cuts);
+    }
   }
 
   return solution->status == sovsolve::core::SolverStatus::Optimal ? 0 : 1;

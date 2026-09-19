@@ -81,6 +81,8 @@ struct MilpStatistics {
   /// Nodes whose relaxation did not converge. Any nonzero value forbids an
   /// Optimal verdict -- see the header.
   std::size_t unreliable_nodes = 0;
+  /// Root cover/GCD cuts appended before the search.
+  std::size_t root_cuts = 0;
 };
 
 /// Solves a mixed-integer LINEAR program. A model with no discrete columns is
