@@ -169,6 +169,9 @@ struct MilpStatistics {
   std::size_t conflict_constraints = 0;
   std::size_t conflict_deductions = 0;
   std::size_t conflict_cutoffs = 0;
+  /// Conflict constraints examined in propagation: a deterministic measure
+  /// of what the watched-literal scheme ([CIP] 7.4) costs.
+  std::size_t conflict_checks = 0;
   /// If set, every conflict constraint created is appended here -- a
   /// verification hook, so a test can check each one against the feasible
   /// points it may not exclude.

@@ -93,6 +93,13 @@ class PseudocostTable {
   }
 
   /// `min{eta-, eta+}`, compared against `eta_rel`.
+  /// How often column `k` has been branched on in direction `up`, with the
+  /// child's LP solved -- [CIP] Algorithm 7.7's "number of evaluated
+  /// downwards branchings", read per direction.
+  [[nodiscard]] Real count(std::size_t k, bool up) const {
+    return up ? entries_[k].count_up : entries_[k].count_down;
+  }
+
   [[nodiscard]] Real reliability(std::size_t k) const {
     return std::min(entries_[k].count_down, entries_[k].count_up);
   }
@@ -194,6 +201,10 @@ struct ConflictConstraint {
   /// `cutoff_value`, the canonical incumbent objective when it was derived.
   bool uses_cutoff = false;
   Real cutoff_value = 0.0;
+  /// [CIP] 7.4: the two watched literals (indices into `literals`; equal for
+  /// a one-literal conflict).
+  std::size_t w1 = 0;
+  std::size_t w2 = 0;
 };
 
 /// Why propagation failed, for the analysis.
@@ -336,6 +347,9 @@ class BranchAndBound {
     global_upper_ = root_upper_;
     integer_scale_.assign(p.num_cols(), 0.0);
     for (const IntegerColumn& ic : integers_) integer_scale_[ic.canonical] = ic.scale;
+    integer_index_.assign(p.num_cols(), kNoColumn);
+    for (std::size_t k = 0; k < integers_.size(); ++k) integer_index_[integers_[k].canonical] = k;
+    watchers_.assign(p.num_cols(), {});
     // [CIP] 7.6: "all objective coefficients are integral ... and all objective
     // coefficients for continuous variables are zero". Canonical c_j is
     // s_j times the original coefficient, since x_original = s_j x_j.
@@ -512,6 +526,18 @@ class BranchAndBound {
   std::vector<Real> active_max_;
 
   std::vector<ConflictConstraint> conflicts_;
+  /// Per canonical column, the conflicts watching a literal on it. Entries go
+  /// stale when a watch moves and are skipped (and dropped) when met.
+  std::vector<std::vector<std::size_t>> watchers_;
+  /// Incremental watching across nodes: the bounds the last node's
+  /// propagation ended with, and the conflicts it left with a false watch
+  /// (they forced a literal, proved the node empty, or are new) -- those are
+  /// re-examined at the next node whatever changed.
+  std::vector<Real> prev_lower_;
+  std::vector<Real> prev_upper_;
+  std::vector<std::size_t> recheck_;
+  /// Canonical column -> index into `integers_`, or kNoColumn.
+  std::vector<std::size_t> integer_index_;
   std::size_t alive_conflicts_ = 0;
   std::size_t oldest_alive_ = 0;
 };
@@ -1175,7 +1201,55 @@ bool BranchAndBound::propagate(std::vector<Real>& lower, std::vector<Real>& uppe
     trail->changes->push_back(BoundChange{j, up, value, old, trail->depth, reason, source,
                                           snapshot, from_lambda});
   };
+  // [CIP] 7.4: conflicts are looked at only through their watched columns.
+  // The columns to look through are those whose bounds are tighter than the
+  // root's -- a watched literal can only have become false there -- and those
+  // tightened during this call.
+  std::vector<std::size_t> changed_cols;
+  std::vector<char> col_marked;
+  const bool have_conflicts = alive_conflicts_ > 0;
+  // A node's propagation (trail given) compares with the bounds the previous
+  // node's propagation ended with: after that call every conflict it did not
+  // put on `recheck_` had two non-false watches, and a watch can turn false
+  // only where a bound is now TIGHTER. Comparing with the root instead (the
+  // first version) re-examined every conflict watching any branched column at
+  // every node -- 1240 examinations a node on gen-ip054. A dive (no trail)
+  // starts from a node and only tightens it, so it compares with the root.
+  // Dives too: a dive starts from the node just propagated -- whose end state
+  // IS prev_ -- and only tightens it, so the same reference holds; a dive
+  // reads the recheck list but leaves it for the next node.
+  const bool incremental = prev_lower_.size() == n;
+  if (have_conflicts) {
+    col_marked.assign(n, 0);
+    const auto& ref_lower = incremental ? prev_lower_ : root_lower_;
+    const auto& ref_upper = incremental ? prev_upper_ : root_upper_;
+    for (std::size_t j = 0; j < n; ++j) {
+      if (lower[j] > ref_lower[j] || upper[j] < ref_upper[j]) {
+        col_marked[j] = 1;
+        changed_cols.push_back(j);
+      }
+    }
+  }
+  std::vector<std::size_t> recheck_next;
+  // Records where the node propagation ended, whatever the outcome.
+  struct EndState {
+    BranchAndBound* self;
+    bool active;
+    std::vector<Real>& lower;
+    std::vector<Real>& upper;
+    std::vector<std::size_t>& next;
+    ~EndState() {
+      if (!active) return;
+      self->prev_lower_ = lower;
+      self->prev_upper_ = upper;
+      self->recheck_ = std::move(next);
+    }
+  } end_state{this, trail != nullptr, lower, upper, recheck_next};
   auto requeue = [&](std::size_t j) {
+    if (have_conflicts && col_marked[j] == 0) {
+      col_marked[j] = 1;
+      changed_cols.push_back(j);
+    }
     for (std::size_t q = csc.slice_begin(j); q < csc.slice_end(j); ++q) {
       const auto row = static_cast<std::size_t>(csc.indices()[q]);
       if (queued[row] == 0) {
@@ -1295,53 +1369,147 @@ bool BranchAndBound::propagate(std::vector<Real>& lower, std::vector<Real>& uppe
   }
 
   // The conflict constraints ([CIP] 11.3: "solely used for domain
-  // propagation"). A bound disjunction with every literal false proves the
-  // node empty; with exactly one literal left undecided, that literal must
-  // hold. A constraint that deduces nothing ages, and is dropped at the limit.
+  // propagation"), by [CIP] Algorithm 7.7's two watched literals, generalized
+  // from 0/1 fixings to bound disjunctions: a literal is TRUE (implied by the
+  // bounds), FALSE (excluded by them) or open. A conflict is examined only
+  // when a column it watches changed; if a watched literal is false it looks
+  // for replacements, and with none left it either forces its last open
+  // literal or proves the node empty. A conflict examined without a deduction
+  // ages, and is dropped at the limit.
   bool deduced = false;
-  for (std::size_t k = 0; k < conflicts_.size(); ++k) {
-    ConflictConstraint& cc = conflicts_[k];
-    if (!cc.alive) continue;
-    std::size_t open_count = 0;
-    std::size_t open_lit = 0;
-    bool satisfied = false;
-    for (std::size_t q = 0; q < cc.literals.size() && !satisfied; ++q) {
-      const Literal& lit = cc.literals[q];
+  if (have_conflicts) {
+    enum class State : std::uint8_t { True, False, Open };
+    auto state = [&](const Literal& lit) {
       const Real tol = kPropTolerance * (1.0 + std::fabs(lit.bound));
       if (lit.upper) {
-        if (upper[lit.col] <= lit.bound + tol) satisfied = true;
-        else if (lower[lit.col] <= lit.bound + tol) { ++open_count; open_lit = q; }
+        if (upper[lit.col] <= lit.bound + tol) return State::True;
+        return lower[lit.col] <= lit.bound + tol ? State::Open : State::False;
+      }
+      if (lower[lit.col] >= lit.bound - tol) return State::True;
+      return upper[lit.col] >= lit.bound - tol ? State::Open : State::False;
+    };
+    // Algorithm 7.7 step 5: among open literals, prefer those whose
+    // falsifying branch direction has been explored least -- a literal
+    // "x <= w" is falsified by branching UP, "x >= w" by branching down.
+    auto branchings = [&](const Literal& lit) {
+      const std::size_t k = integer_index_[lit.col];
+      return k == kNoColumn ? 0.0 : pseudocosts_.count(k, lit.upper);
+    };
+    enum class Outcome : std::uint8_t { Done, Empty };
+    std::vector<char> recheck_marked(conflicts_.size(), 0);
+    auto mark_recheck = [&](std::size_t k) {
+      if (trail == nullptr || k >= recheck_marked.size() || recheck_marked[k] != 0) return;
+      recheck_marked[k] = 1;
+      recheck_next.push_back(k);
+    };
+    // Examine conflict k; afterwards, if a watch is still false, it goes on
+    // the recheck list for the next node.
+    auto examine = [&](std::size_t k) -> Outcome {
+      ConflictConstraint& cc = conflicts_[k];
+      ++stats_.conflict_checks;
+      const State s1 = state(cc.literals[cc.w1]);
+      const State s2 = state(cc.literals[cc.w2]);
+      if (s1 == State::Open && s2 == State::Open) return Outcome::Done;
+      if (s1 == State::True || s2 == State::True) {
+        if (s1 == State::False || s2 == State::False) mark_recheck(k);
+        return Outcome::Done;  // satisfied here
+      }
+      // Steps 4-5: keep an open watch; otherwise take the least-branched
+      // open literals as watches.
+      std::size_t best1 = kNoColumn, best2 = kNoColumn;
+      Real key1 = kInf, key2 = kInf;
+      for (std::size_t q = 0; q < cc.literals.size(); ++q) {
+        const State st = state(cc.literals[q]);
+        if (st == State::True) {
+          mark_recheck(k);
+          return Outcome::Done;
+        }
+        if (st == State::False) continue;
+        const bool was_watched = q == cc.w1 || q == cc.w2;
+        const Real key = was_watched ? -1.0 : branchings(cc.literals[q]);
+        if (key < key1) {
+          best2 = best1;
+          key2 = key1;
+          best1 = q;
+          key1 = key;
+        } else if (key < key2) {
+          best2 = q;
+          key2 = key;
+        }
+      }
+      const std::size_t snap = trail != nullptr ? trail->size() : 0;
+      if (best1 == kNoColumn) {  // step 6: every literal false
+        cc.age = 0;
+        ++stats_.conflict_cutoffs;
+        mark_recheck(k);
+        fail(Cause::Kind::Conflict, k, snap);
+        return Outcome::Empty;
+      }
+      if (best2 == kNoColumn) {  // step 7: the last open literal must hold
+        const Literal lit = cc.literals[best1];
+        if (lit.upper) {
+          record(lit.col, true, lit.bound, upper[lit.col], Reason::Conflict, k, snap, false);
+          upper[lit.col] = lit.bound;
+        } else {
+          record(lit.col, false, lit.bound, lower[lit.col], Reason::Conflict, k, snap, false);
+          lower[lit.col] = lit.bound;
+        }
+        cc.age = 0;
+        ++stats_.conflict_deductions;
+        deduced = true;
+        requeue(lit.col);
+        mark_recheck(k);
+        return Outcome::Done;
+      }
+      // Step 8: move the watches to two open literals.
+      const std::size_t old1 = cc.literals[cc.w1].col;
+      const std::size_t old2 = cc.literals[cc.w2].col;
+      cc.w1 = best1;
+      cc.w2 = best2;
+      for (std::size_t q : {best1, best2}) {
+        const std::size_t col = cc.literals[q].col;
+        if (col != old1 && col != old2) watchers_[col].push_back(k);
+      }
+      if (++cc.age >= options_.milp.conflict_max_age) {
+        cc.alive = false;
+        --alive_conflicts_;
+      }
+      return Outcome::Done;
+    };
+
+    if (incremental && !recheck_.empty()) {
+      std::vector<std::size_t> pending;
+      if (trail != nullptr) {
+        pending = std::move(recheck_);
+        recheck_.clear();
       } else {
-        if (lower[lit.col] >= lit.bound - tol) satisfied = true;
-        else if (upper[lit.col] >= lit.bound - tol) { ++open_count; open_lit = q; }
+        pending = recheck_;  // a dive: read, do not consume
+      }
+      for (std::size_t k : pending) {
+        if (k >= conflicts_.size() || !conflicts_[k].alive) continue;
+        if (examine(k) == Outcome::Empty) return false;
       }
     }
-    if (satisfied) continue;
-    const std::size_t snap = trail != nullptr ? trail->size() : 0;
-    if (open_count == 0) {
-      cc.age = 0;
-      ++stats_.conflict_cutoffs;
-      return fail(Cause::Kind::Conflict, k, snap);
-    }
-    if (open_count == 1) {
-      const Literal lit = cc.literals[open_lit];
-      if (lit.upper) {
-        record(lit.col, true, lit.bound, upper[lit.col], Reason::Conflict, k, snap, false);
-        upper[lit.col] = lit.bound;
-      } else {
-        record(lit.col, false, lit.bound, lower[lit.col], Reason::Conflict, k, snap, false);
-        lower[lit.col] = lit.bound;
+    for (std::size_t c = 0; c < changed_cols.size(); ++c) {
+      const std::size_t j = changed_cols[c];
+      auto& list = watchers_[j];
+      for (std::size_t idx = 0; idx < list.size(); ++idx) {
+        const std::size_t k = list[idx];
+        ConflictConstraint& cc = conflicts_[k];
+        const bool watches_j = cc.literals[cc.w1].col == j || cc.literals[cc.w2].col == j;
+        if (!cc.alive || !watches_j) {
+          list[idx] = list.back();  // stale: the watch moved, or the conflict died
+          list.pop_back();
+          --idx;
+          continue;
+        }
+        if (examine(k) == Outcome::Empty) return false;
       }
-      cc.age = 0;
-      ++stats_.conflict_deductions;
-      deduced = true;
-      requeue(lit.col);
-      continue;
     }
-    if (++cc.age >= options_.milp.conflict_max_age) {
-      cc.alive = false;
-      --alive_conflicts_;
-    }
+    changed_cols.clear();
+    // Columns examined in this pass may be tightened again by the next row
+    // pass; they are re-marked then.
+    std::fill(col_marked.begin(), col_marked.end(), 0);
   }
   if (!deduced || queue.empty() || visits >= max_visits) break;
   }
@@ -1371,24 +1539,28 @@ namespace {
 class TrailIndex {
  public:
   explicit TrailIndex(const std::vector<BoundChange>& trail) {
+    entries_.reserve(trail.size());
     for (std::size_t pos = 0; pos < trail.size(); ++pos) {
-      index_[key(trail[pos].col, trail[pos].upper)].push_back(pos);
+      entries_.emplace_back(key(trail[pos].col, trail[pos].upper), pos);
     }
+    std::sort(entries_.begin(), entries_.end());
   }
   /// The latest change of (col, side) before `snapshot`, or npos.
   [[nodiscard]] std::size_t before(std::size_t col, bool upper, std::size_t snapshot) const {
-    const auto it = index_.find(key(col, upper));
-    if (it == index_.end()) return npos;
-    const auto& v = it->second;
-    auto lb = std::lower_bound(v.begin(), v.end(), snapshot);
-    if (lb == v.begin()) return npos;
-    return *(lb - 1);
+    const std::size_t k = key(col, upper);
+    auto it = std::lower_bound(entries_.begin(), entries_.end(), std::make_pair(k, snapshot));
+    if (it == entries_.begin()) return npos;
+    --it;
+    return it->first == k ? it->second : npos;
   }
   static constexpr std::size_t npos = std::numeric_limits<std::size_t>::max();
 
  private:
   static std::size_t key(std::size_t col, bool upper) { return 2 * col + (upper ? 1 : 0); }
-  std::map<std::size_t, std::vector<std::size_t>> index_;
+  /// (column-side key, trail position), sorted: one allocation and one sort
+  /// per analysis. A map of per-key vectors cost ~3 ms an analysis on
+  /// gen-ip054 -- 6 s of a 21 s run (measured, pinned to one core).
+  std::vector<std::pair<std::size_t, std::size_t>> entries_;
 };
 
 }  // namespace
@@ -1702,6 +1874,48 @@ void BranchAndBound::analyze_conflict(const std::vector<BoundChange>& trail,
                                                        lit.bound * scale_of_[lit.col]});
       }
       stats_.conflict_log->push_back(std::move(rec));
+    }
+    // A ONE-literal conflict is a bound that holds everywhere the cutoff does:
+    // it goes straight into the global bounds (which the analysis already
+    // treats as cutoff-dependent) instead of being watched -- two watches on
+    // one literal would never fire, since they act only when a watch turns
+    // false. Kept in the pool as dead, so every conflict keeps its id.
+    if (cc.literals.size() == 1) {
+      const Literal& lit = cc.literals.front();
+      if (lit.upper) {
+        global_upper_[lit.col] = std::min(global_upper_[lit.col], lit.bound);
+      } else {
+        global_lower_[lit.col] = std::max(global_lower_[lit.col], lit.bound);
+      }
+      ++stats_.conflict_deductions;
+      cc.alive = false;
+      conflicts_.push_back(std::move(cc));
+      ++stats_.conflict_constraints;
+      return true;
+    }
+    // Watches: the two literals whose bound changes came latest on the trail
+    // -- the usual SAT choice: going back up the tree, they are the first to
+    // become open again.
+    {
+      std::size_t pos1 = 0, pos2 = 0, lit1 = 0, lit2 = 0, q = 0;
+      bool have1 = false, have2 = false;
+      for (const auto& [key, pos] : latest) {
+        if (!have1 || pos > pos1) {
+          pos2 = pos1; lit2 = lit1; have2 = have1;
+          pos1 = pos; lit1 = q; have1 = true;
+        } else if (!have2 || pos > pos2) {
+          pos2 = pos; lit2 = q; have2 = true;
+        }
+        ++q;
+      }
+      cc.w1 = lit1;
+      cc.w2 = have2 ? lit2 : lit1;
+    }
+    const std::size_t id = conflicts_.size();
+    recheck_.push_back(id);  // all its literals are false here: look again next node
+    watchers_[cc.literals[cc.w1].col].push_back(id);
+    if (cc.literals[cc.w2].col != cc.literals[cc.w1].col) {
+      watchers_[cc.literals[cc.w2].col].push_back(id);
     }
     conflicts_.push_back(std::move(cc));
     ++alive_conflicts_;
