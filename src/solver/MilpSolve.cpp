@@ -947,13 +947,17 @@ Real round_half_up(Real v) { return std::floor(v + 0.5); }
 /// alpha_0 = 1, alpha <- 0.95 alpha per round.
 ///
 /// CYCLES ([B] Algorithm 3 steps 4-7): a 1-cycle (x~ unchanged) flips the T
-/// most fractional columns (f > 0.02) of S, T uniform in [10, 30]; a longer
-/// cycle -- x~ already seen with alpha within 0.005 -- is broken by a "random
-/// perturbation". Berthold does not specify that perturbation beyond
-/// "shifts some of the variables' values ... randomly up or down, instead of
-/// rounding them as usual"; here it flips T RANDOMLY chosen columns of S to
-/// the other side. That choice is ours; the original is in Fischetti, Glover
-/// and Lodi's paper ([B] reference [24]), not in hand.
+/// most fractional columns (f > 0.02) of S, T uniform in [10, 30] -- as in
+/// Fischetti, Glover and Lodi, "The feasibility pump", Math. Programming 104
+/// (2005) ([FGL]), Figure 1 step 9: "flip the TT = rand(T/2, 3T/2) entries
+/// with highest |x*_j - x~_j|", T = 20. A longer cycle -- x~ already seen
+/// with alpha within 0.005 -- gets [FGL] section 3's random perturbation:
+/// "for each j in I we generate a uniformly random value rho_j in [-0.3, 0.7]
+/// and flip x~_j in case |x*_j - x~_j| + max{rho_j, 0} > 0.5".
+///
+/// A FLIP on a general integer ([FGL] states the rule for 0-1 MIPs) moves
+/// x~_j to the other integer neighbour of x*_j, or one step off x*_j when x*_j
+/// is itself integral, kept within the column's bounds.
 ///
 /// Every candidate goes through offer_point: a rounding that violates a row
 /// is rejected there, never trusted.
@@ -1037,17 +1041,16 @@ core::Status BranchAndBound::feasibility_pump(const SimplexResult& root) {
       };
       while (seen()) {
         if (stage == 2 && ++perturbations > 100) return core::Status::Ok();  // "goto Stage 3"
-        const auto T = static_cast<std::size_t>(10 + std::floor(rng.uniform() * 21.0));
-        for (std::size_t q = 0; q < T; ++q) {
-          const auto i = static_cast<std::size_t>(rng.uniform() * static_cast<Real>(S.size()));
-          const std::size_t col = std::min(i, S.size() - 1);
-          const Real v = value(x_bar, S[col]);
-          tilde[col] = tilde[col] > v ? std::floor(v) : std::ceil(v);
-          if (tilde[col] == round_half_up(v)) tilde[col] += tilde[col] > v ? -1.0 : 1.0;
-          const IntegerColumn& ic = integers_[S[col]];
-          const Real lo = ic.scale * root_lower_[ic.canonical];
-          const Real hi = ic.scale * root_upper_[ic.canonical];
-          tilde[col] = std::clamp(tilde[col], std::ceil(lo - 1e-9), std::floor(hi + 1e-9));
+        for (std::size_t i = 0; i < S.size(); ++i) {
+          const Real v = value(x_bar, S[i]);
+          const Real rho = -0.3 + rng.uniform();  // uniform on [-0.3, 0.7]
+          if (std::fabs(v - tilde[i]) + std::max(rho, 0.0) <= 0.5) continue;
+          Real flipped = tilde[i] > v ? std::floor(v) : std::ceil(v);
+          if (flipped == tilde[i]) flipped += tilde[i] >= v ? -1.0 : 1.0;
+          const IntegerColumn& ic = integers_[S[i]];
+          const Real lo = std::ceil(ic.scale * root_lower_[ic.canonical] - 1e-9);
+          const Real hi = std::floor(ic.scale * root_upper_[ic.canonical] + 1e-9);
+          tilde[i] = std::clamp(flipped, lo, hi);
         }
         if (stage == 1 && perturbations++ > 1000) return core::Status::Ok();
       }
