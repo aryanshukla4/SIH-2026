@@ -41,6 +41,10 @@ Each module has one job and uses the shared project types.
   is the only operation this hardware's FP64 penalty leaves competitive
   (docs/ARCHITECTURE-REVIEW.md 3.5 measures factorization at ~64x slower than
   the CPU, SpMV at ~2x).
+- Added Module 24F: PDLP's iterate resident on the GPU, `--gpu-resident=1`
+  (2026-09-19). 3.6x faster than CPU on datt256 and 4.8x on bab2, 2.3-2.5x
+  over the spmv-only port. Records a pre-existing false infeasibility
+  certificate on israel under the Linux build.
 - Added Module 27: VALID dual bounds (2026-09-15). An approximate dual
   objective is not a bound, and pruning on one silently discards optimal
   solutions -- so this repairs approximate duals to exact feasibility
@@ -975,6 +979,81 @@ is no fill-in and no factor. The same instance's Cholesky factor would not fit.
 KNOWN: `tests/data/ken-18.mps` is corrupt (the parser rejects it as binary
 garbage); only `ken-18.gz` is intact. Not fixed here, and it is why the planned
 third large instance is missing from the table above.
+
+## 24F. PDLP with the iterate resident on the GPU -- added 2026-09-19, `--gpu-resident=1`
+
+Section 24E measured why the first GPU port was slow: on datt256 the kernel
+took 1.63 s and the host<->device copies around it 2.94 s. The copies were a
+cost of the INTERFACE -- `MatVec` takes host spans, so every product shipped
+its input down and its output back.
+
+PART 1 moved the seam up a level. `pdlp::IterationBackend` abstracts the
+ITERATE, not the matrix. The split is read straight off Pdlp.cpp: the HOT path
+(Algorithm 2's trials, the fixed step, the infeasibility sequences, the restart
+average) goes through the backend every iteration; the COLD path (termination,
+restarts, certificates) stays on the host and runs once per check_interval
+(40), as the paper already schedules it. Per trial the backend returns three
+doubles -- what Algorithm 2 line 6 needs to accept or reject. 24 bytes.
+
+`HostIterationBackend` is the old inner loop moved verbatim, INCLUDING THE
+ORDER OF EVERY SUM, because reordering changes the last bits and the adaptive
+step then diverges. Verified bit-identical against the actual pre-refactor
+code, not argued: all 19 corpus instances at default options and again with
+--pdlp-adaptive=0 (checked by stashing, rebuilding the old code and running
+both), then a full 24,120-iteration israel run on Windows AND a 7,600-iteration
+one on Linux -- same status, objective, iterations and product count.
+
+PART 2 is `gpu::DevicePdlpBackend`: every hot-path vector on the device for the
+whole solve, a pointer swap (not a copy) on accept, one pinned 24-byte copy per
+trial as the only sync, and the cold path served by an adapter over the SAME
+device matrix so the model is resident once. The three reductions use a FIXED
+grid -- per-block partials, then one block summing them in order -- and no
+atomics, so a run is reproducible to the bit. Not bit-identical to the host:
+summation order differs and nvcc contracts `x - tau*(c-k)` into an FMA.
+
+A sticky `status()` was added to the interface. The hot-path methods return
+nothing, by design, so a failed launch would otherwise leave the iterate frozen
+and report MaxIterations on a solvable model; the solver now checks it at every
+sync and reports NumericalError.
+
+MEASURED, 2000 iterations, same machine (RTX 3050 Laptop, GA107):
+
+    instance    size     CPU       spmv only   RESIDENT   resident vs CPU
+    25fv47      360 KB   0.05 s    2.30 s      0.76 s     15x slower
+    maros-r7    4.7 MB   0.54 s    1.06 s      0.78 s     1.4x slower
+    datt256     93 MB    16.02 s   11.13 s     4.47 s     3.6x FASTER
+    bab2        106 MB   15.96 s   7.52 s      3.32 s     4.8x FASTER
+
+Residency is 2.3-2.5x over the spmv-only port on the large instances, which is
+what 24E's attribution predicted. Small instances still lose: a trial is now
+~6 launches plus one sync, and that fixed floor is the whole runtime at 360 KB.
+
+CORRECTION, and it matters for how these numbers are quoted: bab2's 4.8x
+exceeds the "~3.8x ceiling" this file and ARCHITECTURE-REVIEW 3.5 gave as the
+bandwidth ratio. That ceiling assumed the CPU saturates its memory bus. Our CPU
+PDLP is a SINGLE-THREADED loop and does not come close. So part of this win is
+against a single-core baseline, and a multi-threaded CPU implementation would
+narrow it. Quote it as "vs our CPU implementation", not "vs the CPU".
+
+TESTS: pdlp_device_test, 2248 checks. The oracle is the host backend, fed the
+same state, operation by operation. afiro and adlittle each fit in ONE 256-thread
+block and so never reach the cross-block reduction stage; a synthetic 2000x600
+model generated in the test spans 8 blocks. (25fv47 would have too, but it is
+gitignored -- a test depending on it passes here and fails on a fresh clone.)
+Seven mutations, all caught: inequality dual projection dropped (48 checks),
+primal clamp dropped (59), extrapolation 2x'-x replaced by x' (46), cross-block
+reduction reading only block 0 (9 -- would PASS without the synthetic model),
+accept doing nothing (33), iterate sum never accumulating (6), K dx losing its
+factor of one half (10).
+
+KNOWN, PRE-EXISTING, NOT FIXED HERE: a FALSE INFEASIBILITY CERTIFICATE on
+Linux. israel is feasible (optimum -896644.8). The Windows build reports
+Optimal at 24,120 iterations; the Linux build -- pre-refactor code included,
+bit-for-bit -- reports Infeasible at 7,600. Compiler rounding sends the
+trajectory to a point where the 1e-6 certificate test fires. The earlier
+finding "1e-6 gives zero false verdicts" was measured on Windows only. The
+certificate test needs to be made robust (e.g. persistence across checks, or a
+verified ray) -- a separate change, and probably a paper question.
 
 ## 25. Homogeneous self-dual embedding -- added 2026-09-14/15, `--method=hsd`
 

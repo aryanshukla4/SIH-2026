@@ -58,7 +58,7 @@ Solution verdict(const Problem& problem, core::SolverStatus status) {
 }  // namespace
 
 Expected<Solution> solve_lp(const Problem& problem, const Options& options,
-                            const MatVecProvider& matvec_provider) {
+                            const PdlpBackendProvider& backend_provider) {
   const auto start = std::chrono::steady_clock::now();
 
   if (problem.has_quadratic()) {
@@ -94,14 +94,18 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options,
     // The injected backend, when there is one. PDLP's only contact with the
     // matrix is through this, so the GPU path differs from the host path in
     // exactly one object and nothing else.
-    pdlp::MatVec* matvec = nullptr;
-    if (matvec_provider) {
-      auto supplied = matvec_provider(canon->problem);
+    PdlpBackends backends;
+    if (backend_provider) {
+      auto supplied = backend_provider(canon->problem);
       if (!supplied.has_value()) return supplied.error();
-      matvec = *supplied;
+      backends = *supplied;
     }
-    auto result = matvec ? pdlp::solve_pdlp(canon->problem, options, *matvec)
-                         : pdlp::solve_pdlp(canon->problem, options);
+    auto result =
+        backends.matvec && backends.iteration
+            ? pdlp::solve_pdlp(canon->problem, options, *backends.matvec,
+                               *backends.iteration)
+        : backends.matvec ? pdlp::solve_pdlp(canon->problem, options, *backends.matvec)
+                          : pdlp::solve_pdlp(canon->problem, options);
     if (!result.has_value()) return result.error();
     canonical = pdlp::to_canonical_solution(canon->problem, *result);
   } else if (options.simplex.method == model::Method::Hsd) {

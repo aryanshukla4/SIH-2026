@@ -26,6 +26,7 @@
 #include "sovsolve/model/Options.hpp"
 #include "sovsolve/model/Problem.hpp"
 #include "sovsolve/model/Solution.hpp"
+#include "sovsolve/solver/pdlp/IterationBackend.hpp"
 #include "sovsolve/solver/pdlp/MatVec.hpp"
 
 namespace sovsolve::solver {
@@ -40,7 +41,7 @@ namespace sovsolve::solver {
 /// silently solved as an LP -- a simplex moves between vertices of the
 /// feasible polytope, and a QP's optimum is generally not at one, so dropping
 /// `Q` would return a confidently wrong answer instead of an error.
-/// Supplies the `K`/`K'` implementation for `Method::Pdlp`, given the problem
+/// Supplies PDLP's backends for `Method::Pdlp`, given the problem
 /// AFTER canonicalize -> presolve -> scale.
 ///
 /// A provider rather than an object, because the backend has to be built
@@ -53,12 +54,24 @@ namespace sovsolve::solver {
 /// The GPU implementation lives in `sovsolve_solver_gpu` and is injected here
 /// rather than selected here, because the `gpu -> solver` library edge is
 /// one-way (src/solver/CMakeLists.txt) and must stay that way.
-using MatVecProvider =
-    std::function<core::Expected<pdlp::MatVec*>(const model::CanonicalProblem&)>;
+///
+/// Two pieces, because PDLP has two paths. `matvec` serves the COLD path --
+/// termination, restarts and certificates, once per `check_interval` -- and,
+/// when `iteration` is null, the hot path too, through the host iteration
+/// backend. `iteration` supplies the HOT path's state directly: the
+/// device-resident implementation (gpu/PdlpDevice.hpp) sets both, pointing
+/// `matvec` at its own cold-path adapter over the same device matrix.
+struct PdlpBackends {
+  pdlp::MatVec* matvec = nullptr;
+  pdlp::IterationBackend* iteration = nullptr;
+};
+
+using PdlpBackendProvider =
+    std::function<core::Expected<PdlpBackends>(const model::CanonicalProblem&)>;
 
 [[nodiscard]] core::Expected<model::Solution> solve_lp(
     const model::Problem& problem, const model::Options& options = {},
-    const MatVecProvider& matvec_provider = {});
+    const PdlpBackendProvider& backend_provider = {});
 
 }  // namespace sovsolve::solver
 
