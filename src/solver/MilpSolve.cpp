@@ -5,6 +5,7 @@
 #include <cmath>
 #include <limits>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <set>
@@ -28,6 +29,7 @@ namespace {
 
 using core::Real;
 using core::SolverStatus;
+using core::is_finite_bound;
 using model::BranchingRule;
 using model::NodeSelection;
 using model::Options;
@@ -250,6 +252,26 @@ class BranchAndBound {
     down_locks_.assign(integers_.size(), 0);
     up_locks_.assign(integers_.size(), 0);
     binary_.assign(integers_.size(), 0);
+    global_lower_ = root_lower_;
+    global_upper_ = root_upper_;
+    integer_scale_.assign(p.num_cols(), 0.0);
+    for (const IntegerColumn& ic : integers_) integer_scale_[ic.canonical] = ic.scale;
+    // [CIP] 7.6: "all objective coefficients are integral ... and all objective
+    // coefficients for continuous variables are zero". Canonical c_j is
+    // s_j times the original coefficient, since x_original = s_j x_j.
+    integral_objective_ = true;
+    for (std::size_t j = 0; j < p.num_cols(); ++j) {
+      if (p.c[j] == 0.0) continue;
+      if (integer_scale_[j] == 0.0) {
+        integral_objective_ = false;
+        break;
+      }
+      const Real original = p.c[j] / integer_scale_[j];
+      if (std::fabs(original - std::round(original)) > 1e-9) {
+        integral_objective_ = false;
+        break;
+      }
+    }
     original_of_.assign(p.num_cols(), kNoColumn);
     scale_of_.assign(p.num_cols(), 1.0);
     for (const auto& rec : canon_.transforms.records()) {
@@ -304,6 +326,12 @@ class BranchAndBound {
   [[nodiscard]] core::Status dive(const Node& node, const SimplexResult& lp);
   [[nodiscard]] bool dive_budget_left() const;
   [[nodiscard]] core::Status feasibility_pump(const SimplexResult& root);
+  /// [CIP] Algorithm 7.1 over every row (and the objective cutoff row once an
+  /// incumbent exists), to a fixed point. Tightens `lower`/`upper` in place;
+  /// returns false when the bounds admit no feasible point.
+  [[nodiscard]] bool propagate(std::vector<Real>& lower, std::vector<Real>& upper);
+  /// [CIP] Algorithm 7.11, on every incumbent improvement.
+  void root_reduced_cost_strengthening();
   [[nodiscard]] core::Status rens(const SimplexResult& root);
   /// Canonical structural point of an ORIGINAL-space solution of `working_`,
   /// or false if some canonical column cannot be recovered.
@@ -349,6 +377,22 @@ class BranchAndBound {
   std::vector<std::size_t> original_of_;
   std::vector<Real> scale_of_;
   std::size_t last_improvement_node_ = 0;
+
+  // --- domain propagation, [CIP] chapter 7 ----------------------------------
+  /// Global bounds: the root's, tightened by root reduced cost strengthening.
+  /// Every node is intersected with them before it is propagated.
+  std::vector<Real> global_lower_;
+  std::vector<Real> global_upper_;
+  /// Per canonical column: the scale of an integer column (`x_original =
+  /// s x`), 0 for a continuous one -- integrality is rounded in ORIGINAL space.
+  std::vector<Real> integer_scale_;
+  /// The objective is integral on every integer point ([CIP] 7.6's test).
+  bool integral_objective_ = false;
+  /// Root LP: objective, point and reduced costs, for Algorithm 7.11.
+  bool have_root_ = false;
+  Real root_objective_ = 0.0;
+  std::vector<Real> root_x_;
+  std::vector<Real> root_reduced_cost_;
 };
 
 Real BranchAndBound::elapsed() const {
@@ -584,6 +628,7 @@ core::Status BranchAndBound::offer_incumbent(const SimplexResult& lp, Real objec
   have_incumbent_ = true;
   incumbent_objective_ = objective;
   incumbent_ = std::move(*solution);
+  if (options_.milp.propagation) root_reduced_cost_strengthening();
   return core::Status::Ok();
 }
 
@@ -879,25 +924,239 @@ core::Status BranchAndBound::dive(const Node& node, const SimplexResult& lp) {
     const Real saved_lower = lower[j];
     const Real saved_upper = upper[j];
     core::Expected<SimplexResult> next = core::make_error(core::ErrorCode::NumericalError, "");
+    std::vector<Real> try_lower;
+    std::vector<Real> try_upper;
     for (int attempt = 0; attempt < 2; ++attempt) {
       const bool go_up = attempt == 0 ? up : !up;  // attempt 1 is step 8
-      lower[j] = saved_lower;
-      upper[j] = saved_upper;
+      try_lower = lower;
+      try_upper = upper;
+      try_lower[j] = saved_lower;
+      try_upper[j] = saved_upper;
       if (go_up) {
-        lower[j] = std::max(lower[j], std::ceil(pick->value) / ic.scale);
+        try_lower[j] = std::max(try_lower[j], std::ceil(pick->value) / ic.scale);
       } else {
-        upper[j] = std::min(upper[j], std::floor(pick->value) / ic.scale);
+        try_upper[j] = std::min(try_upper[j], std::floor(pick->value) / ic.scale);
       }
-      if (lower[j] > upper[j]) continue;
-      next = solve_with(lower, upper, node_lp_, &current.basis);
+      if (try_lower[j] > try_upper[j]) continue;
+      // Step 6: propagate the bound change. An empty domain is an infeasible
+      // LP without solving one, and takes the same backtrack.
+      if (options_.milp.propagation && !propagate(try_lower, try_upper)) continue;
+      next = solve_with(try_lower, try_upper, node_lp_, &current.basis);
       if (!next.has_value()) return next.error();
       stats_.dive_lp_iterations += next->iterations;
-      if (next->status != SolverStatus::Infeasible) break;
+      if (next->status != SolverStatus::Infeasible) {
+        lower.swap(try_lower);
+        upper.swap(try_upper);
+        break;
+      }
     }
     if (!next.has_value() || next->status != SolverStatus::Optimal) return core::Status::Ok();
     if (dominated(next->objective)) return core::Status::Ok();
     current = std::move(*next);
     ++steps;
+  }
+}
+
+// --------------------------------------------------------------------------
+// Domain propagation -- [CIP] chapter 7
+// --------------------------------------------------------------------------
+
+namespace {
+
+/// [CIP] (7.2): the feasibility tolerance epsilon-hat.
+constexpr Real kPropTolerance = 1e-6;
+
+/// [CIP] (7.3): a bound change is accepted only if it cuts off at least 5% of
+/// the domain's width or of the bound's magnitude (at least 1), or makes an
+/// infinite bound finite -- otherwise a chain like 0.2 <= x - y <= 0.8 on
+/// {0..1000} walks the bounds down one unit per round, 1000 rounds long.
+Real min_change(Real lo, Real hi, Real bound) {
+  return 0.05 * std::max(std::min(hi - lo, std::fabs(bound)), 1.0);
+}
+
+}  // namespace
+
+/// [CIP] Algorithm 7.1, applied to the canonical rows -- `A_E x = b_E`
+/// (lambda = rho = b) and `A_I x <= b_I` (lambda = -inf) -- and, once there is
+/// an incumbent, to the objective cutoff row of 7.6. Activity bounds
+/// (Definition 7.1) are recomputed from the current bounds each time a row is
+/// visited rather than kept up to date by the thesis's event handler
+/// (Algorithm 7.2): simpler, and a deduction made from activities that a
+/// tightening earlier in the same visit has made stale is still VALID -- the
+/// stale ones are looser -- only possibly weaker; the row is re-queued anyway.
+///
+/// Per variable ([CIP] 7.1, Reduction 5), with residual activities
+/// alpha_j = min(a'x) - a_j x_j and beta_j likewise:
+///     a_j > 0:  (lambda - beta_j)/a_j <= x_j <= (rho - alpha_j)/a_j
+///     a_j < 0:  (rho - alpha_j)/a_j <= x_j <= (lambda - beta_j)/a_j
+/// then (7.2): relax to five digits, u <- 10^-5 ceil(10^5 u - eps),
+/// l <- 10^-5 floor(10^5 l + eps) -- the extracted text lost the rounding
+/// marks, but "we slightly RELAX the newly calculated bounds" fixes their
+/// direction -- and for an integer column round inward, u <- floor(u + eps),
+/// l <- ceil(l - eps), in original space. Accepted per (7.3). Reduction 4
+/// (min activity above rho, max below lambda) proves the node empty.
+///
+/// NOT from the thesis: a cap of 20 visits per row per call. [CIP] has no
+/// explicit limit -- (7.3) is what bounds the work there -- and the cap only
+/// stops propagation early, which is always safe.
+bool BranchAndBound::propagate(std::vector<Real>& lower, std::vector<Real>& upper) {
+  const model::CanonicalProblem& p = canon_.problem;
+  const std::size_t m = p.num_rows();
+  const std::size_t n = p.num_cols();
+  const auto& csr = p.A.csr;
+  const auto& csc = p.A.csc;
+
+  // The objective row: c'x <= incumbent - delta, or with an integral
+  // objective, <= incumbent - (1 - delta) ([CIP] 7.6).
+  const bool objective_row = have_incumbent_;
+  const Real cutoff = integral_objective_ ? incumbent_objective_ - (1.0 - kPropTolerance)
+                                          : incumbent_objective_ - kPropTolerance;
+  const std::size_t rows = m + (objective_row ? 1 : 0);
+
+  std::deque<std::size_t> queue;
+  std::vector<char> queued(rows, 1);
+  for (std::size_t r = 0; r < rows; ++r) queue.push_back(r);
+  std::size_t visits = 0;
+  const std::size_t max_visits = 20 * rows;
+
+  std::vector<std::pair<std::size_t, Real>> entries;
+  while (!queue.empty() && visits++ < max_visits) {
+    const std::size_t r = queue.front();
+    queue.pop_front();
+    queued[r] = 0;
+
+    entries.clear();
+    Real lambda = -kInf;
+    Real rho = kInf;
+    if (r < m) {
+      for (std::size_t q = csr.slice_begin(r); q < csr.slice_end(r); ++q) {
+        entries.emplace_back(static_cast<std::size_t>(csr.indices()[q]), csr.values()[q]);
+      }
+      rho = p.b[r];
+      if (r < p.num_equality) lambda = p.b[r];
+    } else {
+      for (std::size_t j = 0; j < n; ++j) {
+        if (p.c[j] != 0.0) entries.emplace_back(j, p.c[j]);
+      }
+      rho = cutoff;
+    }
+
+    // Activity bounds, infinite contributions counted separately ([CIP] 7.1).
+    // "Infinite" is this codebase's convention -- a bound of magnitude 1e20 or
+    // more (Types.hpp) -- NOT IEEE infinity: summing a 1e20 "bound" as a
+    // number would swamp the finite part of the activity and could make a
+    // residual too LARGE, i.e. an invalid, too-tight deduction.
+    Real min_act = 0.0, max_act = 0.0;
+    std::size_t min_inf = 0, max_inf = 0;
+    auto lo_bound = [&](std::size_t j, Real a) { return a > 0.0 ? lower[j] : upper[j]; };
+    auto hi_bound = [&](std::size_t j, Real a) { return a > 0.0 ? upper[j] : lower[j]; };
+    for (const auto& [j, a] : entries) {
+      if (is_finite_bound(lo_bound(j, a))) min_act += a * lo_bound(j, a); else ++min_inf;
+      if (is_finite_bound(hi_bound(j, a))) max_act += a * hi_bound(j, a); else ++max_inf;
+    }
+    // Reduction 4.
+    if (min_inf == 0 && min_act > rho + kPropTolerance * (1.0 + std::fabs(rho))) return false;
+    if (max_inf == 0 && std::isfinite(lambda) &&
+        max_act < lambda - kPropTolerance * (1.0 + std::fabs(lambda))) {
+      return false;
+    }
+
+    for (const auto& [j, a] : entries) {
+      // Residuals alpha_j (min) and beta_j (max) over every column but j.
+      Real alpha = -kInf;
+      if (is_finite_bound(lo_bound(j, a))) {
+        if (min_inf == 0) alpha = min_act - a * lo_bound(j, a);
+      } else if (min_inf == 1) {
+        alpha = min_act;
+      }
+      Real beta = kInf;
+      if (is_finite_bound(hi_bound(j, a))) {
+        if (max_inf == 0) beta = max_act - a * hi_bound(j, a);
+      } else if (max_inf == 1) {
+        beta = max_act;
+      }
+
+      Real new_lo = -kInf;
+      Real new_hi = kInf;
+      if (std::isfinite(rho) && std::isfinite(alpha)) {
+        (a > 0.0 ? new_hi : new_lo) = (rho - alpha) / a;
+      }
+      if (std::isfinite(lambda) && std::isfinite(beta)) {
+        (a > 0.0 ? new_lo : new_hi) = (lambda - beta) / a;
+      }
+
+      const Real s = integer_scale_[j];
+      bool changed = false;
+      if (is_finite_bound(new_hi)) {
+        new_hi = 1e-5 * std::ceil(1e5 * new_hi - kPropTolerance);
+        if (s != 0.0) new_hi = std::floor(s * new_hi + kPropTolerance) / s;
+        if (new_hi < upper[j] &&
+            (!is_finite_bound(upper[j]) ||
+             new_hi < upper[j] - min_change(lower[j], upper[j], upper[j]))) {
+          upper[j] = new_hi;
+          changed = true;
+        }
+      }
+      if (is_finite_bound(new_lo)) {
+        new_lo = 1e-5 * std::floor(1e5 * new_lo + kPropTolerance);
+        if (s != 0.0) new_lo = std::ceil(s * new_lo - kPropTolerance) / s;
+        if (new_lo > lower[j] &&
+            (!is_finite_bound(lower[j]) ||
+             new_lo > lower[j] + min_change(lower[j], upper[j], lower[j]))) {
+          lower[j] = new_lo;
+          changed = true;
+        }
+      }
+      if (!changed) continue;
+      ++stats_.propagation_tightenings;
+      if (lower[j] > upper[j] + kPropTolerance * (1.0 + std::fabs(upper[j]))) return false;
+      if (lower[j] > upper[j]) lower[j] = upper[j];  // equal within tolerance
+      for (std::size_t q = csc.slice_begin(j); q < csc.slice_end(j); ++q) {
+        const auto row = static_cast<std::size_t>(csc.indices()[q]);
+        if (queued[row] == 0) {
+          queued[row] = 1;
+          queue.push_back(row);
+        }
+      }
+      if (objective_row && p.c[j] != 0.0 && queued[m] == 0) {
+        queued[m] = 1;
+        queue.push_back(m);
+      }
+    }
+  }
+  return true;
+}
+
+/// [CIP] Algorithm 7.11. With c_R, x_R, r_R the root LP's objective, point and
+/// reduced costs and c^ the incumbent: a column with r_j > 0 cannot exceed
+/// x_R,j + (c^ - c_R)/r_j in any solution better than c^ (the LP bound would
+/// already be c^), and r_j < 0 bounds it from below the same way. GLOBAL
+/// bounds, re-derived on every incumbent improvement; the new bound does not
+/// depend on the current one, so even small tightenings are safe to accept.
+void BranchAndBound::root_reduced_cost_strengthening() {
+  if (!have_root_) return;
+  const Real gap = incumbent_objective_ - root_objective_;
+  if (!(gap >= 0.0)) return;
+  const Real tol = options_.simplex.dual_feasibility_tolerance;
+  for (std::size_t j = 0; j < root_x_.size(); ++j) {
+    const Real r = root_reduced_cost_[j];
+    if (std::fabs(r) <= tol) continue;
+    const Real s = integer_scale_[j];
+    if (r > 0.0) {
+      Real u = root_x_[j] + gap / r;
+      if (s != 0.0) u = std::floor(s * u + kPropTolerance) / s;
+      if (u < global_upper_[j]) {
+        global_upper_[j] = std::max(u, global_lower_[j]);
+        ++stats_.redcost_tightenings;
+      }
+    } else {
+      Real l = root_x_[j] + gap / r;
+      if (s != 0.0) l = std::ceil(s * l - kPropTolerance) / s;
+      if (l > global_lower_[j]) {
+        global_lower_[j] = std::min(l, global_upper_[j]);
+        ++stats_.redcost_tightenings;
+      }
+    }
   }
 }
 
@@ -1345,6 +1604,22 @@ core::Expected<Solution> BranchAndBound::run() {
     // bound is not. Discarding it is pruning by bound, and safe.
     if (dominated(node.bound)) continue;
 
+    // [CIP] chapter 7: the node's bounds, intersected with the global ones,
+    // propagated to a fixed point before the LP sees them. A node proven empty
+    // here is pruned exactly as an infeasible LP would prune it.
+    if (m.propagation) {
+      for (std::size_t j = 0; j < n; ++j) {
+        node.lower[j] = std::max(node.lower[j], global_lower_[j]);
+        node.upper[j] = std::min(node.upper[j], global_upper_[j]);
+      }
+      bool empty = false;
+      for (std::size_t j = 0; j < n && !empty; ++j) empty = node.lower[j] > node.upper[j];
+      if (empty || !propagate(node.lower, node.upper)) {
+        ++stats_.propagation_cutoffs;
+        continue;
+      }
+    }
+
     ++stats_.nodes;
     max_depth = std::max(max_depth, node.depth);
     auto lp = solve_with(node.lower, node.upper, node_lp_, node.warm.get());
@@ -1372,6 +1647,13 @@ core::Expected<Solution> BranchAndBound::run() {
       continue;
     }
 
+    if (!have_root_) {
+      have_root_ = true;
+      root_objective_ = lp->objective;
+      root_x_.assign(lp->x.begin(), lp->x.begin() + static_cast<std::ptrdiff_t>(n));
+      root_reduced_cost_.assign(lp->reduced_cost.begin(),
+                                lp->reduced_cost.begin() + static_cast<std::ptrdiff_t>(n));
+    }
     if (root_values_.empty()) {
       root_values_.resize(integers_.size());
       for (std::size_t k = 0; k < integers_.size(); ++k) {

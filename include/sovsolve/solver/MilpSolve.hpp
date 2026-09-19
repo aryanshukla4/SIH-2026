@@ -48,6 +48,9 @@
 //             has none. At the root, the objective feasibility pump (9.3.3,
 //             Berthold 2006 Algorithm 3 stages 1-2, SCIP's +-1/0 costs for
 //             general integers) and RENS (9.1.1) on this same search.
+//   propagation [CIP] chapter 7: Algorithm 7.1 on every row at every node
+//             and in dives, the objective cutoff as one more row (7.6), and
+//             root reduced cost strengthening of the global bounds (7.7).
 //
 // WHAT THE SEARCH WORKS ON. The model is canonicalized and scaled ONCE, at the
 // root, and a node is just a set of canonical column bounds. Canonicalization
@@ -120,6 +123,12 @@ struct MilpStatistics {
   std::size_t pump_solutions = 0;
   std::size_t rens_nodes = 0;
   std::size_t rens_solutions = 0;
+  /// [CIP] chapter 7: bounds tightened by propagation (local, all nodes and
+  /// dives), nodes it proved empty before their LP was solved, and global
+  /// bounds tightened by root reduced cost strengthening.
+  std::size_t propagation_tightenings = 0;
+  std::size_t propagation_cutoffs = 0;
+  std::size_t redcost_tightenings = 0;
 };
 
 /// Solves a mixed-integer LINEAR program. A model with no discrete columns is
