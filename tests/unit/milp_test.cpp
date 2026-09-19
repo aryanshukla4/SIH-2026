@@ -22,6 +22,7 @@
 #include "sovsolve/io/Load.hpp"
 #include "sovsolve/model/Options.hpp"
 #include "sovsolve/model/Problem.hpp"
+#include "sovsolve/solver/LpSolve.hpp"
 #include "sovsolve/solver/MilpSolve.hpp"
 #include "tests/TestMain.hpp"
 
@@ -39,6 +40,15 @@ constexpr BranchingRule kRules[] = {BranchingRule::MostFractional,
 
 constexpr NodeSelection kSelections[] = {NodeSelection::BestFirst,
                                          NodeSelection::Interleaved};
+
+/// For tests of one search component (plunging, a heuristic): the root cuts
+/// of stage 8b often solve these small programs outright, and then the
+/// component under test never gets to run. Answers are unaffected either way.
+model::Options without_cuts(model::Options o) {
+  o.milp.gomory_cuts = false;
+  o.milp.cmir_cuts = false;
+  return o;
+}
 
 model::Options options_for(BranchingRule rule,
                            NodeSelection selection = NodeSelection::Interleaved) {
@@ -371,7 +381,7 @@ void test_node_selection_on_deeper_trees() {
     for (NodeSelection selection : kSelections) {
       solver::MilpStatistics stats;
       auto result = solver::solve_milp(
-          problem, options_for(BranchingRule::Reliability, selection), &stats);
+          problem, without_cuts(options_for(BranchingRule::Reliability, selection)), &stats);
       CHECK(result.has_value());
       if (!result.has_value()) continue;
       ++checked;
@@ -424,6 +434,7 @@ End
     o.milp.node_limit = 1;
     // Cuts could make the root LP integral, leaving nothing to round.
     o.milp.root_cuts = false;
+    o = without_cuts(o);
     solver::MilpStatistics stats;
     auto r = solver::solve_milp(p, o, &stats);
     CHECK(r.has_value());
@@ -504,6 +515,7 @@ void test_pump_and_rens_never_change_the_answer() {
     model::Options o = options_for(BranchingRule::Reliability);
     o.milp.dive_quota = 0.0;
     o.milp.dive_allowance = 0;
+    o = without_cuts(o);
     solver::MilpStatistics stats;
     auto result = solver::solve_milp(problem, o, &stats);
     CHECK(result.has_value());
@@ -644,6 +656,168 @@ End
     CHECK_NEAR(r->objective, -7.0, 1e-7);
   }
 }
+
+/// Stage 8b's root cuts under the oracle. A cut that removes an integer
+/// point -- a wrong MIR coefficient, a sign slip substituting a bound or a
+/// slack back, a scaling that is not exact -- can delete the optimum, and
+/// shows up here as a wrong answer or a false Infeasible. Cuts on and off
+/// must both match enumeration; with them on, both separators must produce
+/// cuts somewhere, cuts must enter the LP, and the root bound must never get
+/// WORSE -- adding valid rows to a minimization can only raise its LP value.
+void test_root_cuts_never_change_the_answer() {
+  std::size_t gomory = 0;
+  std::size_t cmir = 0;
+  std::size_t added = 0;
+  std::size_t improved = 0;
+  for (unsigned seed = 1; seed <= 40; ++seed) {
+    const RandomIp ip = make_random_ip(seed * 86028121u, 9, 4);
+    Real expected = 0.0;
+    const bool has_solution = enumerate(ip, expected);
+    model::Problem problem;
+    if (!parse(to_lp(ip), problem)) continue;
+    for (bool cuts : {true, false}) {
+      model::Options o = options_for(BranchingRule::Reliability);
+      o.milp.gomory_cuts = cuts;
+      o.milp.cmir_cuts = cuts;
+      solver::MilpStatistics stats;
+      auto result = solver::solve_milp(problem, o, &stats);
+      CHECK(result.has_value());
+      if (!result.has_value()) continue;
+      if (has_solution) {
+        CHECK(result->status == SolverStatus::Optimal);
+        CHECK_NEAR(result->objective, expected, 1e-6);
+        CHECK_NEAR(result->best_bound, result->objective, 1e-6);
+      } else {
+        CHECK(result->status == SolverStatus::Infeasible);
+      }
+      if (cuts) {
+        gomory += stats.gomory_cuts;
+        cmir += stats.cmir_cuts;
+        added += stats.cuts_added;
+        if (stats.cut_rounds > 0) {
+          CHECK(stats.root_bound_after_cuts >=
+                stats.root_bound_before_cuts - 1e-7 * (1.0 + std::fabs(stats.root_bound_before_cuts)));
+          if (stats.root_bound_after_cuts > stats.root_bound_before_cuts + 1e-7) ++improved;
+        }
+      } else {
+        CHECK_EQ(stats.cuts_added, std::size_t{0});
+      }
+    }
+  }
+  CHECK(gomory > 0);
+  CHECK(cmir > 0);
+  CHECK(added > 0);
+  CHECK(improved > 0);
+}
+
+/// A MIXED-integer oracle, for what the pure-integer one cannot reach:
+/// continuous structural columns, which c-MIR aggregates away and whose
+/// bounds it substitutes -- a lower, an upper, or both finite. Every integer
+/// assignment in the box is fixed in turn and the continuous remainder solved
+/// as an LP (solve_lp, whose own suites stand behind it); the best of those is
+/// the optimum. Cuts on and off must both reproduce it.
+void test_root_cuts_on_mixed_programs() {
+  std::size_t checked = 0;
+  std::size_t cmir = 0;
+  for (unsigned seed = 1; seed <= 25; ++seed) {
+    unsigned st = seed * 2654435761u;
+    auto next = [&st]() {
+      st = st * 1664525u + 1013904223u;
+      return static_cast<int>((st >> 8) % 10007u);
+    };
+    auto nonzero = [&next]() {
+      const int v = next() % 17 - 8;
+      return v == 0 ? 3 : v;
+    };
+    // x0..x2 integer, y0 in [0,5], y1 in [-3,4], y2 >= 0.
+    std::string t = next() % 2 == 0 ? "Maximize\n obj:" : "Minimize\n obj:";
+    const char* names[6] = {"x0", "x1", "x2", "y0", "y1", "y2"};
+    for (int j = 0; j < 6; ++j) {
+      const int c = nonzero();
+      t += std::string(c < 0 ? " - " : " + ") + std::to_string(c < 0 ? -c : c) + " " + names[j];
+    }
+    t += "\nSubject To\n";
+    for (int i = 0; i < 3; ++i) {
+      t += " r" + std::to_string(i) + ":";
+      for (int j = 0; j < 6; ++j) {
+        const int a = next() % 11 - 5;
+        const std::string mag = j < 3 ? std::to_string(a < 0 ? -a : a)
+                                      : std::to_string(a < 0 ? -a : a) + ".5";
+        t += std::string(a < 0 ? " - " : " + ") + mag + " " + names[j];
+      }
+      const int kind = next() % 3;
+      t += kind == 0 ? " <= " : (kind == 1 ? " >= " : " = ");
+      t += std::to_string(next() % 15 - 3) + "\n";
+    }
+    t += "Bounds\n";
+    for (int j = 0; j < 3; ++j) {
+      const int lo = next() % 3 - 1;
+      t += " " + std::to_string(lo) + " <= " + names[j] + " <= " +
+           std::to_string(lo + 2 + next() % 3) + "\n";
+    }
+    t += " 0 <= y0 <= 5\n -3 <= y1 <= 4\n y2 >= 0\nGeneral\n x0\n x1\n x2\nEnd\n";
+
+    model::Problem problem;
+    if (!parse(t, problem)) continue;
+
+    // The oracle: every integer point, the LP over the rest.
+    std::vector<std::size_t> ints;
+    for (std::size_t j = 0; j < problem.num_cols(); ++j) {
+      if (problem.col_type[j] != core::VarType::Continuous) ints.push_back(j);
+    }
+    if (ints.size() != 3) continue;
+    const bool maximize = problem.sense == core::ObjSense::Maximize;
+    bool found = false;
+    bool unbounded = false;
+    Real best = 0.0;
+    std::vector<int> v(3);
+    for (std::size_t k = 0; k < 3; ++k) v[k] = static_cast<int>(problem.col_lower[ints[k]]);
+    for (;;) {
+      model::Problem fixed = problem.clone();
+      for (std::size_t k = 0; k < 3; ++k) {
+        fixed.col_lower[ints[k]] = v[k];
+        fixed.col_upper[ints[k]] = v[k];
+      }
+      model::Options lo;
+      lo.log.level = model::LogOptions::Level::Silent;
+      lo.simplex.method = model::Method::DualSimplex;
+      auto r = solver::solve_lp(fixed, lo);
+      if (r.has_value() && r->status == SolverStatus::Unbounded) unbounded = true;
+      if (r.has_value() && r->status == SolverStatus::Optimal) {
+        if (!found || (maximize ? r->objective > best : r->objective < best)) best = r->objective;
+        found = true;
+      }
+      std::size_t k = 0;
+      while (k < 3 && v[k] == static_cast<int>(problem.col_upper[ints[k]])) {
+        v[k] = static_cast<int>(problem.col_lower[ints[k]]);
+        ++k;
+      }
+      if (k == 3) break;
+      ++v[k];
+    }
+    if (unbounded) continue;
+
+    for (bool cuts : {true, false}) {
+      model::Options o = options_for(BranchingRule::Reliability);
+      o.milp.gomory_cuts = cuts;
+      o.milp.cmir_cuts = cuts;
+      solver::MilpStatistics stats;
+      auto result = solver::solve_milp(problem, o, &stats);
+      CHECK(result.has_value());
+      if (!result.has_value()) continue;
+      ++checked;
+      if (found) {
+        CHECK(result->status == SolverStatus::Optimal);
+        CHECK_NEAR(result->objective, best, 1e-6 * (1.0 + std::fabs(best)));
+      } else {
+        CHECK(result->status == SolverStatus::Infeasible);
+      }
+      if (cuts) cmir += stats.cmir_cuts;
+    }
+  }
+  CHECK(checked >= 30);
+  CHECK(cmir > 0);
+}
 }  // namespace
 
 int main() {
@@ -654,6 +828,8 @@ int main() {
   test_pump_and_rens_never_change_the_answer();
   test_propagation_never_changes_the_answer();
   test_propagation_respects_infinite_bounds();
+  test_root_cuts_never_change_the_answer();
+  test_root_cuts_on_mixed_programs();
   test_tiny_knapsack();
   test_integer_infeasible();
   test_maximization_sign();

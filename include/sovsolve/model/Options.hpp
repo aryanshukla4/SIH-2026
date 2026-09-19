@@ -391,6 +391,15 @@ struct MilpOptions {
   /// files under separators but which here, as there, only tightens bounds.
   bool propagation = true;
 
+  /// Root cutting planes in canonical space, cut-and-branch as [CIP] 8.10
+  /// measures SCIP's default: Gomory mixed integer cuts ([CIP] 8.3 with
+  /// Wolter's section 6.1 safeguards) and complemented MIR cuts (Wolter
+  /// chapter 3, the fast version), selected by [CIP] Algorithm 3.2, for at
+  /// most `cut_rounds` separation rounds -- Wolter's MAXROUNDS = 15.
+  bool gomory_cuts = true;
+  bool cmir_cuts = true;
+  std::size_t cut_rounds = 15;
+
   /// Stop once this many nodes pass without an improved incumbent (0 = off).
   /// The RENS sub-MIP's stalling limit; available to any run.
   std::size_t stall_node_limit = 0;

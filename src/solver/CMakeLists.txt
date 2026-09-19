@@ -8,6 +8,7 @@ add_library(sovsolve_solver STATIC
   Iis.cpp
   DualBound.cpp
   MilpCuts.cpp
+  MilpSeparators.cpp
   MilpSolve.cpp
   Homogeneous.cpp
   HomogeneousSolve.cpp
