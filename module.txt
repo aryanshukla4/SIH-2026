@@ -1536,3 +1536,64 @@ run went further: 1000 random programs, 4-6 variables, 2-5 rows, 3000 solves,
 432 feasible / 568 infeasible, ZERO mismatches.
 
 IT FOUND A BUG IN THE DUAL SIMPLEX on its first run -- recorded in section 23.
+
+28, stage 2 -- cuts shared, the tool wired, and the first measurement.
+
+ROOT CUTS MOVED, NOT COPIED. Module 22's cover/GCD cut separation lived in
+BranchAndBound.cu wired to the GPU solver, though nothing in it touches the GPU.
+It is now solver/MilpCuts.{hpp,cpp}, add_root_cuts(), and each branch-and-bound
+injects its own LP solver for the root relaxations -- one implementation, not
+two free to drift. branch_and_bound_test (GPU) passes unchanged on it.
+MilpOptions::root_cuts / --mip-cuts=0|1 switches it for Module 28, because cuts
+are rows every node LP carries and whether they pay is per-instance.
+markshare_4_0, 100000 nodes: 60 root cuts; incumbent 12 -> 5 (optimum 1).
+
+THE TOOL. A MILP with --method=dual-simplex or primal-simplex now runs
+solve_milp. Before, it called solve_lp, which ignores integrality: a MILP asked
+for with the simplex silently got its LP RELAXATION back. Other host methods
+(pdlp, hsd) still solve the relaxation and now say so on stderr. --branching=
+selects the rule; the search statistics are printed.
+
+MEASURED, 12 small MIPLIB 2017 instances, 100000-node limit. No instance was
+solved to proven optimality under any rule, so the paper's headline metric --
+nodes to optimality -- is not available yet (see below for why). What IS
+comparable at a fixed node count, and deterministic (three identical runs give
+identical iterations and bounds), is how far each rule pushes the LOWER BOUND:
+
+    instance      most-fractional  pseudocost    reliability   (opt, approx.)
+    timtab1       191278           297474        405956        764772
+    glass4        8.00005e8        8.00005e8     1.00001e9     1.2e9
+    enlight_hard  13               19            23.5          37
+    mas74         11043            11187         11262         11801
+    gen-ip054     6788.8           6793.7        6794.2        6840.97
+    gen-ip002     -4812.3          -4808.0       -4806.6       -4783.73
+    mas76         39530            39638         39622         40005
+
+Reliability gives the strongest bound on 6 of 7, and 2.1x most-fractional's on
+timtab1 -- consistent with [AKM]'s finding that most-fractional is "not better
+than selecting the variable randomly". The optimum column is from memory of
+MIPLIB, marked approximate.
+
+RETRACTED: the same run's TIME-limited rows (pk1, neos5, glass4-reliability,
+assign1-5-8) are not reported. A CUDA build was running concurrently and
+competed for the CPU, so wall-clock comparisons from that window are
+contaminated. Only the node-limited rows above stand.
+
+TWO FINDINGS THAT DECIDE WHAT COMES NEXT.
+
+1. NO INCUMBENTS. On most instances no integer-feasible point was found in
+   100000 nodes under any rule. Pure best-first search always expands the
+   lowest-bound node and never dives deep enough to reach one. That is NODE
+   SELECTION, not branching: [CIP] chapter 6 (best-estimate search with
+   plunging). Until an incumbent exists nothing can be pruned by bound, and
+   the rules cannot be compared on nodes-to-optimality.
+
+2. DUAL DEGENERACY IN THE NODE LPs. pk1 (45 rows) takes 654 pivots at the root
+   and 2000-7500 per node afterwards -- traced per node: every LP Optimal,
+   objective 0, thousands of bound flips, no dual progress. The warm start is
+   not failing (a first child takes 25 pivots); the dual simplex is churning
+   through zero-length dual steps. It prices by largest violation (Dantzig)
+   and has no cost perturbation; section 23 lists dual steepest edge and
+   perturbation as deliberately not done. For a MILP engine they are no longer
+   optional: branch-and-bound multiplies the LP engine's cost by the node
+   count.

@@ -29,6 +29,7 @@
 #include "sovsolve/solver/HomogeneousStep.hpp"
 #include "sovsolve/solver/Iis.hpp"
 #include "sovsolve/solver/LpSolve.hpp"
+#include "sovsolve/solver/MilpCuts.hpp"
 #include "sovsolve/solver/MilpSolve.hpp"
 #include "sovsolve/solver/Regularization.hpp"
 #include "sovsolve/solver/Residuals.hpp"

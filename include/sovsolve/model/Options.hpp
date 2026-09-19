@@ -324,6 +324,12 @@ struct MilpOptions {
   std::size_t strong_iterations_min = 10;
   std::size_t strong_iterations_max = 500;
 
+  /// Separate root cover/GCD cuts before the search (MilpCuts.hpp). Module 28
+  /// only; Module 22 always does. A switch because cuts are not free -- every
+  /// cut is a row every node LP carries -- and whether they pay is a
+  /// per-instance measurement, not an assumption.
+  bool root_cuts = true;
+
   /// `epsilon` in the product score `max{q-, eps} * max{q+, eps}`, thesis
   /// equation (5.2). Keeps a zero gain in one direction from zeroing out the
   /// comparison. Thesis: 1e-6.
