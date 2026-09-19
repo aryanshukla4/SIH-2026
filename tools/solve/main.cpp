@@ -127,6 +127,9 @@ void print_usage(const char* argv0) {
       "                        MilpOptions::branching (default reliability). A\n"
       "                        MILP with --method=dual-simplex or primal-simplex\n"
       "                        runs the host branch-and-bound (module.txt 28).\n"
+      "  --mip-gomory=0|1      MilpOptions::gomory_cuts (default 1)\n"
+      "  --mip-cmir=0|1        MilpOptions::cmir_cuts (default 1)\n"
+      "  --mip-cut-rounds=N    MilpOptions::cut_rounds (default 15)\n"
       "  --mip-propagation=0|1 MilpOptions::propagation (default 1): CIP ch. 7\n"
       "  --mip-pump=0|1        MilpOptions::feasibility_pump (default 1)\n"
       "  --mip-rens=0|1        MilpOptions::rens (default 1)\n"
@@ -241,6 +244,12 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.simplex.dual_steepest_edge = (val != "0");
     } else if (key == "perturb") {
       options.simplex.cost_perturbation = (val != "0");
+    } else if (key == "mip-gomory") {
+      options.milp.gomory_cuts = (val != "0");
+    } else if (key == "mip-cmir") {
+      options.milp.cmir_cuts = (val != "0");
+    } else if (key == "mip-cut-rounds") {
+      options.milp.cut_rounds = static_cast<std::size_t>(std::stoul(val));
     } else if (key == "mip-propagation") {
       options.milp.propagation = (val != "0");
     } else if (key == "mip-pump") {
@@ -550,6 +559,12 @@ int main(int argc, char** argv) {
       std::printf("propagation_cutoffs=%zu\n", milp_stats.propagation_cutoffs);
       std::printf("redcost_tightenings=%zu\n", milp_stats.redcost_tightenings);
       std::printf("local_redcost_tightenings=%zu\n", milp_stats.local_redcost_tightenings);
+      std::printf("cut_rounds=%zu\n", milp_stats.cut_rounds);
+      std::printf("gomory_cuts=%zu\n", milp_stats.gomory_cuts);
+      std::printf("cmir_cuts=%zu\n", milp_stats.cmir_cuts);
+      std::printf("cuts_added=%zu\n", milp_stats.cuts_added);
+      std::printf("root_bound_before_cuts=%.10e\n", milp_stats.root_bound_before_cuts);
+      std::printf("root_bound_after_cuts=%.10e\n", milp_stats.root_bound_after_cuts);
     }
   }
 

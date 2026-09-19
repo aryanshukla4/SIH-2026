@@ -132,6 +132,16 @@ struct MilpStatistics {
   /// [CIP] 8.8: LOCAL bounds tightened at a node by its own LP's reduced
   /// costs, inherited by its subtree.
   std::size_t local_redcost_tightenings = 0;
+  /// Root cutting planes (stage 8b): rounds performed, cuts generated per
+  /// separator, cuts that entered the LP after selection, and the root LP
+  /// bound before the first and after the last round -- CANONICAL
+  /// (minimization) objective values.
+  std::size_t cut_rounds = 0;
+  std::size_t gomory_cuts = 0;
+  std::size_t cmir_cuts = 0;
+  std::size_t cuts_added = 0;
+  double root_bound_before_cuts = 0.0;
+  double root_bound_after_cuts = 0.0;
 };
 
 /// Solves a mixed-integer LINEAR program. A model with no discrete columns is
