@@ -45,6 +45,9 @@ Each module has one job and uses the shared project types.
   with reliability branching (Achterberg-Koch-Martin; Achterberg's thesis
   ch. 5). Its enumeration oracle found a dual simplex bug on first run --
   the bound-flipping exit called a feasible LP infeasible -- now fixed.
+- Added Module 28 stage 8a: local reduced cost strengthening ([CIP] 8.8)
+  at every node. mas74 and gen-ip054 improve, glass4 worsens. Cuts proper
+  wait on Wolter's thesis for the details [CIP] leaves out.
 - Added Module 28 stage 7: domain propagation ([CIP] ch. 7) -- linear
   propagation at every node and in dives, objective propagation, root
   reduced cost strengthening. enlight_hard finds its optimum 37, where every
@@ -2129,3 +2132,35 @@ search path, not a wrong deduction (the oracle and mutants say the
 deductions are sound). glass4 took twice as long (70s -> 137s) for its
 better incumbent. Propagation work is visible in the counts: 185k-338k
 tightenings on the combinatorial instances, 8 on neos5.
+
+28, stage 8a -- local reduced cost strengthening, [CIP] 8.8.
+
+At every node with an incumbent c^, on its own LP (value c, reduced costs
+r): a nonbasic column at its lower bound with r_j > 0 is bounded above by
+l_j + (c^ - c)/r_j, one at its upper bound with r_j < 0 below by
+u_j + (c^ - c)/r_j -- valid for the node's subtree, so written into the
+node's bounds, which both children copy. Integer bounds rounded inward in
+original space; for a continuous column only if it cuts off at least 20% of
+the local domain AND into the column's "active region" (the span of all its
+node-LP values so far), exactly [CIP]'s installation rule. Gated by
+--mip-propagation. [CIP] Table 8.1: disabling it costs +21% time, the
+second-largest single effect after c-MIR cuts.
+
+Tests: the propagation oracle now also requires local tightenings to occur.
+Mutants caught: the upper bound computed from the wrong end, the integer
+bound rounded half a unit too tight, the lower bound's sign flipped.
+
+MEASURED, 20000 nodes, against stage 7: mas74 13248.3 -> 12925.3,
+gen-ip054 6966.8 -> 6922.4, glass4 2.380e9 -> 2.690e9 (WORSE); others'
+incumbents unchanged; bounds move in the 4th-5th digit. [CIP] says of it
+that it "has no direct effect on the dual bound": its value comes through
+later propagation, over longer runs than 20000 nodes.
+
+NOT DONE YET, and why: cutting planes proper. [CIP] Table 8.1 ranks c-MIR
+first (+35% without) and warns that SCIP's aggressive Gomory setting HURT,
+a conservative "numerically stable" one helped. [CIP] gives the MIR and
+Gomory formulas (8.3)-(8.5) and the cut selection rule (Algorithm 3.2), but
+NOT the c-MIR aggregation row score ("depends on the dual solution, the
+density, and the slack") nor the conservative Gomory criteria. Both are in
+Wolter's diploma thesis ([CIP] reference [218]) and Marchand and Wolsey
+(2001); requested rather than invented.

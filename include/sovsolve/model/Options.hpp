@@ -386,7 +386,9 @@ struct MilpOptions {
   /// (Algorithm 7.1) at EVERY node and after every dive bound change -- the
   /// thesis's "aggr linear" setting, which Table 7.1 measures better than its
   /// every-fifth-depth default on almost all test sets -- plus objective
-  /// propagation (7.6) and root reduced cost strengthening (7.7).
+  /// propagation (7.6) and root reduced cost strengthening (7.7). Also gates
+  /// [CIP] 8.8's LOCAL reduced cost strengthening at every node, which SCIP
+  /// files under separators but which here, as there, only tightens bounds.
   bool propagation = true;
 
   /// Stop once this many nodes pass without an improved incumbent (0 = off).

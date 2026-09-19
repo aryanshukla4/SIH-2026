@@ -541,6 +541,7 @@ void test_propagation_never_changes_the_answer() {
   std::size_t tightenings = 0;
   std::size_t cutoffs = 0;
   std::size_t redcost = 0;
+  std::size_t local_redcost = 0;
   for (unsigned seed = 1; seed <= 30; ++seed) {
     const RandomIp ip = make_random_ip(seed * 49979687u, 9, 4);
     Real expected = 0.0;
@@ -565,6 +566,7 @@ void test_propagation_never_changes_the_answer() {
         tightenings += stats.propagation_tightenings;
         cutoffs += stats.propagation_cutoffs;
         redcost += stats.redcost_tightenings;
+        local_redcost += stats.local_redcost_tightenings;
       } else {
         CHECK_EQ(stats.propagation_tightenings + stats.propagation_cutoffs +
                      stats.redcost_tightenings,
@@ -575,6 +577,7 @@ void test_propagation_never_changes_the_answer() {
   CHECK(tightenings > 0);
   CHECK(cutoffs > 0);
   CHECK(redcost > 0);
+  CHECK(local_redcost > 0);  // [CIP] 8.8 at the nodes
 }
 
 /// An INFINITE activity contribution ([CIP] 7.1: "accumulated in separate
