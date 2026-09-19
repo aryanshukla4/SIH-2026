@@ -529,6 +529,118 @@ void test_pump_and_rens_never_change_the_answer() {
   CHECK(pump_found > 0);
   CHECK(rens_found > 0);
 }
+
+/// [CIP] chapter 7 under the oracle. Propagation removes points from node
+/// domains, so a wrong deduction -- a sign slip in a residual, a bound
+/// rounded the wrong way, a cutoff one unit too tight -- deletes feasible
+/// (possibly optimal) points and shows up as a wrong optimum or a false
+/// Infeasible. Both settings must match enumeration, and with it on, every
+/// mechanism must actually fire somewhere: local tightenings, nodes proven
+/// empty before their LP, and global reduced-cost tightenings.
+void test_propagation_never_changes_the_answer() {
+  std::size_t tightenings = 0;
+  std::size_t cutoffs = 0;
+  std::size_t redcost = 0;
+  for (unsigned seed = 1; seed <= 30; ++seed) {
+    const RandomIp ip = make_random_ip(seed * 49979687u, 9, 4);
+    Real expected = 0.0;
+    const bool has_solution = enumerate(ip, expected);
+    model::Problem problem;
+    if (!parse(to_lp(ip), problem)) continue;
+    for (bool propagation : {true, false}) {
+      model::Options o = options_for(BranchingRule::Reliability);
+      o.milp.propagation = propagation;
+      solver::MilpStatistics stats;
+      auto result = solver::solve_milp(problem, o, &stats);
+      CHECK(result.has_value());
+      if (!result.has_value()) continue;
+      if (has_solution) {
+        CHECK(result->status == SolverStatus::Optimal);
+        CHECK_NEAR(result->objective, expected, 1e-6);
+        CHECK_NEAR(result->best_bound, result->objective, 1e-6);
+      } else {
+        CHECK(result->status == SolverStatus::Infeasible);
+      }
+      if (propagation) {
+        tightenings += stats.propagation_tightenings;
+        cutoffs += stats.propagation_cutoffs;
+        redcost += stats.redcost_tightenings;
+      } else {
+        CHECK_EQ(stats.propagation_tightenings + stats.propagation_cutoffs +
+                     stats.redcost_tightenings,
+                 std::size_t{0});
+      }
+    }
+  }
+  CHECK(tightenings > 0);
+  CHECK(cutoffs > 0);
+  CHECK(redcost > 0);
+}
+
+/// An INFINITE activity contribution ([CIP] 7.1: "accumulated in separate
+/// counters"). In `x - y <= 2` with y >= 0 unbounded above, the row's minimum
+/// activity is -inf, so it implies NOTHING about x. A propagator that dropped
+/// the infinite term would read the finite part alone and conclude x <= 2,
+/// cutting off the optimum x = 10, y = 8 (objective -10 + 0.8 = -9.2). The
+/// enumeration oracle cannot see this: all its columns are bounded.
+void test_propagation_respects_infinite_bounds() {
+  model::Problem p;
+  if (!parse(R"(Minimize
+ obj: - x + 0.1 y
+Subject To
+ r: x - y <= 2
+Bounds
+ 0 <= x <= 10
+ y >= 0
+General
+ x
+End
+)",
+             p)) {
+    return;
+  }
+  for (bool propagation : {true, false}) {
+    model::Options o = options_for(BranchingRule::Reliability);
+    o.milp.propagation = propagation;
+    auto r = solver::solve_milp(p, o);
+    CHECK(r.has_value());
+    if (!r.has_value()) continue;
+    CHECK(r->status == SolverStatus::Optimal);
+    CHECK_NEAR(r->objective, -9.2, 1e-7);
+  }
+
+  // Infinite bounds are stored as 1e20 (Types.hpp), not IEEE infinity. A
+  // propagator that summed y's -1e20 as a NUMBER would get a minimum activity
+  // of exactly -1e20 -- the finite part, w's -5, lost to rounding -- and then
+  // y's residual as 0 instead of -5, deducing y <= 2 where the truth is y <= 7.
+  // The optimum is x = 0, w = -5, y = 7: objective -7, not -2. This was a real
+  // bug, found when the mutant above survived and the rows were printed.
+  model::Problem q;
+  if (!parse(R"(Minimize
+ obj: - y
+Subject To
+ r: x + w + y <= 2
+Bounds
+ 0 <= x <= 10
+ -5 <= w <= 0
+ -inf <= y <= 10
+General
+ x
+End
+)",
+             q)) {
+    return;
+  }
+  for (bool propagation : {true, false}) {
+    model::Options o = options_for(BranchingRule::Reliability);
+    o.milp.propagation = propagation;
+    auto r = solver::solve_milp(q, o);
+    CHECK(r.has_value());
+    if (!r.has_value()) continue;
+    CHECK(r->status == SolverStatus::Optimal);
+    CHECK_NEAR(r->objective, -7.0, 1e-7);
+  }
+}
 }  // namespace
 
 int main() {
@@ -537,6 +649,8 @@ int main() {
   test_simple_rounding_at_the_root();
   test_heuristics_never_change_the_answer();
   test_pump_and_rens_never_change_the_answer();
+  test_propagation_never_changes_the_answer();
+  test_propagation_respects_infinite_bounds();
   test_tiny_knapsack();
   test_integer_infeasible();
   test_maximization_sign();

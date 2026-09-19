@@ -45,6 +45,11 @@ Each module has one job and uses the shared project types.
   with reliability branching (Achterberg-Koch-Martin; Achterberg's thesis
   ch. 5). Its enumeration oracle found a dual simplex bug on first run --
   the bound-flipping exit called a feasible LP infeasible -- now fixed.
+- Added Module 28 stage 7: domain propagation ([CIP] ch. 7) -- linear
+  propagation at every node and in dives, objective propagation, root
+  reduced cost strengthening. enlight_hard finds its optimum 37, where every
+  heuristic had failed. A surviving mutant exposed a real soundness bug (1e20
+  bounds summed as numbers); fixed and tested.
 - Fixed Module 28 stage 6b: the pump's cycle perturbation is now Fischetti,
   Glover and Lodi's own (2005, section 3), replacing our stand-in. Same
   incumbents; the pump converges or gives up in fewer rounds.
@@ -2056,3 +2061,71 @@ MEASURED (20000 nodes, defaults): every final incumbent identical to stage 6.
 The pump's own effort moved: mas76 reaches its point in 69 rounds (was 139);
 where it fails it stops sooner -- enlight_hard 182 rounds (was 607), glass4
 3704 LP iterations (was 6223), timtab1 703 rounds (was 756).
+
+28, stage 7 -- domain propagation, [CIP] chapter 7.
+
+Three mechanisms, all on by default (--mip-propagation=0 turns them off):
+
+  LINEAR PROPAGATION, Algorithm 7.1, on every canonical row at EVERY node
+  before its LP, and after every dive bound change (Algorithm 9.1 step 6,
+  skipped until now for want of a propagator). Every node rather than SCIP's
+  every-fifth-depth default: [CIP] Table 7.1's "aggr linear" column measures
+  every node as better on almost all test sets, most of all enlight (-42%).
+  Activity bounds (Definition 7.1) with infinite contributions counted apart;
+  residuals; the bound rule of Reduction 5; relaxation to five digits (7.2)
+  and inward rounding of integer bounds in ORIGINAL space; the 5% minimum
+  change (7.3); Reduction 4 proves a node empty. Activities are recomputed
+  per row visit instead of maintained by the event handler (Algorithm 7.2) --
+  stale activities are looser, so deductions stay valid. OURS: a cap of 20
+  visits per row per call; stopping early is always safe.
+
+  OBJECTIVE PROPAGATION, 7.6: once an incumbent exists, c'x <= c^ - delta is
+  one more row, and c^ - (1 - delta) when the objective is integral on every
+  integer point (integer columns with integral original costs, continuous
+  columns with none).
+
+  ROOT REDUCED COST STRENGTHENING, Algorithm 7.11: on every incumbent
+  improvement, r_j > 0 bounds x_j <= x_R,j + (c^ - c_R)/r_j globally, and
+  r_j < 0 the lower bound likewise. Every node is intersected with these
+  global bounds before propagation.
+
+A REAL BUG, FOUND BY A SURVIVING MUTANT. This codebase's infinity is a bound
+of magnitude >= 1e20 (Types.hpp), not IEEE infinity; the first version tested
+std::isfinite and so summed -1e20 into activities as a number. That swamps
+the finite part: in x + w + y <= 2 with y <= 10 unbounded below and
+w in [-5, 0], the minimum activity came out as exactly -1e20, y's residual
+as 0 instead of -5, and the deduction y <= 2 instead of the true y <= 7 --
+an INVALID bound that cuts off the optimum. The enumeration oracle could not
+see it (all its columns are bounded); a mutant that ignored the infinite
+count survived, the rows were printed to see why, and there it was. Fixed
+with core::is_finite_bound throughout, and that model is now a test.
+
+Tests (milp_test): the 9-variable oracle with propagation on and off, exact
+both ways, with local tightenings, empty-node cutoffs and reduced-cost
+tightenings all required to occur; two mixed models with unbounded
+continuous columns (the bug above, and a row whose -inf activity must imply
+nothing). Mutants caught: residual sign; integer bound rounded half a unit
+too tight; reduced-cost lower bound with |r|; infinite count ignored; the
+1e20 bug itself. Equivalent: an integral cutoff tighter by 2e-6 -- below
+Reduction 4's relative tolerance, so it can never cut a point.
+
+MEASURED, MIPLIB, 20000 nodes, defaults, propagation off -> on. The machine
+was under load this run (pk1 17.9s here vs ~5s earlier), so times compare
+only within the run.
+
+    instance       incumbent off -> on          bound off -> on        optimum
+    enlight_hard   none -> 37 (OPTIMAL)         18 -> 22               37
+    timtab1        1306381 -> 1104166           202926 -> 251231       764772
+    glass4         2.50002e9 -> 2.38002e9       8.0000340e8 -> 8.0000350e8  1.20001e9
+    markshare_4_0  12 -> 10                     0 -> 0                 1
+    gen-ip054      6871.7 -> 6966.8 (WORSE)     6778.2 -> 6777.1       6840.97
+    mas76          40121.9 -> 40560.1 (WORSE)   39277.4 -> 39282.9     40005.05
+    pk1, mas74, gen-ip002, neos5: incumbent unchanged (neos5 at its optimum)
+    assign1-5-8: incumbent unchanged at its optimum 212 (127s -> 128s)
+enlight_hard -- the instance every chapter-9 heuristic failed on -- now finds
+its optimum, as [CIP] Table 7.1 leads one to expect: enlight is where
+propagation matters most. Two instances end with worse incumbents: a changed
+search path, not a wrong deduction (the oracle and mutants say the
+deductions are sound). glass4 took twice as long (70s -> 137s) for its
+better incumbent. Propagation work is visible in the counts: 185k-338k
+tightenings on the combinatorial instances, 8 on neos5.
