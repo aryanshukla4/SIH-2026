@@ -51,6 +51,10 @@
 //   propagation [CIP] chapter 7: Algorithm 7.1 on every row at every node
 //             and in dives, the objective cutoff as one more row (7.6), and
 //             root reduced cost strengthening of the global bounds (7.7).
+//   conflicts [CIP] chapter 11: a bound-change trail with reasons; conflicts
+//             from propagation and from infeasible LPs (Algorithm 11.1 on the
+//             dual simplex's Farkas ray), resolved to one FUIP constraint per
+//             depth level, stored as bound disjunctions (11.14).
 //
 // WHAT THE SEARCH WORKS ON. The model is canonicalized and scaled ONCE, at the
 // root, and a node is just a set of canonical column bounds. Canonicalization
@@ -76,6 +80,7 @@
 #define SOVSOLVE_SOLVER_MILP_SOLVE_HPP
 
 #include <cstddef>
+#include <vector>
 
 #include "sovsolve/core/Status.hpp"
 #include "sovsolve/model/Options.hpp"
@@ -83,6 +88,21 @@
 #include "sovsolve/model/Solution.hpp"
 
 namespace sovsolve::solver {
+
+/// One conflict constraint, as a test sees it: a bound disjunction in ORIGINAL
+/// columns and units, and whether its proof used the objective cutoff (then it
+/// is only claimed for points better than `incumbent`, the incumbent's
+/// original objective when it was derived).
+struct ConflictRecord {
+  struct Literal {
+    std::size_t col = 0;
+    bool upper = false;  ///< x_col <= bound (else x_col >= bound)
+    double bound = 0.0;
+  };
+  std::vector<Literal> literals;
+  bool uses_cutoff = false;
+  double incumbent = 0.0;
+};
 
 /// Where the effort went. The branching rules trade node count against work
 /// per node, so comparing them on nodes alone would flatter strong branching;
@@ -142,6 +162,17 @@ struct MilpStatistics {
   std::size_t cuts_added = 0;
   double root_bound_before_cuts = 0.0;
   double root_bound_after_cuts = 0.0;
+  /// [CIP] chapter 11: conflicts analyzed (propagation or infeasible LP),
+  /// conflict constraints created, bounds they deduced in propagation, and
+  /// nodes they proved empty on their own.
+  std::size_t conflicts_analyzed = 0;
+  std::size_t conflict_constraints = 0;
+  std::size_t conflict_deductions = 0;
+  std::size_t conflict_cutoffs = 0;
+  /// If set, every conflict constraint created is appended here -- a
+  /// verification hook, so a test can check each one against the feasible
+  /// points it may not exclude.
+  std::vector<ConflictRecord>* conflict_log = nullptr;
 };
 
 /// Solves a mixed-integer LINEAR program. A model with no discrete columns is

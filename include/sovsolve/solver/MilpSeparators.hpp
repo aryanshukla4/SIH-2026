@@ -63,6 +63,8 @@ struct SeparationInput {
   /// Global canonical column bounds.
   const std::vector<Real>* lower = nullptr;
   const std::vector<Real>* upper = nullptr;
+  /// MilpOptions::cut_violation_margin.
+  Real violation_margin = 1e-6;
 };
 
 /// [W] Algorithm 3.1 bookkeeping carried across rounds: how often each row has

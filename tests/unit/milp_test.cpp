@@ -166,6 +166,37 @@ bool enumerate(const RandomIp& ip, Real& best) {
   return found;
 }
 
+/// Every feasible integer point of `ip` with its objective, for checking a
+/// claim about the feasible set directly rather than through the optimum.
+std::vector<std::pair<std::vector<int>, Real>> feasible_points(const RandomIp& ip) {
+  std::vector<std::pair<std::vector<int>, Real>> out;
+  const std::size_t n = ip.c.size();
+  std::vector<int> x(ip.lo.begin(), ip.lo.end());
+  for (;;) {
+    bool feasible = true;
+    for (std::size_t i = 0; i < ip.a.size() && feasible; ++i) {
+      int lhs = 0;
+      for (std::size_t j = 0; j < n; ++j) lhs += ip.a[i][j] * x[j];
+      if (ip.sense[i] == 'L') feasible = lhs <= ip.rhs[i];
+      else if (ip.sense[i] == 'G') feasible = lhs >= ip.rhs[i];
+      else feasible = lhs == ip.rhs[i];
+    }
+    if (feasible) {
+      Real obj = 0.0;
+      for (std::size_t j = 0; j < n; ++j) obj += ip.c[j] * x[j];
+      out.emplace_back(x, obj);
+    }
+    std::size_t k = 0;
+    while (k < n && x[k] == ip.hi[k]) {
+      x[k] = ip.lo[k];
+      ++k;
+    }
+    if (k == n) break;
+    ++x[k];
+  }
+  return out;
+}
+
 void test_every_rule_matches_enumeration() {
   int feasible_cases = 0;
   int infeasible_cases = 0;
@@ -818,6 +849,106 @@ void test_root_cuts_on_mixed_programs() {
   CHECK(checked >= 30);
   CHECK(cmir > 0);
 }
+
+/// [CIP] chapter 11 under the oracle. A conflict constraint is a claim that
+/// some combination of bounds contains no solution better than the incumbent;
+/// an unsound one -- a reason read from the wrong side of a row, a literal
+/// negated the wrong way, an infeasibility proof relaxed one bound too far --
+/// deletes feasible points, and shows up here as a wrong optimum or a false
+/// Infeasible. On and off must both match enumeration, and with it on,
+/// conflicts must be analyzed, stored and actually used, both from
+/// propagation and from infeasible LPs. Cuts are off so the trees are deep
+/// enough to fail in.
+void test_conflict_analysis_never_changes_the_answer() {
+  std::size_t analyzed = 0;
+  std::size_t constraints = 0;
+  std::size_t deductions = 0;
+  std::size_t logged = 0;
+  std::size_t logged_sets = 0;
+  for (unsigned seed = 1; seed <= 40; ++seed) {
+    // Binary programs, 16 columns and 6 rows: 65536 points to enumerate, and
+    // trees large enough that a learned conflict gets used again elsewhere.
+    RandomIp ip = make_random_ip(seed * 39916801u, 16, 6);
+    for (std::size_t j = 0; j < ip.lo.size(); ++j) {
+      ip.lo[j] = 0;
+      ip.hi[j] = 1;
+    }
+    Real expected = 0.0;
+    const bool has_solution = enumerate(ip, expected);
+    model::Problem problem;
+    if (!parse(to_lp(ip), problem)) continue;
+    // Problem column -> RandomIp variable, by name ("x<j>").
+    std::vector<std::size_t> var_of(problem.num_cols(), 0);
+    for (std::size_t c = 0; c < problem.num_cols(); ++c) {
+      var_of[c] = static_cast<std::size_t>(std::stoul(std::string(problem.col_names[c].substr(1))));
+    }
+    const auto points = feasible_points(ip);
+    for (bool conflicts : {true, false}) {
+      model::Options o = without_cuts(options_for(BranchingRule::Reliability));
+      o.milp.conflict_analysis = conflicts;
+      solver::MilpStatistics stats;
+      std::vector<solver::ConflictRecord> log;
+      stats.conflict_log = &log;
+      auto result = solver::solve_milp(problem, o, &stats);
+      // THE SOUNDNESS CHECK, per conflict: a bound disjunction may exclude no
+      // feasible point -- or, if its proof used the objective cutoff, no
+      // feasible point strictly better than the incumbent it was derived
+      // under. An invalid conflict fails here even when it happens never to
+      // prune the optimum.
+      for (const auto& rec : log) {
+        for (const auto& [x, obj] : points) {
+          if (rec.uses_cutoff) {
+            const bool better = ip.maximize ? obj > rec.incumbent + 1e-6
+                                            : obj < rec.incumbent - 1e-6;
+            if (!better) continue;
+          }
+          bool satisfied = false;
+          for (const auto& lit : rec.literals) {
+            const Real v = x[var_of[lit.col]];
+            if (lit.upper ? v <= lit.bound + 1e-6 : v >= lit.bound - 1e-6) {
+              satisfied = true;
+              break;
+            }
+          }
+          CHECK(satisfied);
+          if (!satisfied) {
+            std::fprintf(stderr, "BADCONFLICT seed=%u cutoff=%d inc=%g obj=%g lits:", seed,
+                         rec.uses_cutoff ? 1 : 0, rec.incumbent, obj);
+            for (const auto& lit : rec.literals) {
+              std::fprintf(stderr, " x%zu%s%g(val %d)", var_of[lit.col], lit.upper ? "<=" : ">=",
+                           lit.bound, x[var_of[lit.col]]);
+            }
+            std::fprintf(stderr, "\n");
+            break;
+          }
+        }
+      }
+      ++logged_sets;
+      logged += log.size();
+      CHECK(result.has_value());
+      if (!result.has_value()) continue;
+      if (has_solution) {
+        CHECK(result->status == SolverStatus::Optimal);
+        CHECK_NEAR(result->objective, expected, 1e-6);
+        CHECK_NEAR(result->best_bound, result->objective, 1e-6);
+      } else {
+        CHECK(result->status == SolverStatus::Infeasible);
+      }
+      if (conflicts) {
+        analyzed += stats.conflicts_analyzed;
+        constraints += stats.conflict_constraints;
+        deductions += stats.conflict_deductions + stats.conflict_cutoffs;
+      } else {
+        CHECK_EQ(stats.conflict_constraints, std::size_t{0});
+      }
+    }
+  }
+  CHECK(analyzed > 0);
+  CHECK(constraints > 0);
+  CHECK(deductions > 0);
+  CHECK(logged > 0);  // the per-conflict check above actually checked something
+  CHECK(logged_sets > 0);
+}
 }  // namespace
 
 int main() {
@@ -830,6 +961,7 @@ int main() {
   test_propagation_respects_infinite_bounds();
   test_root_cuts_never_change_the_answer();
   test_root_cuts_on_mixed_programs();
+  test_conflict_analysis_never_changes_the_answer();
   test_tiny_knapsack();
   test_integer_infeasible();
   test_maximization_sign();

@@ -127,6 +127,12 @@ void print_usage(const char* argv0) {
       "                        MilpOptions::branching (default reliability). A\n"
       "                        MILP with --method=dual-simplex or primal-simplex\n"
       "                        runs the host branch-and-bound (module.txt 28).\n"
+      "  --mip-conflicts=0|1   MilpOptions::conflict_analysis (default 1): CIP ch. 11\n"
+      "  (OURS -- chosen here, not taken from a paper; tune freely:)\n"
+      "  --mip-conflict-age=N  MilpOptions::conflict_max_age (default 1000)\n"
+      "  --mip-dive-allowance=N  MilpOptions::dive_allowance (default 1000)\n"
+      "  --mip-prop-row-visits=N  MilpOptions::propagation_row_visits (default 20)\n"
+      "  --mip-cut-margin=X    MilpOptions::cut_violation_margin (default 1e-6)\n"
       "  --mip-gomory=0|1      MilpOptions::gomory_cuts (default 1)\n"
       "  --mip-cmir=0|1        MilpOptions::cmir_cuts (default 1)\n"
       "  --mip-cut-rounds=N    MilpOptions::cut_rounds (default 15)\n"
@@ -244,6 +250,16 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.simplex.dual_steepest_edge = (val != "0");
     } else if (key == "perturb") {
       options.simplex.cost_perturbation = (val != "0");
+    } else if (key == "mip-prop-row-visits") {
+      options.milp.propagation_row_visits = static_cast<std::size_t>(std::stoul(val));
+    } else if (key == "mip-cut-margin") {
+      options.milp.cut_violation_margin = std::stod(val);
+    } else if (key == "mip-conflict-age") {
+      options.milp.conflict_max_age = static_cast<std::size_t>(std::stoul(val));
+    } else if (key == "mip-dive-allowance") {
+      options.milp.dive_allowance = static_cast<std::size_t>(std::stoul(val));
+    } else if (key == "mip-conflicts") {
+      options.milp.conflict_analysis = (val != "0");
     } else if (key == "mip-gomory") {
       options.milp.gomory_cuts = (val != "0");
     } else if (key == "mip-cmir") {
@@ -565,6 +581,10 @@ int main(int argc, char** argv) {
       std::printf("cuts_added=%zu\n", milp_stats.cuts_added);
       std::printf("root_bound_before_cuts=%.10e\n", milp_stats.root_bound_before_cuts);
       std::printf("root_bound_after_cuts=%.10e\n", milp_stats.root_bound_after_cuts);
+      std::printf("conflicts_analyzed=%zu\n", milp_stats.conflicts_analyzed);
+      std::printf("conflict_constraints=%zu\n", milp_stats.conflict_constraints);
+      std::printf("conflict_deductions=%zu\n", milp_stats.conflict_deductions);
+      std::printf("conflict_cutoffs=%zu\n", milp_stats.conflict_cutoffs);
     }
   }
 
