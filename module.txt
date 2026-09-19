@@ -41,6 +41,10 @@ Each module has one job and uses the shared project types.
   is the only operation this hardware's FP64 penalty leaves competitive
   (docs/ARCHITECTURE-REVIEW.md 3.5 measures factorization at ~64x slower than
   the CPU, SpMV at ~2x).
+- Added Module 28: host branch-and-bound on the warm-started dual simplex,
+  with reliability branching (Achterberg-Koch-Martin; Achterberg's thesis
+  ch. 5). Its enumeration oracle found a dual simplex bug on first run --
+  the bound-flipping exit called a feasible LP infeasible -- now fixed.
 - Fixed Module 24G: PDLP's infeasibility test now uses arXiv 2102.04592
   (50)/(51), violation per unit of objective improvement. The old
   size-normalized test declared israel infeasible on Linux. Measured on
@@ -692,6 +696,34 @@ B&B warm starting (Stage 3 of the plan) is also not done: `BranchAndBound.cu`
 still re-runs canonicalize + presolve per node, which can change the canonical
 shape between parent and child, and a basis index space cannot survive that.
 `BranchAndBound.hpp`'s stated limitation therefore still stands as written.
+
+POST-MODULE-28 FIX -- the bound-flipping ratio test declared a FEASIBLE LP
+infeasible (2026-09-19). Found by milp_test's enumeration oracle, seed 23: the
+dual simplex reported Infeasible at ITERATION ZERO on an LP relaxation the
+primal simplex solved (-9, matching enumeration). Switches isolated it:
+--bound-flipping=0 or Ruiz scaling both gave the right answer.
+
+The model's row r0 is feasible only at its boundary -- its left-hand side
+reaches 12 over the box only at the single feasible point -- so the boxed
+columns' flips close r0's violation EXACTLY. On integer data that cancels to
+zero and the last column enters. After geometric scaling it cancels to ~1e-16,
+and `reduction < remaining` flipped the last column too, left no candidate, and
+took the "nothing blocks the dual step" exit. The certificate it produced,
+`y = (-1, 0, 0)`, fails arXiv 2102.04592 (50) at every tolerance up to 0.1.
+
+Fix: pass a breakpoint only while `remaining - reduction` exceeds the primal
+feasibility tolerance -- the threshold choose_leaving already uses to call a row
+violated at all. The infeasibility exit is then reachable only with a violation
+larger than the tolerance left over. Netlib re-run with the dual simplex after
+the fix: all 19 still correct, objectives unchanged. Regression test
+`test_flips_that_close_the_violation_exactly` in dual_simplex_test; reverting
+the fix fails it (5 checks). It reproduces through the solver's default
+scaling, which is what makes the residual -- a scaler change could make it pass
+without exercising the exit, recorded at the test.
+
+The corpus never exposed this because Netlib has no row that is tight at a
+unique point. MILP relaxations are full of them: branching drives bounds until
+exactly that happens. This is why the MILP engine needed its own oracle.
 
 ## 24. PDLP -- primal-dual hybrid gradient (LP) -- added 2026-09-14
 
@@ -1437,3 +1469,70 @@ directly by removing each member and requiring the rest to become feasible.
 ## Module Independence
 No module silently implements another module's job. All modules use frozen shared types and
 interfaces.
+
+## 28. Branch-and-bound on the warm-started dual simplex, with reliability branching -- added 2026-09-19
+
+`solver/MilpSolve.{hpp,cpp}`, `solve_milp`. Host-only, no CUDA needed.
+
+WHY A SECOND BRANCH-AND-BOUND. Module 22 (gpu/BranchAndBound.cu) solves every
+node with the GPU interior-point method, cold. Its own header names the
+problem: production MILP solvers use simplex for node relaxations because it
+warm-starts. A child differs from its parent by one bound, so the parent's
+optimal basis stays DUAL feasible for the child -- the costs have not changed --
+and the dual simplex resumes from it. That is also what the branching rule
+needs: strong branching is DEFINED as "at most gamma dual simplex iterations"
+on each child from the parent's basis, which means nothing on an IPM.
+
+SOURCES, transcribed: T. Achterberg, T. Koch, A. Martin, "Branching rules
+revisited" (Oper. Res. Letters 2005, ZIB ZR-04-13) [AKM]; T. Achterberg,
+"Constraint Integer Programming", PhD thesis (2007), chapter 5 [CIP].
+
+  score        [CIP] (5.2) product  max{q-, 1e-6} * max{q+, 1e-6}
+  pseudocosts  [AKM] (4)-(5): mean objective gain per unit of rounding;
+               uninitialized -> average of initialized, or 1
+  reliability  [AKM] Alg. 3 / [CIP] Alg. 5.2: strong-branch unreliable
+               candidates (min(eta-, eta+) < 8) in pseudocost order; stop after
+               lambda = 8 updates without the max changing, or kappa = 100
+  gamma        2 x average node-LP iterations, clamped to [10, 500]
+  budget       strong-branching iterations <= half the node-LP iterations +
+               100000; eta_rel falls linearly 8 -> 1 over the budget's upper
+               half and to 0 beyond it. [CIP] also RAISES eta_rel when strong
+               branching is cheap; not implemented -- the thesis gives only
+               "proportional", no constant.
+
+`MilpOptions::branching` selects MostFractional (the old rule, which [AKM] 2.1
+measures as "in general not better than selecting the variable randomly"),
+Pseudocost, or Reliability (default).
+
+DESIGN. The model is canonicalized and scaled ONCE; a node is a set of
+canonical bounds. Canonicalization only keeps or substitutes out a column and
+scaling divides each by one factor, so an integer column maps to exactly one
+canonical column with x_original = s * x_canonical, and a branch x <= floor(v)
+becomes x_canonical <= floor(v)/s. General LP presolve is NOT run -- it merges
+parallel columns and substitutes, neither of which respects integrality; the
+MILP-specific original-space reductions Module 22 uses (MilpPresolve.hpp) run
+first, as there. This also removes the per-node canonicalize/presolve/scale
+that Module 22 pays through solve_problem.
+
+A probe that is Infeasible is a verdict -- the dual simplex reports Infeasible
+only with no artificial bound in play -- so that side is discarded ([CIP]'s
+"variable fixings due to infeasible strong branching LPs"). An iteration-limited
+probe's objective is used as the ESTIMATE strong branching is defined to use,
+never to prune; nodes prune only on Optimal relaxations.
+
+SOUNDNESS FIX over Module 22, made while porting. There a node whose
+relaxation did not converge is dropped ("the SAFE choice") and the search can
+still report Optimal -- which is not safe, since the unexplored subtree may hold
+the optimum. Here such nodes are counted (`MilpStatistics::unreliable_nodes`)
+and any nonzero count forbids Optimal: the run reports NotConverged with its
+incumbent.
+
+THE ORACLE IS ENUMERATION. milp_test solves small random pure-integer programs
+under all three rules and requires each to reproduce the enumerated optimum,
+or Infeasible exactly when no integer point exists. Plus maximization (sign of
+objective and best_bound), an LP-feasible/integer-infeasible model, a mixed
+model, and strong-branching counters confined to Reliability. A scratch stress
+run went further: 1000 random programs, 4-6 variables, 2-5 rows, 3000 solves,
+432 feasible / 568 infeasible, ZERO mismatches.
+
+IT FOUND A BUG IN THE DUAL SIMPLEX on its first run -- recorded in section 23.
