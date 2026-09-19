@@ -299,11 +299,43 @@ enum class BranchingRule : std::uint8_t {
 /// Module 22 controls: branch-and-bound over the existing LP/QP relaxation
 /// solver (solve_problem, Solve.hpp), activated automatically whenever
 /// Problem::has_discrete() is true -- see solver/gpu/BranchAndBound.hpp.
+/// How Module 28's branch-and-bound picks the next open node. Achterberg,
+/// "Constraint Integer Programming" (2007), chapter 6.
+enum class NodeSelection : std::uint8_t {
+  /// Always the open node with the smallest dual bound, [CIP] section 6.2.
+  /// Fewest nodes for a fixed branching rule (Proposition 6.1), but its nodes'
+  /// LP solutions are "usually far away from integrality", so it rarely finds
+  /// an incumbent. The rule this engine shipped with; kept for comparison.
+  BestFirst,
+  /// [CIP] section 6.6, SCIP's default and the best overall strategy in
+  /// Table 6.1: best estimate search with plunging, and every `best_frequency`
+  /// plunges a best-bound node instead.
+  Interleaved,
+};
+
 struct MilpOptions {
   /// Module 28, the host branch-and-bound only. Every default below is the
   /// value Achterberg's thesis "Constraint Integer Programming" (2007)
   /// sections 5.2-5.7 gives for SCIP, which the thesis reports as tuned.
   BranchingRule branching = BranchingRule::Reliability;
+
+  /// [CIP] chapter 6. See NodeSelection.
+  NodeSelection node_selection = NodeSelection::Interleaved;
+
+  /// `bestfreq`: every this-many plunges, the next node is the best-BOUND
+  /// leaf rather than the best-estimate one. [CIP] section 6.6: 10.
+  std::size_t best_frequency = 10;
+
+  /// A plunge takes at least `plunge_min_depth_fraction * dmax` and at most
+  /// `plunge_max_depth_fraction * dmax` steps, `dmax` the deepest node
+  /// processed so far. [CIP] section 6.3: 0.1 and 0.5.
+  Real plunge_min_depth_fraction = 0.1;
+  Real plunge_max_depth_fraction = 0.5;
+
+  /// Past the minimum, a plunge is abandoned once the next node's local
+  /// relative gap `(c_Q - c_lower) / (c_upper - c_lower)` exceeds this.
+  /// [CIP] section 6.3: 0.25.
+  Real plunge_max_gap = 0.25;
 
   /// `eta_rel`: pseudocosts count as reliable once both directions have been
   /// observed at least this often. Thesis section 5.7: 8. Zero turns
@@ -608,6 +640,14 @@ struct SimplexOptions {
   /// costs take fewer than n/4 distinct values, the thesis's own test for a
   /// significantly dual-degenerate problem.
   bool cost_perturbation = true;
+
+  /// Dual steepest edge pricing in the dual simplex: choose the leaving row by
+  /// `violation^2 / beta_r` rather than by the largest violation (Dantzig).
+  /// Koberstein, "The dual simplex method, techniques for a fast and stable
+  /// implementation" (2005), section 3.3 and 8.2.2.1 -- Forrest and Goldfarb's
+  /// "Dual algorithm I". The thesis's section 9.4 measures it as its single
+  /// largest improvement: -43.9% iterations, -47.6% time against Dantzig.
+  bool dual_steepest_edge = true;
 
   /// Temporary finite bound given to a dual-infeasible nonbasic column during
   /// phase 1. Escalated by `artificial_bound_growth` when the solved

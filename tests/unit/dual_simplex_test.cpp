@@ -20,10 +20,13 @@
 
 #include "sovsolve/core/Types.hpp"
 #include "sovsolve/io/Load.hpp"
+#include "sovsolve/model/Canonical.hpp"
 #include "sovsolve/model/Options.hpp"
 #include "sovsolve/model/Problem.hpp"
 #include "sovsolve/model/Solution.hpp"
 #include "sovsolve/solver/LpSolve.hpp"
+#include "sovsolve/solver/simplex/Basis.hpp"
+#include "sovsolve/solver/simplex/DualSimplex.hpp"
 #include "tests/TestMain.hpp"
 
 using namespace sovsolve;  // NOLINT(build/namespaces)
@@ -555,6 +558,150 @@ End
   CHECK_NEAR(on.objective, off.objective, 0.0);
   CHECK_EQ(on.iterations, off.iterations);
 }
+
+// --------------------------------------------------------------------------
+// Dual steepest edge (Koberstein thesis sections 3.3 and 8.2.2.1)
+// --------------------------------------------------------------------------
+
+/// A random bounded LP with a known feasible point, so the dual simplex runs
+/// a real number of pivots and ends Optimal. Integer data keeps it readable
+/// when a failure prints it.
+std::string random_bounded_lp(unsigned seed, int n, int m) {
+  auto next = [&seed]() {
+    seed = seed * 1664525u + 1013904223u;
+    return static_cast<int>((seed >> 8) % 10007u);
+  };
+  std::vector<int> x0(static_cast<std::size_t>(n));
+  std::string t = "Minimize\n obj:";
+  for (int j = 0; j < n; ++j) {
+    const int c = next() % 21 - 10;
+    t += (c < 0 ? " - " : " + ") + std::to_string(c < 0 ? -c : c) + " x" + std::to_string(j);
+    x0[static_cast<std::size_t>(j)] = next() % 5;
+  }
+  t += "\nSubject To\n";
+  for (int i = 0; i < m; ++i) {
+    t += " r" + std::to_string(i) + ":";
+    int lhs = 0;
+    for (int j = 0; j < n; ++j) {
+      const int a = next() % 11 - 5;
+      lhs += a * x0[static_cast<std::size_t>(j)];
+      t += (a < 0 ? " - " : " + ") + std::to_string(a < 0 ? -a : a) + " x" + std::to_string(j);
+    }
+    const bool le = next() % 2 == 0;
+    t += le ? " <= " + std::to_string(lhs + next() % 4) : " >= " + std::to_string(lhs - next() % 4);
+    t += "\n";
+  }
+  t += "Bounds\n";
+  for (int j = 0; j < n; ++j) t += " 0 <= x" + std::to_string(j) + " <= 6\n";
+  t += "End\n";
+  return t;
+}
+
+/// Solves `B' rho = e_r` densely from the DEFINITION of B -- the columns of
+/// `[A | I]` the basis names -- by Gaussian elimination with partial pivoting.
+/// Independent of LuFactor, so an error shared by the factorization and the
+/// weight update cannot cancel out here.
+std::vector<Real> dense_btran_unit(const model::CanonicalProblem& p,
+                                   const solver::simplex::Basis& basis, std::size_t r) {
+  const std::size_t m = p.num_rows();
+  const std::size_t n = p.num_cols();
+  // M = B' : row k of M is column basic[k] of [A | I].
+  std::vector<std::vector<Real>> M(m, std::vector<Real>(m + 1, 0.0));
+  const auto& csc = p.A.csc;
+  for (std::size_t k = 0; k < m; ++k) {
+    const auto w = static_cast<std::size_t>(basis.basic[k]);
+    if (w < n) {
+      for (std::size_t q = csc.slice_begin(w); q < csc.slice_end(w); ++q) {
+        M[k][static_cast<std::size_t>(csc.indices()[q])] = csc.values()[q];
+      }
+    } else {
+      M[k][w - n] = 1.0;
+    }
+    M[k][m] = k == r ? 1.0 : 0.0;
+  }
+  for (std::size_t col = 0; col < m; ++col) {
+    std::size_t piv = col;
+    for (std::size_t k = col + 1; k < m; ++k) {
+      if (std::fabs(M[k][col]) > std::fabs(M[piv][col])) piv = k;
+    }
+    std::swap(M[col], M[piv]);
+    for (std::size_t k = 0; k < m; ++k) {
+      if (k == col || M[k][col] == 0.0) continue;
+      const Real f = M[k][col] / M[col][col];
+      for (std::size_t q = col; q <= m; ++q) M[k][q] -= f * M[col][q];
+    }
+  }
+  std::vector<Real> rho(m);
+  for (std::size_t i = 0; i < m; ++i) rho[i] = M[i][m] / M[i][i];
+  return rho;
+}
+
+/// THE check on the update formulas. Started from the all-logical basis
+/// (weights exactly 1) with no basis repair, Forrest-Goldfarb's recurrence --
+/// (3.47a) for the leaving row, (8.1) for the rest -- is EXACT, bound flips
+/// included (a flip does not change B). So at the end every basic variable's
+/// carried weight must equal `||B^-T e_r||^2` recomputed from scratch. A sign
+/// error in kappa, a missing square, the wrong vector FTRAN'd for tau, or a
+/// weight left on the wrong slot after a pivot all fail this; "the solve still
+/// ends Optimal" catches none of them, since any positive weights give a valid
+/// (only slower) pricing rule.
+void test_dse_weights_are_exact() {
+  std::size_t checked_weights = 0;
+  std::size_t pivots = 0;
+  for (unsigned seed = 1; seed <= 20; ++seed) {
+    auto parsed = io::parseProblem(random_bounded_lp(seed * 7919u, 10, 6), io::FileFormat::Lp);
+    if (!parsed.has_value()) {
+      ::sovsolve::test::record(__FILE__, __LINE__, "parse", parsed.error().format());
+      return;
+    }
+    auto canon = model::canonicalize(parsed.value());
+    if (!canon.has_value()) continue;
+    model::Options o = simplex_options();
+    o.simplex.dual_steepest_edge = true;
+    auto r = solver::simplex::solve_dual_simplex(canon->problem, o);
+    CHECK(r.has_value());
+    if (!r.has_value()) continue;
+    CHECK(r->status == SolverStatus::Optimal);
+    if (r->basis_repairs != 0) continue;  // a repair legitimately restarts a weight at 1
+    pivots += r->iterations;
+    const auto& b = r->basis;
+    CHECK_EQ(b.dse_weights.size(), canon->problem.num_cols() + canon->problem.num_rows());
+    if (b.dse_weights.size() != canon->problem.num_cols() + canon->problem.num_rows()) continue;
+    for (std::size_t row = 0; row < b.basic.size(); ++row) {
+      const std::vector<Real> rho = dense_btran_unit(canon->problem, b, row);
+      Real exact = 0.0;
+      for (const Real v : rho) exact += v * v;
+      if (exact < 1e-3) continue;  // below the 1e-4 floor's reach, not comparable
+      const Real carried = b.dse_weights[static_cast<std::size_t>(b.basic[row])];
+      CHECK_NEAR(carried / exact, 1.0, 1e-9);
+      ++checked_weights;
+    }
+  }
+  // The test must actually exercise pivots, or every weight is trivially 1.
+  CHECK(pivots >= 40);
+  CHECK(checked_weights >= 60);
+}
+
+/// Pricing changes the PATH, never the answer: the same random LPs, Dantzig
+/// against dual steepest edge, same status and objective.
+void test_dse_changes_path_not_answer() {
+  std::size_t differing_paths = 0;
+  for (unsigned seed = 1; seed <= 20; ++seed) {
+    const std::string text = random_bounded_lp(seed * 104729u, 12, 7);
+    model::Solution off;
+    model::Solution on;
+    model::Options o = simplex_options();
+    o.simplex.dual_steepest_edge = false;
+    if (!solve_with("dantzig", text, o, off)) continue;
+    o.simplex.dual_steepest_edge = true;
+    if (!solve_with("dse", text, o, on)) continue;
+    CHECK(on.status == off.status);
+    CHECK_NEAR(on.objective, off.objective, 1e-7 * (1.0 + std::fabs(off.objective)));
+    if (on.iterations != off.iterations) ++differing_paths;
+  }
+  // If no path ever differs, the switch is not reaching the pricing at all.
+  CHECK(differing_paths > 0);
+}
 }  // namespace
 
 int main() {
@@ -572,6 +719,8 @@ int main() {
   test_perturbation_keeps_infeasible();
   test_perturbation_confirms_unbounded();
   test_perturbation_leaves_distinct_costs_alone();
+  test_dse_weights_are_exact();
+  test_dse_changes_path_not_answer();
   test_afiro();
   return sovsolve::test::report("dual_simplex");
 }

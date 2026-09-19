@@ -4,8 +4,10 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <memory>
-#include <queue>
+#include <set>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -25,6 +27,7 @@ namespace {
 using core::Real;
 using core::SolverStatus;
 using model::BranchingRule;
+using model::NodeSelection;
 using model::Options;
 using model::Problem;
 using model::Solution;
@@ -133,6 +136,10 @@ struct Node {
   /// child's feasible set is a subset of its parent's.
   Real bound = 0.0;
   std::size_t depth = 0;
+  /// [CIP] section 6.4's best estimate `e_Q`, the estimated objective of the
+  /// best integer point in this subtree. See `estimate()` for how an unsolved
+  /// child gets one.
+  Real estimate = 0.0;
   /// The parent's optimal basis, shared by both children. Still DUAL feasible
   /// for either child -- only a bound moved -- which is why the dual simplex
   /// resumes from it.
@@ -140,10 +147,59 @@ struct Node {
   Origin origin;
 };
 
-struct NodeOrder {
-  // std::priority_queue is a max-heap; this makes the SMALLEST bound come out
-  // first -- best-first search, the same order Module 22 uses.
-  bool operator()(const Node& a, const Node& b) const noexcept { return a.bound > b.bound; }
+/// The open nodes -- the leaves of the tree -- held so that BOTH orders
+/// [CIP] chapter 6 needs are available at O(log n): the smallest dual bound
+/// (best first, and the global lower bound) and the smallest estimate (best
+/// estimate). [CIP] section 3.3.6 keeps a priority queue for the leaves; two
+/// ordered sets over one pool are that, for two keys at once.
+///
+/// Ties, [CIP] section 6.2: equal bounds are broken by the better estimate,
+/// equal estimates by the better bound, and then by DEPTH, deeper first -- the
+/// thesis's "stay close to the previous subproblem". The id makes the order
+/// total and therefore deterministic.
+class OpenNodes {
+ public:
+  using Id = std::size_t;
+
+  Id insert(Node node) {
+    const Id id = next_++;
+    by_bound_.insert(bound_key(node, id));
+    by_estimate_.insert(estimate_key(node, id));
+    nodes_.emplace(id, std::move(node));
+    return id;
+  }
+
+  [[nodiscard]] bool contains(Id id) const { return nodes_.count(id) != 0; }
+  [[nodiscard]] const Node& at(Id id) const { return nodes_.at(id); }
+  [[nodiscard]] bool empty() const noexcept { return nodes_.empty(); }
+
+  Node take(Id id) {
+    auto it = nodes_.find(id);
+    Node node = std::move(it->second);
+    by_bound_.erase(bound_key(node, id));
+    by_estimate_.erase(estimate_key(node, id));
+    nodes_.erase(it);
+    return node;
+  }
+
+  [[nodiscard]] Id best_bound() const { return std::get<3>(*by_bound_.begin()); }
+  [[nodiscard]] Id best_estimate() const { return std::get<3>(*by_estimate_.begin()); }
+  /// The global lower bound: no open node's subtree can do better.
+  [[nodiscard]] Real lower_bound() const { return std::get<0>(*by_bound_.begin()); }
+
+ private:
+  using Key = std::tuple<Real, Real, long long, Id>;
+  static Key bound_key(const Node& n, Id id) {
+    return {n.bound, n.estimate, -static_cast<long long>(n.depth), id};
+  }
+  static Key estimate_key(const Node& n, Id id) {
+    return {n.estimate, n.bound, -static_cast<long long>(n.depth), id};
+  }
+
+  std::map<Id, Node> nodes_;
+  std::set<Key> by_bound_;
+  std::set<Key> by_estimate_;
+  Id next_ = 0;
 };
 
 // --------------------------------------------------------------------------
@@ -197,6 +253,7 @@ class BranchAndBound {
                                    const SimplexResult& lp);
   void strong_branch(Candidate& c, const Node& node, const SimplexResult& lp);
   [[nodiscard]] Real elapsed() const;
+  [[nodiscard]] Real estimate(const std::vector<Candidate>& candidates, Real bound) const;
   [[nodiscard]] core::Expected<Solution> incumbent_solution(const SimplexResult& lp);
 
   Problem& working_;
@@ -209,6 +266,9 @@ class BranchAndBound {
   PseudocostTable pseudocosts_;
   std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
   std::size_t solved_node_lps_ = 0;
+  /// Every integer column's ORIGINAL-space value in the root LP, for Martin's
+  /// child-selection rule ([CIP] section 6.1).
+  std::vector<Real> root_values_;
 };
 
 Real BranchAndBound::elapsed() const {
@@ -401,6 +461,25 @@ std::size_t BranchAndBound::select(std::vector<Candidate>& candidates, const Nod
   return best;
 }
 
+/// [CIP] section 6.4, the best estimate rule of Forrest et al.:
+///
+///     e_Q = c_Q + sum_{j fractional} min{ Psi-_j f-_j , Psi+_j f+_j }
+///
+/// with `Psi` the pseudocosts -- "the estimated minimum value of a rounded
+/// solution". It needs the node's LP solution, so it is computed when a node
+/// is SOLVED and handed to both children, the same way they inherit its dual
+/// bound (section 6.3: "the child nodes inherit the dual bound of their parent
+/// node"). The thesis does not say how an unsolved child's estimate is formed;
+/// inheriting it is the reading that adds nothing to the text.
+Real BranchAndBound::estimate(const std::vector<Candidate>& candidates, Real bound) const {
+  Real e = bound;
+  for (const Candidate& c : candidates) {
+    e += std::min(c.frac_down * pseudocosts_.value(c.column, false),
+                  c.frac_up * pseudocosts_.value(c.column, true));
+  }
+  return e;
+}
+
 core::Expected<Solution> BranchAndBound::incumbent_solution(const SimplexResult& lp) {
   const Solution canonical = simplex::to_canonical_solution(canon_.problem, lp);
   return reconstruct_solution(working_, canon_.problem, canon_.transforms, canonical);
@@ -410,7 +489,7 @@ core::Expected<Solution> BranchAndBound::run() {
   const auto& m = options_.milp;
   const std::size_t n = canon_.problem.num_cols();
 
-  std::priority_queue<Node, std::vector<Node>, NodeOrder> pending;
+  OpenNodes open;
   {
     Node root;
     root.lower.resize(n);
@@ -420,7 +499,8 @@ core::Expected<Solution> BranchAndBound::run() {
       root.upper[j] = canon_.problem.col_upper[j];
     }
     root.bound = -kInf;
-    pending.push(std::move(root));
+    root.estimate = -kInf;
+    open.insert(std::move(root));
   }
 
   bool have_incumbent = false;
@@ -429,28 +509,93 @@ core::Expected<Solution> BranchAndBound::run() {
   bool closed = false;
   Real closing_bound = 0.0;
 
-  while (!pending.empty()) {
-    if (stats_.nodes >= m.node_limit || elapsed() >= m.time_limit_seconds) break;
+  // A node cannot improve on the incumbent: its bound is no better, or within
+  // the gap tolerance of it.
+  auto dominated = [&](Real bound) {
+    if (!have_incumbent) return false;
+    const Real gap =
+        std::fabs(incumbent_objective - bound) / (1.0 + std::fabs(incumbent_objective));
+    return bound >= incumbent_objective || gap < m.gap_tolerance;
+  };
 
-    Node node = std::move(const_cast<Node&>(pending.top()));
-    pending.pop();
+  // PLUNGING, [CIP] section 6.3. `children` are the open children of the node
+  // just processed, `siblings` the open siblings of it. A plunge continues
+  // with a child, else a sibling, and ends -- returning to the leaf queue --
+  // when neither is left or the abort test below fires.
+  std::vector<OpenNodes::Id> children;
+  std::vector<OpenNodes::Id> siblings;
+  std::size_t plunge_steps = 0;  // steps in the CURRENT plunge
+  std::size_t plunges = 0;       // plunges started, for `best_frequency`
+  std::size_t max_depth = 0;     // `dmax`, over processed nodes
+  const bool plunging = m.node_selection == NodeSelection::Interleaved;
 
-    // Best-first: everything still queued has a bound no better than this
-    // one, so once this cannot beat the incumbent (or is within the gap),
-    // nothing can -- which is what makes stopping a proof.
-    if (have_incumbent) {
-      const Real gap = std::fabs(incumbent_objective - node.bound) /
-                       (1.0 + std::fabs(incumbent_objective));
-      if (node.bound >= incumbent_objective || gap < m.gap_tolerance) {
-        closed = true;
-        // The proven bound is the better of the two: the incumbent itself
-        // when the queue can no longer beat it, the queue's best otherwise.
-        closing_bound = std::min(node.bound, incumbent_objective);
-        break;
+  auto next_node = [&]() -> OpenNodes::Id {
+    if (plunging) {
+      // "During each plunge, we perform a certain minimal number of plunging
+      // steps, but we abort the plunging after a certain total number of steps
+      // or if the local relative gap gamma(Q) = (c_Q - c_lower)/(c_upper -
+      // c_lower) of the current subproblem Q exceeds ... 0.25", with the
+      // minimum and maximum "0.1 dmax and 0.5 dmax". With no incumbent
+      // `c_upper` is infinite and gamma is 0, so only the maximum applies.
+      const auto dmax = static_cast<Real>(max_depth);
+      const auto min_steps = static_cast<std::size_t>(m.plunge_min_depth_fraction * dmax);
+      const auto max_steps = static_cast<std::size_t>(m.plunge_max_depth_fraction * dmax);
+      auto admissible = [&](OpenNodes::Id id) {
+        if (!open.contains(id)) return false;
+        if (plunge_steps >= max_steps) return false;
+        if (plunge_steps < min_steps || !have_incumbent) return true;
+        const Real lower = open.lower_bound();
+        const Real width = incumbent_objective - lower;
+        if (!(width > 0.0)) return false;
+        return (open.at(id).bound - lower) / width <= m.plunge_max_gap;
+      };
+      for (const auto* pool : {&children, &siblings}) {
+        for (OpenNodes::Id id : *pool) {
+          if (admissible(id)) {
+            ++plunge_steps;
+            ++stats_.plunge_steps;
+            return id;
+          }
+        }
+      }
+      // The plunge is over: a leaf from the queue starts the next one.
+      // [CIP] section 6.6: every `bestfreq`-th a best-BOUND leaf, so the
+      // global dual bound keeps moving; otherwise the best estimate.
+      plunge_steps = 0;
+      ++plunges;
+      if (m.best_frequency == 0 || plunges % m.best_frequency != 0) {
+        return open.best_estimate();
       }
     }
+    return open.best_bound();
+  };
+
+  while (!open.empty()) {
+    if (stats_.nodes >= m.node_limit || elapsed() >= m.time_limit_seconds) break;
+
+    // The global lower bound is the smallest bound of any open node, whatever
+    // order they are PROCESSED in. Once it cannot beat the incumbent (or is
+    // within the gap) nothing open can -- which is what makes stopping a proof.
+    if (dominated(open.lower_bound())) {
+      closed = true;
+      closing_bound = std::min(open.lower_bound(), incumbent_objective);
+      break;
+    }
+
+    const OpenNodes::Id id = next_node();
+    Node node = open.take(id);
+    siblings.clear();
+    for (OpenNodes::Id c : children) {
+      if (c != id && open.contains(c)) siblings.push_back(c);
+    }
+    children.clear();
+
+    // Selected out of bound order, so it can be dominated while the global
+    // bound is not. Discarding it is pruning by bound, and safe.
+    if (dominated(node.bound)) continue;
 
     ++stats_.nodes;
+    max_depth = std::max(max_depth, node.depth);
     auto lp = solve_with(node.lower, node.upper, node_lp_, node.warm.get());
     if (!lp.has_value()) return lp.error();
     stats_.node_lp_iterations += lp->iterations;
@@ -476,6 +621,13 @@ core::Expected<Solution> BranchAndBound::run() {
       continue;
     }
 
+    if (root_values_.empty()) {
+      root_values_.resize(integers_.size());
+      for (std::size_t k = 0; k < integers_.size(); ++k) {
+        root_values_[k] = integers_[k].scale * lp->x[integers_[k].canonical];
+      }
+    }
+
     // [AKM] section 2.2: the gain per unit, measured on the child actually
     // solved, updates the pseudocost of the variable that created it.
     if (node.origin.present && node.origin.fraction > 0.0) {
@@ -483,12 +635,14 @@ core::Expected<Solution> BranchAndBound::run() {
       pseudocosts_.record(node.origin.column, node.origin.up, gain / node.origin.fraction);
     }
 
-    if (have_incumbent && lp->objective >= incumbent_objective) continue;
+    if (dominated(lp->objective)) continue;
 
     std::vector<Candidate> candidates = fractional(*lp);
     if (candidates.empty()) {
       auto solution = incumbent_solution(*lp);
       if (!solution.has_value()) return solution.error();
+      if (!have_incumbent) stats_.first_incumbent_node = stats_.nodes;
+      ++stats_.incumbents;
       have_incumbent = true;
       incumbent_objective = lp->objective;
       incumbent = std::move(*solution);
@@ -499,10 +653,18 @@ core::Expected<Solution> BranchAndBound::run() {
     const Candidate& c = candidates[pick];
     if (c.down_infeasible && c.up_infeasible) continue;  // the node is empty
 
+    const Real node_estimate = estimate(candidates, lp->objective);
     const IntegerColumn& ic = integers_[c.column];
     const auto basis = std::make_shared<const Basis>(lp->basis);
+
+    // Martin's rule, [CIP] section 6.1: plunge first into the child that
+    // pushes the variable FURTHER from its root LP value -- "on the path to
+    // the current node the value of the variable has the tendency to be
+    // pushed" that way. Section 6.3 applies it during plunging. The thesis
+    // gives no rule for a value equal to the root's; up is taken then.
+    const bool up_first = c.value >= root_values_[c.column];
     for (int side = 0; side < 2; ++side) {
-      const bool up = side == 1;
+      const bool up = side == 0 ? up_first : !up_first;
       if (up ? c.up_infeasible : c.down_infeasible) continue;
       Node child;
       child.lower = node.lower;
@@ -516,10 +678,11 @@ core::Expected<Solution> BranchAndBound::run() {
       }
       if (child.lower[ic.canonical] > child.upper[ic.canonical]) continue;
       child.bound = lp->objective;
+      child.estimate = node_estimate;
       child.depth = node.depth + 1;
       child.warm = basis;
       child.origin = Origin{c.column, up, up ? c.frac_up : c.frac_down, lp->objective, true};
-      pending.push(std::move(child));
+      children.push_back(open.insert(std::move(child)));
     }
   }
 
@@ -540,7 +703,7 @@ core::Expected<Solution> BranchAndBound::run() {
   if (closed && sound) {
     result.status = SolverStatus::Optimal;
     result.best_bound = to_original(closing_bound);
-  } else if (pending.empty() && sound) {
+  } else if (open.empty() && sound) {
     // Every node was solved or pruned on a trustworthy bound.
     result.status = have_incumbent ? SolverStatus::Optimal : SolverStatus::Infeasible;
     result.best_bound = have_incumbent ? result.objective : 0.0;
@@ -548,8 +711,8 @@ core::Expected<Solution> BranchAndBound::run() {
     // A limit, or an unexplored subtree: report what is known, never a
     // verdict the search did not earn.
     result.status = SolverStatus::NotConverged;
-    result.best_bound = pending.empty() ? (have_incumbent ? result.objective : 0.0)
-                                        : to_original(pending.top().bound);
+    result.best_bound = open.empty() ? (have_incumbent ? result.objective : 0.0)
+                                     : to_original(open.lower_bound());
   }
   result.nodes_explored = stats_.nodes;
   result.from_best_iterate = result.status != SolverStatus::Optimal;

@@ -29,6 +29,7 @@ using namespace sovsolve;  // NOLINT(build/namespaces)
 using core::Real;
 using core::SolverStatus;
 using model::BranchingRule;
+using model::NodeSelection;
 
 namespace {
 
@@ -36,10 +37,15 @@ constexpr BranchingRule kRules[] = {BranchingRule::MostFractional,
                                     BranchingRule::Pseudocost,
                                     BranchingRule::Reliability};
 
-model::Options options_for(BranchingRule rule) {
+constexpr NodeSelection kSelections[] = {NodeSelection::BestFirst,
+                                         NodeSelection::Interleaved};
+
+model::Options options_for(BranchingRule rule,
+                           NodeSelection selection = NodeSelection::Interleaved) {
   model::Options o;
   o.log.level = model::LogOptions::Level::Silent;
   o.milp.branching = rule;
+  o.milp.node_selection = selection;
   return o;
 }
 
@@ -162,21 +168,24 @@ void test_every_rule_matches_enumeration() {
     model::Problem problem;
     if (!parse(to_lp(ip), problem)) continue;
     for (BranchingRule rule : kRules) {
-      auto result = solver::solve_milp(problem, options_for(rule));
-      CHECK(result.has_value());
-      if (!result.has_value()) continue;
-      if (has_solution && result->status != SolverStatus::Optimal) {
-        std::fprintf(stderr, "DEBUG seed=%u rule=%d status=%d obj=%g expected=%g\n%s\n", seed,
-                     static_cast<int>(rule), static_cast<int>(result->status), result->objective,
-                     expected, to_lp(ip).c_str());
-      }
-      if (has_solution) {
-        CHECK(result->status == SolverStatus::Optimal);
-        CHECK_NEAR(result->objective, expected, 1e-6);
-        // Optimal means the bound meets the objective.
-        CHECK_NEAR(result->best_bound, result->objective, 1e-6);
-      } else {
-        CHECK(result->status == SolverStatus::Infeasible);
+      for (NodeSelection selection : kSelections) {
+        auto result = solver::solve_milp(problem, options_for(rule, selection));
+        CHECK(result.has_value());
+        if (!result.has_value()) continue;
+        if (has_solution && result->status != SolverStatus::Optimal) {
+          std::fprintf(stderr, "DEBUG seed=%u rule=%d sel=%d status=%d obj=%g expected=%g\n%s\n",
+                       seed, static_cast<int>(rule), static_cast<int>(selection),
+                       static_cast<int>(result->status), result->objective, expected,
+                       to_lp(ip).c_str());
+        }
+        if (has_solution) {
+          CHECK(result->status == SolverStatus::Optimal);
+          CHECK_NEAR(result->objective, expected, 1e-6);
+          // Optimal means the bound meets the objective.
+          CHECK_NEAR(result->best_bound, result->objective, 1e-6);
+        } else {
+          CHECK(result->status == SolverStatus::Infeasible);
+        }
       }
     }
   }
@@ -344,10 +353,49 @@ End
   CHECK_NEAR(r->objective, -2.8, 1e-9);
 }
 
+/// Node selection on trees deep enough for it to matter. The 5-variable
+/// oracle above rarely goes past depth 3, where [CIP] section 6.3's plunge
+/// limit (0.5 dmax steps) is one step at most. Nine variables of width up to
+/// 4 give trees where plunges run several steps, incumbents arrive mid-search,
+/// and the gap-based abort and out-of-order pruning are exercised -- all of
+/// which must leave the ANSWER untouched. Still checked by enumeration.
+void test_node_selection_on_deeper_trees() {
+  std::size_t plunge_steps = 0;
+  std::size_t checked = 0;
+  for (unsigned seed = 1; seed <= 12; ++seed) {
+    const RandomIp ip = make_random_ip(seed * 104729u, 9, 4);
+    Real expected = 0.0;
+    const bool has_solution = enumerate(ip, expected);
+    model::Problem problem;
+    if (!parse(to_lp(ip), problem)) continue;
+    for (NodeSelection selection : kSelections) {
+      solver::MilpStatistics stats;
+      auto result = solver::solve_milp(
+          problem, options_for(BranchingRule::Reliability, selection), &stats);
+      CHECK(result.has_value());
+      if (!result.has_value()) continue;
+      ++checked;
+      if (has_solution) {
+        CHECK(result->status == SolverStatus::Optimal);
+        CHECK_NEAR(result->objective, expected, 1e-6);
+        CHECK_NEAR(result->best_bound, result->objective, 1e-6);
+      } else {
+        CHECK(result->status == SolverStatus::Infeasible);
+      }
+      if (selection == NodeSelection::BestFirst) CHECK_EQ(stats.plunge_steps, std::size_t{0});
+      if (selection == NodeSelection::Interleaved) plunge_steps += stats.plunge_steps;
+    }
+  }
+  CHECK_EQ(checked, std::size_t{24});
+  // Plunging must actually happen somewhere, or this test checks nothing new.
+  CHECK(plunge_steps > 0);
+}
+
 }  // namespace
 
 int main() {
   test_every_rule_matches_enumeration();
+  test_node_selection_on_deeper_trees();
   test_tiny_knapsack();
   test_integer_infeasible();
   test_maximization_sign();

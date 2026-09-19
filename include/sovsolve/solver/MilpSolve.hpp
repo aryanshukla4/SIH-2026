@@ -34,6 +34,12 @@
 //             pseudocosts with what the probes find; stop after `lambda`
 //             score updates without a new best, or `kappa` candidates.
 //   parameters [CIP] sections 5.4 and 5.7 -- see MilpOptions.
+//   node selection [CIP] chapter 6, SCIP's default (section 6.6): best
+//             estimate search with plunging, and every 10th plunge a
+//             best-bound leaf instead. Estimate (section 6.4, Forrest et al.)
+//             `e_Q = c_Q + sum min{Psi- f-, Psi+ f+}`; plunge limits and the
+//             0.25 gap abort from section 6.3; child order by Martin's rule
+//             (section 6.1). Pure best first (section 6.2) remains selectable.
 //
 // WHAT THE SEARCH WORKS ON. The model is canonicalized and scaled ONCE, at the
 // root, and a node is just a set of canonical column bounds. Canonicalization
@@ -83,6 +89,14 @@ struct MilpStatistics {
   std::size_t unreliable_nodes = 0;
   /// Root cover/GCD cuts appended before the search.
   std::size_t root_cuts = 0;
+  /// Integer-feasible node LPs that improved the incumbent, and the node count
+  /// at which the first one was found. Node selection ([CIP] chapter 6) is
+  /// judged on these as much as on the bound.
+  std::size_t incumbents = 0;
+  std::size_t first_incumbent_node = 0;
+  /// Nodes chosen by continuing a plunge (a child or sibling of the node just
+  /// processed) rather than from the leaf queue.
+  std::size_t plunge_steps = 0;
 };
 
 /// Solves a mixed-integer LINEAR program. A model with no discrete columns is
