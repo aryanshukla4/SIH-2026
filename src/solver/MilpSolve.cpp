@@ -393,6 +393,10 @@ class BranchAndBound {
   Real root_objective_ = 0.0;
   std::vector<Real> root_x_;
   std::vector<Real> root_reduced_cost_;
+  /// [CIP] 8.8's "active region" of each column: the smallest interval
+  /// containing every node-LP value it has taken during the search.
+  std::vector<Real> active_min_;
+  std::vector<Real> active_max_;
 };
 
 Real BranchAndBound::elapsed() const {
@@ -1661,6 +1665,15 @@ core::Expected<Solution> BranchAndBound::run() {
       }
     }
 
+    if (active_min_.empty()) {
+      active_min_.assign(n, kInf);
+      active_max_.assign(n, -kInf);
+    }
+    for (std::size_t j = 0; j < n; ++j) {
+      active_min_[j] = std::min(active_min_[j], lp->x[j]);
+      active_max_[j] = std::max(active_max_[j], lp->x[j]);
+    }
+
     // [AKM] section 2.2: the gain per unit, measured on the child actually
     // solved, updates the pseudocost of the variable that created it.
     if (node.origin.present && node.origin.fraction > 0.0) {
@@ -1701,6 +1714,51 @@ core::Expected<Solution> BranchAndBound::run() {
     const std::size_t pick = select(candidates, node, *lp);
     const Candidate& c = candidates[pick];
     if (c.down_infeasible && c.up_infeasible) continue;  // the node is empty
+
+    // [CIP] 8.8, reduced cost strengthening, on this node's LP: a nonbasic
+    // column at its lower bound with r_j > 0 cannot rise above
+    // l_j + (c^ - c)/r_j in any solution better than the incumbent c^ (the LP
+    // bound of such a point would already reach c^); r_j < 0 at the upper
+    // bound likewise. Valid for this node's subtree -- installed on the node's
+    // bounds, which both children copy. Installed "only if the variable is of
+    // integer type or if at least 20% of the local domain of a continuous
+    // variable is cut off", and for a continuous one only if it cuts into the
+    // column's active region.
+    if (m.propagation && have_incumbent_) {
+      const Real gap = incumbent_objective_ - lp->objective;
+      const Real tol = options_.simplex.dual_feasibility_tolerance;
+      for (std::size_t j = 0; j < n && gap >= 0.0; ++j) {
+        const auto st = lp->basis.status[j];
+        const Real r = lp->reduced_cost[j];
+        const Real s = integer_scale_[j];
+        const Real width = node.upper[j] - node.lower[j];
+        if (st == simplex::VarStatus::AtLower && r > tol) {
+          Real u = node.lower[j] + gap / r;
+          if (s != 0.0) {
+            u = std::floor(s * u + kPropTolerance) / s;
+          } else if (!(is_finite_bound(width) && node.upper[j] - u >= 0.2 * width &&
+                       u < active_max_[j])) {
+            continue;
+          }
+          if (u < node.upper[j]) {
+            node.upper[j] = u;
+            ++stats_.local_redcost_tightenings;
+          }
+        } else if (st == simplex::VarStatus::AtUpper && r < -tol) {
+          Real l = node.upper[j] + gap / r;
+          if (s != 0.0) {
+            l = std::ceil(s * l - kPropTolerance) / s;
+          } else if (!(is_finite_bound(width) && l - node.lower[j] >= 0.2 * width &&
+                       l > active_min_[j])) {
+            continue;
+          }
+          if (l > node.lower[j]) {
+            node.lower[j] = l;
+            ++stats_.local_redcost_tightenings;
+          }
+        }
+      }
+    }
 
     const Real node_estimate = estimate(candidates, lp->objective);
     const IntegerColumn& ic = integers_[c.column];
