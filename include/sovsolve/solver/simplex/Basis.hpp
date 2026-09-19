@@ -115,9 +115,20 @@ class AugmentedMatrix {
 
   /// Objective coefficient. Logicals carry no cost -- the canonical objective
   /// is over `x` alone, and `s` appears in no term of it.
+  ///
+  /// Reads the override when one is set: the cost PERTURBATION of Koberstein's
+  /// thesis section 6.3.1 (SolveSimplex.cpp) runs the dual simplex on slightly
+  /// changed costs, and pointing the one accessor every cost read goes through
+  /// at a different vector is what keeps that from needing a copy of the
+  /// problem -- which branch-and-bound would otherwise pay at every node.
   [[nodiscard]] Real cost(std::size_t w) const noexcept {
-    return is_logical(w) ? 0.0 : problem_->c[w];
+    if (is_logical(w)) return 0.0;
+    return costs_ != nullptr ? (*costs_)[w] : problem_->c[w];
   }
+
+  /// Replaces the costs read by `cost()`, or restores the problem's own with
+  /// `nullptr`. Length `num_structural()`; not owned.
+  void set_costs(const std::vector<Real>* costs) noexcept { costs_ = costs; }
 
   [[nodiscard]] const model::CanonicalProblem& problem() const noexcept {
     return *problem_;
@@ -148,6 +159,7 @@ class AugmentedMatrix {
 
  private:
   const model::CanonicalProblem* problem_;
+  const std::vector<Real>* costs_ = nullptr;
   std::size_t num_rows_;
   std::size_t num_structural_;
 };

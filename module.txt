@@ -45,6 +45,11 @@ Each module has one job and uses the shared project types.
   with reliability branching (Achterberg-Koch-Martin; Achterberg's thesis
   ch. 5). Its enumeration oracle found a dual simplex bug on first run --
   the bound-flipping exit called a feasible LP infeasible -- now fixed.
+- Added Module 28 stage 3: cost perturbation in the dual simplex (Koberstein
+  thesis section 6.3.1), against the dual degeneracy that made pk1's node LPs
+  take thousands of pivots. pk1: 125 -> 15.5 pivots per node, 5.5x faster at
+  20000 nodes. Default on (--perturb=0 turns it off); glass4 got WORSE and is
+  recorded as such.
 - Fixed Module 24G: PDLP's infeasibility test now uses arXiv 2102.04592
   (50)/(51), violation per unit of objective improvement. The old
   size-normalized test declared israel infeasible on Linux. Measured on
@@ -691,6 +696,10 @@ vectors with a nonzero list). They are left for a measured second pass, one
 technique per commit with before/after corpus numbers, per `docs/BENCHMARKS.md`.
 So is the GPU pricing offload for `alpha_r = rho_r' Ahat`, which is to be kept
 only if it is measured faster on this corpus.
+
+(Later: cost perturbation was added as Module 28 stage 3, below, once the
+branch-and-bound made dual degeneracy the measured bottleneck. Dual steepest
+edge is still not done.)
 
 B&B warm starting (Stage 3 of the plan) is also not done: `BranchAndBound.cu`
 still re-runs canonicalize + presolve per node, which can change the canonical
@@ -1597,3 +1606,70 @@ TWO FINDINGS THAT DECIDE WHAT COMES NEXT.
    perturbation as deliberately not done. For a MILP engine they are no longer
    optional: branch-and-bound multiplies the LP engine's cost by the node
    count.
+
+28, stage 3 -- cost perturbation against dual degeneracy.
+
+SOURCE. Koberstein, "The dual simplex method, techniques for a fast and stable
+implementation" (PhD thesis, Paderborn, 2005), section 6.3.1, transcribed step
+by step in SolveSimplex.cpp's make_cost_perturbation(). Not derived here.
+
+  WHEN: the structural costs take fewer than n/4 distinct values (the thesis's
+        up-front test). Fixed and free columns are never perturbed.
+  HOW:  xi_j = 100 eps_D + 1e-5 |c_j|; sign negative if u_j is finite,
+        positive otherwise, times 0.5(1 + mu), mu uniform on [0,1]; weighted
+        by column nonzeros w = (1e-2, 1e-1, 1, 2, 5, 10, 20, 30, 40, 100);
+        scaled by 10s into [xi_min, xi_max], (6.36)-(6.40). Fixed-seed
+        generator, so every solve is reproducible.
+  REMOVAL, as the thesis does it:
+        Infeasible  -- stands. A Farkas ray involves A, b and bounds, never c.
+        Optimal     -- primal phase II from the dual's basis on the TRUE costs.
+        Unbounded   -- confirmed the same way, since it depends on c.
+        Otherwise the point is returned with its TRUE objective and never a
+        verdict the true costs have not confirmed.
+
+Two readings of the text are stated in the code rather than hidden: "size of
+the cost coefficient" is |c_j|, and (6.40)'s mean of c_j is the mean of |c_j|.
+The stall-triggered second perturbation (after 3 x refactor-interval
+iterations without progress) is NOT implemented.
+
+The plumbing: the dual runs on an alternate cost vector passed through
+solve_dual_simplex -> SimplexEngine -> AugmentedMatrix::cost(); the problem's
+own `c` is never modified. Strong-branching probes run unperturbed
+(MilpSolve.cpp): a probe is a short capped estimate and the phase II cleanup
+would be most of its cost.
+
+TESTS (dual_simplex_test): a 5x5 assignment LP with costs in {1,2,3,4} must
+report objective 6 to 1e-9, so an unremoved perturbation (a few 1e-5s) fails;
+infeasible stays infeasible; unbounded is confirmed; distinct costs give the
+identical solve (same objective, same pivot count). Mutations caught: never
+removing the perturbation, and ignoring the n/4 trigger (perturbing every
+problem). The milp_test enumeration
+oracle, 1000 random programs: zero mismatches with perturbation on.
+
+MEASURED, NETLIB: all 19 objectives unchanged. Pivots: greenbea 104712 ->
+15312, stair 3357 -> 635; standata 72 -> 113 (worse, a small model where the
+phase II cleanup costs more than the degeneracy did). Instances whose costs
+are mostly distinct do not qualify and run the same solve bit for bit.
+
+MEASURED, MIPLIB, reliability branching, 20000-node limit, --perturb=0 vs 1:
+
+    instance       pivots/node      time            lower bound
+    pk1            125.4 -> 15.5    24.7s -> 4.5s   4.12 -> 4.75
+    gen-ip054      identical (costs distinct, does not qualify)
+    mas74          identical (does not qualify)
+    timtab1        4.3 -> 4.4       3.95s -> 5.23s  352417 -> 363247
+    enlight_hard   6.4 -> 5.0       --              22 -> 21
+    glass4         4.0 -> 11.9      11.4s -> 22.9s  1.00001e9 -> 8.00004e8
+
+pk1 is the case this was for, and it is fixed. glass4 is a REGRESSION: three
+times the pivots and a weaker bound at the same node count. A bound that
+differs at a fixed node count is expected -- different pivots give different
+optimal vertices, so different branching candidates and a different tree --
+but glass4 does not merely differ, it is worse on every column. Koberstein
+section 9.4 reports perturbation as a net win over his test set, not on every
+instance; the stall-triggered variant (perturb only when stalling is seen) is
+the thesis's own answer for models where the up-front test fires on a
+problem that was not stalling. Recorded rather than tuned away.
+
+Still no incumbents on these runs: node selection ([CIP] chapter 6) remains
+the next MILP item, and dual steepest edge ([Koberstein] 3.3) the next LP one.

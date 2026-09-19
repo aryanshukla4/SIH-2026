@@ -35,8 +35,9 @@ enum class Step : std::uint8_t {
 
 class DualSolver : public SimplexEngine {
  public:
-  DualSolver(const model::CanonicalProblem& problem, const model::Options& options)
-      : SimplexEngine(problem, options) {
+  DualSolver(const model::CanonicalProblem& problem, const model::Options& options,
+             const std::vector<Real>* costs)
+      : SimplexEngine(problem, options, costs) {
     // Set before the first refactorize(), which may re-establish dual
     // feasibility and therefore install artificial bounds of this size.
     current_bound_ = opt_.artificial_bound;
@@ -672,12 +673,17 @@ core::Expected<SimplexResult> DualSolver::run(const Basis* warm_start) {
 
 core::Expected<SimplexResult> solve_dual_simplex(const model::CanonicalProblem& problem,
                                                  const model::Options& options,
-                                                 const Basis* warm_start) {
+                                                 const Basis* warm_start,
+                                                 const std::vector<Real>* costs) {
   if (!problem.validate()) {
     return core::make_error(ErrorCode::DimensionMismatch,
                             "canonical problem failed its own validate()");
   }
-  DualSolver solver(problem, options);
+  if (costs != nullptr && costs->size() != problem.num_cols()) {
+    return core::make_error(ErrorCode::DimensionMismatch,
+                            "solve_dual_simplex: cost override has the wrong length");
+  }
+  DualSolver solver(problem, options, costs);
   return solver.run(warm_start);
 }
 

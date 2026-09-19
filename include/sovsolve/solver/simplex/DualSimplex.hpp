@@ -47,6 +47,8 @@
 #include "sovsolve/core/Types.hpp"
 #include "sovsolve/model/Canonical.hpp"
 #include "sovsolve/model/Options.hpp"
+#include <vector>
+
 #include "sovsolve/solver/simplex/Basis.hpp"
 #include "sovsolve/solver/simplex/SimplexResult.hpp"
 
@@ -68,9 +70,13 @@ using core::SolverStatus;
 /// optimal, infeasible, unbounded, limit reached -- is a `SolverStatus` on a
 /// successful return, because "this model is infeasible" is an answer, not a
 /// failure to produce one.
+///
+/// `costs`, when given, replaces `problem.c` for the whole run -- the cost
+/// perturbation of SolveSimplex.cpp. The reported `objective` is then the
+/// PERTURBED objective; removing the perturbation is the caller's job.
 [[nodiscard]] core::Expected<SimplexResult> solve_dual_simplex(
     const model::CanonicalProblem& problem, const model::Options& options,
-    const Basis* warm_start = nullptr);
+    const Basis* warm_start = nullptr, const std::vector<Real>* costs = nullptr);
 
 }  // namespace sovsolve::solver::simplex
 

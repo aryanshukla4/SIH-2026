@@ -179,6 +179,11 @@ class BranchAndBound {
     // primal cleanup exists to finish a solve that must produce a verdict,
     // and would turn a cheap probe into a full solve.
     probe_lp_.simplex.primal_cleanup = false;
+    // Probes also run UNPERTURBED. Removing a perturbation means a primal
+    // phase II after every optimal solve (SolveSimplex.cpp), and a probe is a
+    // short, iteration-capped estimate -- that cleanup would be most of its
+    // cost. Node LPs, which must be exact, keep it.
+    probe_lp_.simplex.cost_perturbation = false;
   }
 
   core::Expected<Solution> run();
