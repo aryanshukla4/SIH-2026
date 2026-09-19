@@ -45,6 +45,9 @@ Each module has one job and uses the shared project types.
   with reliability branching (Achterberg-Koch-Martin; Achterberg's thesis
   ch. 5). Its enumeration oracle found a dual simplex bug on first run --
   the bound-flipping exit called a feasible LP infeasible -- now fixed.
+- Fixed Module 28 stage 6b: the pump's cycle perturbation is now Fischetti,
+  Glover and Lodi's own (2005, section 3), replacing our stand-in. Same
+  incumbents; the pump converges or gives up in fewer rounds.
 - Added Module 28 stage 6: objective feasibility pump and RENS at the root
   ([CIP] 9.3.3, 9.1.1; Berthold Algorithms 3 and 4). RENS improves mas76
   (gap 2.9% -> 0.29%), gen-ip054 and gen-ip002; the pump finds points but
@@ -1987,9 +1990,10 @@ is perturbed, stage 2 gives up after 100 perturbations. SCIP's form for
 general integers -- cost +1/-1/0 by desired direction, no d_j columns --
 so each round changes costs only and the primal simplex resumes from the
 last basis. Run once, at the root, only while no incumbent exists.
-OURS, stated: the random perturbation flips T random columns of S; [B] only
-says "shifts some of the variables' values ... randomly up or down" and the
-original is in Fischetti-Glover-Lodi ([B] reference [24]), not in hand.
+The random perturbation was first our own choice (T random flips) because
+[B] leaves it unstated; it is now the original's, from Fischetti, Glover and
+Lodi, "The feasibility pump", Math. Programming 104 (2005), section 3 -- see
+stage 6b.
 
 RENS. Fix every integer column integral in the root LP, bound the rest to
 [floor, ceil], solve that sub-MIP with this same branch-and-bound: 5000
@@ -2032,3 +2036,23 @@ Incumbents deterministic; wall times noisy again this session and not used.
 RENS earns its place; the pump, on this set, finds points but no better ones
 than the dives already had. enlight_hard remains without an incumbent after
 every heuristic in [CIP] chapter 9 that this engine can run.
+
+28, stage 6b -- the pump's perturbation from the original paper.
+
+SOURCE ADDED: [FGL] M. Fischetti, F. Glover, A. Lodi, "The feasibility
+pump", Math. Programming 104 (2005). It confirms the 1-cycle rule already in
+place -- Figure 1 step 9, "flip the TT = rand(T/2, 3T/2) entries x~_j with
+highest |x*_j - x~_j|", T = 20, i.e. [10, 30] and, since x~ is x*'s rounding
+there, the most fractional -- and supplies the one piece that was ours, the
+cycle perturbation (section 3): "for each j in I we generate a uniformly
+random value rho_j in [-0.3, 0.7] and flip x~_j in case
+|x*_j - x~_j| + max{rho_j, 0} > 0.5". Stated for 0-1 MIPs; on a general
+integer a flip moves x~_j to x*_j's other integer neighbour, within bounds.
+[FGL]'s extra "in any case after R = 100 iterations" perturbation is not
+added: [B] Algorithm 3, which this pump follows, replaces cycle detection by
+its (x~, alpha) list and has no periodic restart.
+
+MEASURED (20000 nodes, defaults): every final incumbent identical to stage 6.
+The pump's own effort moved: mas76 reaches its point in 69 rounds (was 139);
+where it fails it stops sooner -- enlight_hard 182 rounds (was 607), glass4
+3704 LP iterations (was 6223), timtab1 703 rounds (was 756).
