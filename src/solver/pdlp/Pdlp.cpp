@@ -724,6 +724,10 @@ core::Expected<PdlpResult> PdlpSolver::run() {
 
     if (iteration % interval == 0) {
       sync_from_backend();
+      if (!backend_.status().ok()) {
+        outcome = SolverStatus::NumericalError;
+        break;
+      }
       evaluate(conv);
       if (conv.converged(opt_.pdlp.termination_tolerance)) {
         outcome = SolverStatus::Optimal;
@@ -772,8 +776,10 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   // which case `conv` is stale by up to `interval` iterations. Re-measure so
   // the reported residuals describe the iterate actually returned.
   sync_from_backend();
+  const bool backend_ok = backend_.status().ok();
+  if (!backend_ok) outcome = SolverStatus::NumericalError;
   evaluate(conv);
-  if (certificate_ == CertificateKind::None &&
+  if (backend_ok && certificate_ == CertificateKind::None &&
       conv.converged(opt_.pdlp.termination_tolerance)) {
     outcome = SolverStatus::Optimal;
   }

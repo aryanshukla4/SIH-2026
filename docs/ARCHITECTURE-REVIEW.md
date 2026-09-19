@@ -225,7 +225,14 @@ The distinction that matters:
 > means *this* GPU is, and the matrix-free design is what makes the code
 > portable to one where it isn't.
 >
-> Device residency deferred on the same reasoning, and the reasoning is
+> **Residency was built on 2026-09-19** (`module.txt` §24F): `datt256`
+> 16.02 s → 4.47 s (3.6×), `bab2` 15.96 s → 3.32 s (4.8×). `bab2` beats the
+> "~3.8× ceiling" above, which exposes an assumption in it: the ceiling is the
+> bandwidth ratio against a CPU that *saturates* its memory bus, and our CPU
+> PDLP is single-threaded. Quote these against "our CPU implementation", not
+> "the CPU".
+>
+> *(Superseded:)* Device residency deferred on the same reasoning, and the reasoning is
 > hardware-specific in the opposite direction: it is worth ~4× here, but PCIe
 > does not scale with the GPU, so on a faster card the transfer fraction grows
 > and residency becomes the gate rather than an optimization. Deferred because

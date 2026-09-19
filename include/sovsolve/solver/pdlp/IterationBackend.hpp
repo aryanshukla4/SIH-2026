@@ -45,6 +45,7 @@
 #include <cstdint>
 
 #include "sovsolve/core/Span.hpp"
+#include "sovsolve/core/Status.hpp"
 #include "sovsolve/core/Types.hpp"
 #include "sovsolve/core/Vector.hpp"
 #include "sovsolve/model/Canonical.hpp"
@@ -125,6 +126,18 @@ class IterationBackend {
   /// a scalar.
   virtual void accumulate_average(Real weight) = 0;
   virtual void reset_average() = 0;
+
+  /// A STICKY error: the first failure the backend hit, or OK.
+  ///
+  /// The hot-path methods return nothing, because checking a status after
+  /// every kernel launch would put a host decision back in the middle of the
+  /// loop this interface exists to keep clear. So a device implementation
+  /// records its first failure here and carries on, and the solver checks this
+  /// at every sync point. Without it a failed launch mid-solve would not stop
+  /// anything: the iterate would simply stop changing, and the run would report
+  /// MaxIterations on a solvable problem. The host implementation cannot fail
+  /// and keeps the default.
+  [[nodiscard]] virtual core::Status status() const { return core::Status::Ok(); }
 
   /// Matrix products this backend applied itself, over and above whatever the
   /// cold-path `MatVec` counted. Zero for an implementation that routes its

@@ -86,6 +86,13 @@ if(SOVSOLVE_ENABLE_CUDA)
   target_compile_definitions(solver_gpu_algorithms_test PRIVATE
     SOVSOLVE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
   sovsolve_add_test(branch_and_bound_test      unit/branch_and_bound_test.cpp)
+
+  # Module 24F. The device-resident PDLP backend against the host one,
+  # operation by operation from a shared state -- plus a reproducibility check
+  # that fixed-grid reductions (no atomics) give identical bits run to run.
+  sovsolve_add_test(pdlp_device_test           unit/pdlp_device_test.cpp)
+  target_compile_definitions(pdlp_device_test PRIVATE
+    SOVSOLVE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 endif()
 
 # Corpus tests read real files, so they need an absolute data path -- ctest
