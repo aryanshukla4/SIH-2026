@@ -127,6 +127,7 @@ void print_usage(const char* argv0) {
       "                        MilpOptions::branching (default reliability). A\n"
       "                        MILP with --method=dual-simplex or primal-simplex\n"
       "                        runs the host branch-and-bound (module.txt 28).\n"
+      "  --mip-propagation=0|1 MilpOptions::propagation (default 1): CIP ch. 7\n"
       "  --mip-pump=0|1        MilpOptions::feasibility_pump (default 1)\n"
       "  --mip-rens=0|1        MilpOptions::rens (default 1)\n"
       "  --mip-heuristics=0|1  MilpOptions::heuristics (default 1): CIP ch. 9\n"
@@ -240,6 +241,8 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.simplex.dual_steepest_edge = (val != "0");
     } else if (key == "perturb") {
       options.simplex.cost_perturbation = (val != "0");
+    } else if (key == "mip-propagation") {
+      options.milp.propagation = (val != "0");
     } else if (key == "mip-pump") {
       options.milp.feasibility_pump = (val != "0");
     } else if (key == "mip-rens") {
@@ -543,6 +546,9 @@ int main(int argc, char** argv) {
       std::printf("pump_solutions=%zu\n", milp_stats.pump_solutions);
       std::printf("rens_nodes=%zu\n", milp_stats.rens_nodes);
       std::printf("rens_solutions=%zu\n", milp_stats.rens_solutions);
+      std::printf("propagation_tightenings=%zu\n", milp_stats.propagation_tightenings);
+      std::printf("propagation_cutoffs=%zu\n", milp_stats.propagation_cutoffs);
+      std::printf("redcost_tightenings=%zu\n", milp_stats.redcost_tightenings);
     }
   }
 

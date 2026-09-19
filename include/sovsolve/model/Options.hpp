@@ -382,6 +382,13 @@ struct MilpOptions {
   Real rens_max_fractional_ratio = 0.5;
   Real rens_min_reduction = 0.25;
 
+  /// Domain propagation, [CIP] chapter 7: linear constraint propagation
+  /// (Algorithm 7.1) at EVERY node and after every dive bound change -- the
+  /// thesis's "aggr linear" setting, which Table 7.1 measures better than its
+  /// every-fifth-depth default on almost all test sets -- plus objective
+  /// propagation (7.6) and root reduced cost strengthening (7.7).
+  bool propagation = true;
+
   /// Stop once this many nodes pass without an improved incumbent (0 = off).
   /// The RENS sub-MIP's stalling limit; available to any run.
   std::size_t stall_node_limit = 0;
