@@ -41,6 +41,10 @@ Each module has one job and uses the shared project types.
   is the only operation this hardware's FP64 penalty leaves competitive
   (docs/ARCHITECTURE-REVIEW.md 3.5 measures factorization at ~64x slower than
   the CPU, SpMV at ~2x).
+- Fixed Module 24G: PDLP's infeasibility test now uses arXiv 2102.04592
+  (50)/(51), violation per unit of objective improvement. The old
+  size-normalized test declared israel infeasible on Linux. Measured on
+  both builds: fewer false verdicts and gas11 now caught at 1e-8 too.
 - Added Module 24F: PDLP's iterate resident on the GPU, `--gpu-resident=1`
   (2026-09-19). 3.6x faster than CPU on datt256 and 4.8x on bab2, 2.3-2.5x
   over the spmv-only port. Records a pre-existing false infeasibility
@@ -1052,8 +1056,60 @@ Optimal at 24,120 iterations; the Linux build -- pre-refactor code included,
 bit-for-bit -- reports Infeasible at 7,600. Compiler rounding sends the
 trajectory to a point where the 1e-6 certificate test fires. The earlier
 finding "1e-6 gives zero false verdicts" was measured on Windows only. The
-certificate test needs to be made robust (e.g. persistence across checks, or a
-verified ray) -- a separate change, and probably a paper question.
+certificate test needed the reference's own definition -- FIXED in 24G.
+
+## 24G. Infeasibility certificates: the paper's definition, not ours -- 2026-09-19
+
+A FALSE VERDICT, and it came from not reading far enough into a paper already in
+hand. The Linux build declared israel (feasible, optimum -896644.8) INFEASIBLE at
+iteration 7600, with the iterate at -896636 -- nearly converged. The Windows
+build reported Optimal. Pre-refactor code did the same, bit for bit, so it was
+never caused by the GPU work.
+
+The cause: pdlp/Infeasibility.cpp normalized each candidate ray by its own SIZE
+and then compared every constraint against an absolute epsilon. That accepts
+rays that are almost FLAT -- objective improvement 1e-5 of their length,
+violation 1e-7, passes. A nearly converged run on a feasible model produces
+exactly such vectors: tiny, directionless differences of iterates, which become
+unit-length noise once divided by their own size. Compiler rounding decided
+which platform crossed the line.
+
+arXiv 2102.04592 -- the reference this module was built from -- defines the
+test properly in section 6, (50) and (51): an EPSILON-APPROXIMATE certificate
+measures violation PER UNIT OF OBJECTIVE IMPROVEMENT (Euclidean norm), which
+it notes parallels SCS. For the flat example that is 1e-7 / 1e-5 = 1e-2, and it
+is rejected. Implemented as stated: (50) for a dual ray, (51) for a primal ray
+with its two conditions kept separate. Two choices of ours, both documented at
+the code: a candidate outside the dual sign cone is PROJECTED and the distance
+moved is charged to the residual (rejecting outright would discard the fastest
+sequence over rounding; ignoring it would not be (50)); and a rounding guard
+`rate > 1e-12 * magnitude` for the one case a ratio cannot handle, a residual
+of exactly zero.
+
+MEASURED ON BOTH BUILDS, scripts/cert_sweep.sh, 30000 iterations, all tracked
+corpus instances (feasible except gas11, run with presolve off):
+
+    tolerance   old test (Windows only)          new test, Windows and Linux
+    1e-4        4 false verdicts                 1 (greenbea Unbounded)
+    1e-6        0 -- but israel false on Linux   0, gas11 detected
+    1e-8        gas11 MISSED                     0, gas11 detected
+
+Fewer false verdicts AND more sensitivity: the old test could not see gas11 at
+1e-8. Default stays 1e-6, two decades from the nearest false verdict.
+
+TESTS: `test_flat_rays_are_rejected` pins it directly with a BOUNDED model,
+`min -1e-5 x s.t. 1e-7 x <= 1, x free`, whose candidate `v = 1` the old test
+called Unbounded; plus a genuine primal ray, a genuine dual ray, a box-cone case
+and a wrong-sign dual case, so the test cannot pass by rejecting everything.
+Mutations: rows against an absolute epsilon (3 checks), dual residual against
+an absolute epsilon (3), sign violation not charged (1), box cone not tested
+(1) -- all caught. The rounding guard SURVIVES deletion: a candidate with
+exactly zero violation and a rate positive only through rounding could not be
+constructed by hand -- every attempt's subtractions came out exact -- so it is
+an unpinned belt-and-braces guard, stated as such.
+
+The lesson is the same as the MOSEK paper's: the answer was in the reference
+the whole time, in a section I had not read closely.
 
 ## 25. Homogeneous self-dual embedding -- added 2026-09-14/15, `--method=hsd`
 
