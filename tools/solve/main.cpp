@@ -85,6 +85,8 @@ void print_usage(const char* argv0) {
       "                        finish a dual run that ended without a verdict\n"
       "                        by handing its basis to the primal simplex)\n"
       "  --bound-flipping=0|1  SimplexOptions::bound_flipping    (default 1)\n"
+      "  --perturb=0|1         SimplexOptions::cost_perturbation (default 1):\n"
+      "                        Koberstein 6.3.1, against dual degeneracy\n"
       "  --simplex-tol-primal=X  SimplexOptions::primal_feasibility_tolerance\n"
       "  --simplex-tol-dual=X    SimplexOptions::dual_feasibility_tolerance\n"
       "\n"
@@ -224,6 +226,8 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       gpu_resident = (val != "0");
     } else if (key == "gpu-spmv-timing") {
       gpu_spmv_timing = (val != "0");
+    } else if (key == "perturb") {
+      options.simplex.cost_perturbation = (val != "0");
     } else if (key == "mip-cuts") {
       options.milp.root_cuts = (val != "0");
     } else if (key == "branching") {

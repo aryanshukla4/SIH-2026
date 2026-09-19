@@ -77,7 +77,8 @@ class SimplexEngine {
   SimplexEngine& operator=(const SimplexEngine&) = delete;
 
  protected:
-  SimplexEngine(const model::CanonicalProblem& problem, const model::Options& options);
+  SimplexEngine(const model::CanonicalProblem& problem, const model::Options& options,
+                const std::vector<Real>* costs = nullptr);
 
   // --- setup -------------------------------------------------------------
 

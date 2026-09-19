@@ -602,6 +602,13 @@ struct SimplexOptions {
   /// linearly with the eta file, so this bounds them together.
   std::size_t refactor_interval = 100;
 
+  /// Cost perturbation against DUAL DEGENERACY, Koberstein, "The dual simplex
+  /// method, techniques for a fast and stable implementation" (thesis, 2005),
+  /// section 6.3.1 -- see SolveSimplex.cpp. Applied only when the structural
+  /// costs take fewer than n/4 distinct values, the thesis's own test for a
+  /// significantly dual-degenerate problem.
+  bool cost_perturbation = true;
+
   /// Temporary finite bound given to a dual-infeasible nonbasic column during
   /// phase 1. Escalated by `artificial_bound_growth` when the solved
   /// artificially-bounded problem leaves a variable resting on one and the
