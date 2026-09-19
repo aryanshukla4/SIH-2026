@@ -2374,3 +2374,75 @@ performance + efficiency cores, Balanced power plan) varied 3.5x on IDENTICAL
 deterministic runs (15.7 s to 54.1 s). Pinning to one core cut that to about
 1.3x. Deterministic counts (nodes, LP iterations, conflict_checks) are the
 reliable measures; wall times need pinning and repetition.
+
+## 29. MIP presolve on the canonical model -- added 2026-09-20, `--mip-presolve`
+
+SOURCES. [CIP] T. Achterberg, "Constraint Integer Programming" (2007),
+chapter 10: Algorithm 10.1 (linear-constraint presolving) and Algorithm 10.14
+(dual fixing). [AGH] Achterberg, Bixby, Gu, Rothberg, Weninger, "Presolve
+Reductions in Mixed Integer Programming" (INFORMS J. Computing 2020), for
+WHICH reductions matter: its Tables 1-39 disable one reduction at a time in
+Gurobi.
+
+STAGE A (this commit), solver/MilpCanonicalPresolve.{hpp,cpp}, run once on
+the scaled canonical model before the root cut loop. Per row, at most 10
+passes while it changes ([CIP] 10.1 step 1g):
+  - step 1d: infeasibility from the activity bounds (a PrimalInfeasible
+    verdict), and deletion of an inequality that can never be violated;
+  - step 1c: bound tightening by Algorithm 7.1, integer bounds rounded in
+    ORIGINAL units (x_original = s x_canonical), the (7.3) minimum change;
+  - step 1f: coefficient tightening on inequality rows, integer columns with
+    finite bounds: a_v > 0: a' = maxact - rho, rho -= (a_v - a') U;
+    a_v < 0: a' = rho - maxact, rho -= (a_v - a') L.
+Then dual fixing with Example 3.4's locks. Rounds repeat until nothing
+changes, at most presolve_rounds (20, OURS; [CIP] loops to a fixpoint).
+
+WHAT IS NOT CHANGED: columns. A fixed column stays with lower == upper, so a
+solution maps back through the unpresolved canonical model (`make_plain`),
+its logicals recomputed as b - A x. Equality rows are never coefficient-
+tightened (step 1f would give them two sides the canonical form cannot hold
+without a range column).
+
+TESTS (milp_test). test_presolve_keeps_the_integer_points calls
+presolve_canonical directly and compares, over EVERY integer point of the
+box, the presolved model with the original: no point added, no feasible
+point inside the final box lost (only dual fixing may remove points, and it
+does so through the bounds), the optimum kept, and PrimalInfeasible only when
+nothing is feasible. Half the programs have `<=` rows pushed near redundancy,
+so steps 1d and 1f fire (plain random rows almost never meet their
+conditions). test_presolve_never_changes_the_answer: on and off through the
+search against enumeration. Mutants -- rhs shifted by the wrong bound (both
+signs), coefficient shrunk too far, equalities deleted as redundant, a loose
+redundancy margin, dual fixing reversed, dual fixing ignoring locks, integer
+rounding the wrong way, the wrong residual, the equality count lost -- all
+caught. One further mutant (loosening step 1f's condition) is EQUIVALENT:
+the later guard a' < a_v already implies it.
+
+MEASURED, 5000 nodes, defaults, presolve off -> on (deterministic counts;
+times unpinned and not quoted as a result):
+
+    instance       reductions (bnd/coef/rows/fixed)  bound off -> on          LP iters
+    timtab1        18 / 0 / 0 / 0                   477410 -> 492055         147.6k -> 124.4k
+    enlight_hard   129 / 0 / 0 / 0                  23.14 -> 23.55           57.6k -> 63.9k
+    glass4         6 / 44 / 4 / 0                   8.000048e8 -> 8.000045e8 119.0k -> 119.9k
+    mas74, mas76   0 / 0 / 0 / 1                    unchanged                identical
+    markshare_4_0  0 / 0 / 0 / 4                    unchanged                identical
+    pk1, gen-ip054, gen-ip002, neos5, assign1-5-8: nothing to reduce; identical
+
+Root LP bound BEFORE cuts is identical off and on for glass4, timtab1, mas74,
+enlight_hard and neos5, as it must be, since no reduction here can loosen
+the LP. glass4's slightly lower bound after cuts is a different cut path.
+Incumbents at 5000 nodes moved both ways (timtab1 1.110e6 -> 1.256e6 and
+glass4 3.375e9 -> 3.450e9 worse; no instance better), path effects of a
+different tree at a fixed node count. Verdict: stage A is close to neutral on
+this set. That matches [AGH]: these are MIPLIB instances already clean at
+the single-row level, and [AGH] measures bound strengthening at 1.09x and
+coefficient strengthening at 1.06x (>= 10 s bracket), against 1.42x for
+implied-free substitution, 1.32x for all single-column reductions, 1.34x for
+multi-row reductions and 1.17x for probing. Default ON ([CIP]'s);
+--mip-presolve=0 turns it off.
+
+NEXT, ranked by [AGH]'s >= 10 s time ratios: column reductions that REMOVE
+columns (implied-free substitution, singleton columns, parallel columns --
+these need a real postsolve stack, which stage A was built to avoid), then
+probing ([CIP] 10.6), then multi-row (parallel rows, non-zero cancellation).

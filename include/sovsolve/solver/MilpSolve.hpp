@@ -156,6 +156,13 @@ struct MilpStatistics {
   /// separator, cuts that entered the LP after selection, and the root LP
   /// bound before the first and after the last round -- CANONICAL
   /// (minimization) objective values.
+  /// MIP presolve (Module 29): rounds, bounds tightened, coefficients
+  /// tightened, redundant rows removed, columns fixed by dual fixing.
+  std::size_t presolve_rounds = 0;
+  std::size_t presolve_bounds = 0;
+  std::size_t presolve_coefficients = 0;
+  std::size_t presolve_rows_removed = 0;
+  std::size_t presolve_fixed = 0;
   std::size_t cut_rounds = 0;
   std::size_t gomory_cuts = 0;
   std::size_t cmir_cuts = 0;

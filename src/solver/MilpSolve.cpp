@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "sovsolve/model/Canonical.hpp"
+#include "sovsolve/solver/MilpCanonicalPresolve.hpp"
 #include "sovsolve/solver/LpSolve.hpp"
 #include "sovsolve/solver/MilpCuts.hpp"
 #include "sovsolve/solver/MilpPresolve.hpp"
@@ -753,14 +754,25 @@ Real BranchAndBound::estimate(const std::vector<Candidate>& candidates, Real bou
 
 core::Expected<Solution> BranchAndBound::incumbent_solution(const SimplexResult& lp) {
   if (plain_ != nullptr) {
-    // Cut rows are appended at the END (MilpSeparators.hpp), so the plain
-    // model's rows and logicals are a prefix: truncate and rebuild against it.
-    const std::size_t n = plain_->problem.num_cols();
-    const std::size_t m0 = plain_->problem.num_rows();
+    // Presolve (rows deleted, coefficients changed) and root cuts (rows
+    // appended) both leave the COLUMNS alone, so the structural part of `x` is
+    // a point of the plain canonical model: its logicals are recomputed there,
+    // as b - A x. Duals mean nothing for a MILP solution and are zeroed.
+    const model::CanonicalProblem& pp = plain_->problem;
+    const std::size_t n = pp.num_cols();
+    const std::size_t m0 = pp.num_rows();
     SimplexResult r = lp;
     r.x.resize(n + m0);
-    r.y.resize(m0);
-    r.reduced_cost.resize(n + m0);
+    const auto& csr = pp.A.csr;
+    for (std::size_t i = 0; i < m0; ++i) {
+      Real act = 0.0;
+      for (std::size_t q = csr.slice_begin(i); q < csr.slice_end(i); ++q) {
+        act += csr.values()[q] * r.x[static_cast<std::size_t>(csr.indices()[q])];
+      }
+      r.x[n + i] = i < pp.num_equality ? 0.0 : std::max(pp.b[i] - act, 0.0);
+    }
+    r.y.assign(m0, 0.0);
+    r.reduced_cost.assign(n + m0, 0.0);
     const Solution canonical = simplex::to_canonical_solution(plain_->problem, r);
     return reconstruct_solution(working_, plain_->problem, plain_->transforms, canonical);
   }
@@ -2835,6 +2847,39 @@ core::Expected<Solution> solve_milp(const Problem& problem, const Options& optio
   // `cut_rounds` (Wolter's MAXROUNDS = 15), an integral or non-optimal LP, or
   // a round that selects nothing.
   std::optional<model::CanonicalResult> plain;
+  auto make_plain = [&]() -> core::Status {
+    if (plain.has_value()) return core::Status::Ok();
+    // The unmodified canonical model, for rebuilding solutions. Canonicalization
+    // and scaling are deterministic, so this is the model before presolve and
+    // cuts.
+    auto again = model::canonicalize(working, options);
+    if (!again.has_value()) return again.error();
+    if (const auto st = scale(again->problem, options, again->transforms); !st.ok()) return st;
+    plain = std::move(*again);
+    return core::Status::Ok();
+  };
+
+  // ---- MIP presolve (Module 29): [CIP] chapter 10, stage A. ----
+  if (options.milp.presolve && !integers.empty()) {
+    if (const auto st = make_plain(); !st.ok()) return st.error();
+    std::vector<Real> integer_scale(canon->problem.num_cols(), 0.0);
+    for (const IntegerColumn& ic : integers) integer_scale[ic.canonical] = ic.scale;
+    CanonicalPresolveStats ps;
+    const auto st = presolve_canonical(canon->problem, integer_scale,
+                                       options.milp.presolve_rounds, ps);
+    stats.presolve_rounds = ps.rounds;
+    stats.presolve_bounds = ps.bounds_tightened;
+    stats.presolve_coefficients = ps.coefficients_tightened;
+    stats.presolve_rows_removed = ps.rows_removed;
+    stats.presolve_fixed = ps.columns_fixed;
+    if (!st.ok()) {
+      if (st.error().code == core::ErrorCode::PrimalInfeasible) {
+        return verdict_solution(problem, SolverStatus::Infeasible);
+      }
+      return st.error();
+    }
+  }
+
   std::optional<simplex::Basis> cut_basis;
   if ((options.milp.gomory_cuts || options.milp.cmir_cuts) && !integers.empty()) {
     const std::size_t n = canon->problem.num_cols();
@@ -2880,16 +2925,7 @@ core::Expected<Solution> solve_milp(const Problem& problem, const Options& optio
       std::vector<Cut> chosen = select_cuts(std::move(cuts), canon->problem, x, 2000);
       if (chosen.empty()) break;
 
-      if (!plain.has_value()) {
-        // The cut-free model, for rebuilding solutions. Canonicalization and
-        // scaling are deterministic, so this is the model the search began on.
-        auto again = model::canonicalize(working, options);
-        if (!again.has_value()) return again.error();
-        if (const auto st = scale(again->problem, options, again->transforms); !st.ok()) {
-          return st.error();
-        }
-        plain = std::move(*again);
-      }
+      if (const auto st = make_plain(); !st.ok()) return st.error();
       simplex::Basis basis = lp->basis;
       if (const auto st = append_cuts(canon->problem, chosen, &basis); !st.ok()) {
         return st.error();
