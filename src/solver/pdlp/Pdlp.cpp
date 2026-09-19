@@ -8,6 +8,7 @@
 
 #include "sovsolve/solver/pdlp/DualityGap.hpp"
 #include "sovsolve/solver/pdlp/Infeasibility.hpp"
+#include "sovsolve/solver/pdlp/IterationBackend.hpp"
 #include "sovsolve/solver/pdlp/MatVec.hpp"
 
 namespace sovsolve::solver::pdlp {
@@ -147,10 +148,12 @@ struct Convergence {
 
 class PdlpSolver {
  public:
-  PdlpSolver(const CanonicalProblem& problem, const Options& options, MatVec& matvec)
+  PdlpSolver(const CanonicalProblem& problem, const Options& options, MatVec& matvec,
+             IterationBackend& backend)
       : problem_(problem),
         opt_(options),
         matvec_(matvec),
+        backend_(backend),
         m_(problem.num_rows()),
         n_(problem.num_cols()),
         gap_(problem),
@@ -169,25 +172,22 @@ class PdlpSolver {
   /// -- and because `MatVec` counts its own products, a CPU-versus-GPU A/B
   /// reads one instrumentation rather than two.
   MatVec& matvec_;
+  /// Where the iterate LIVES between checks (IterationBackend.hpp). The hot
+  /// path goes through this; `matvec_` above is the cold path's.
+  IterationBackend& backend_;
   std::size_t m_;
   std::size_t n_;
 
+  /// HOST MIRRORS of the iterate. Between checks the backend is the source of
+  /// truth and these are stale by up to `check_interval` iterations -- by
+  /// design, since nothing on the hot path reads them. `sync_from_backend`
+  /// refreshes them immediately before the cold path runs.
   core::RealVector x_;
   core::RealVector y_;
-  core::RealVector x_prev_;
-  core::RealVector extrapolated_;  ///< `2 x^{k+1} - x^k`
-  core::RealVector kt_y_;          ///< `K' y`
-  core::RealVector k_x_;           ///< `K x`
+  core::RealVector kt_y_;  ///< `K' y`, cold path
+  core::RealVector k_x_;   ///< `K x`, cold path
   core::RealVector reduced_cost_;
   core::RealVector primal_residual_;
-
-  // Adaptive step size (Algorithm 2) scratch. `x_trial_`/`y_trial_` hold the
-  // candidate point of a trial that may yet be rejected, so `x_`/`y_` are only
-  // overwritten once a step is accepted.
-  core::RealVector x_trial_;
-  core::RealVector y_trial_;
-  core::RealVector k_extrapolated_;  ///< `K(2x' - x)`, recomputed per trial
-  core::RealVector k_x_current_;     ///< `K x`, fixed across a trial sequence
 
   Real omega_ = 1.0;  ///< primal weight; adapts in C3, fixed at 1 until then
   std::size_t step_rejections_ = 0;
@@ -246,7 +246,8 @@ class PdlpSolver {
   /// Algorithm 2. `eta` enters as this iteration's trial size and leaves as
   /// `eta'`, the starting point for the next one.
   void adaptive_step(std::size_t total_iterations, Real& eta);
-  void fixed_step(Real tau, Real sigma);
+  /// Pulls the vectors the cold path reads out of the backend.
+  void sync_from_backend();
 
   void accumulate_average(Real eta);
   /// Tests the reference's three candidate sequences. Returns the verdict, or
@@ -312,36 +313,13 @@ PdlpResult PdlpSolver::pack(SolverStatus status, const Convergence& conv) const 
   r.y = y_.clone();
   r.reduced_cost = reduced_cost_.clone();
   r.objective = conv.primal_objective;
-  r.matrix_products = matvec_.products();
+  r.matrix_products = matvec_.products() + backend_.own_products();
   r.step_rejections = step_rejections_;
   r.restarts = restarts_;
   r.relative_duality_gap = conv.gap;
   r.relative_primal_residual = conv.primal;
   r.relative_dual_residual = conv.dual;
   return r;
-}
-
-/// One fixed-step PDHG iteration -- paper equation (3) verbatim. Kept so the
-/// adaptive rule can be switched off and compared against, which is how the
-/// paper's own ablation (figure 1) is structured.
-void PdlpSolver::fixed_step(Real tau, Real sigma) {
-  matvec_.multiply_transpose(in(y_), out(kt_y_));
-  for (std::size_t j = 0; j < n_; ++j) {
-    x_prev_[j] = x_[j];
-    const Real step = x_[j] - tau * (problem_.c[j] - kt_y_[j]);
-    x_[j] = std::clamp(step, problem_.col_lower[j], problem_.col_upper[j]);
-  }
-  // The extrapolation `2x^{k+1} - x^k` is what makes this PDHG rather than
-  // Arrow-Hurwicz, and it is what the convergence proof needs; using `x^k`
-  // here converges only under far stronger conditions.
-  for (std::size_t j = 0; j < n_; ++j) {
-    extrapolated_[j] = 2.0 * x_[j] - x_prev_[j];
-  }
-  matvec_.multiply(in(extrapolated_), out(k_x_));
-  for (std::size_t i = 0; i < m_; ++i) {
-    const Real step = y_[i] + sigma * (problem_.b[i] - k_x_[i]);
-    y_[i] = i < problem_.num_equality ? step : std::min(step, 0.0);
-  }
 }
 
 /// Algorithm 2: one PDHG step whose size is chosen by trial.
@@ -374,10 +352,9 @@ void PdlpSolver::fixed_step(Real tau, Real sigma) {
 /// at the `denominator` line below.
 void PdlpSolver::adaptive_step(std::size_t total_iterations, Real& eta_inout) {
   Real eta = eta_inout;
-  // Fixed across the whole trial sequence: `x_` and `y_` do not move until a
-  // trial is accepted.
-  matvec_.multiply_transpose(in(y_), out(kt_y_));
-  matvec_.multiply(in(x_), out(k_x_current_));
+  // `K'y` and `Kx` are fixed across the whole trial sequence, because the
+  // iterate does not move until a trial is accepted.
+  backend_.begin_step();
 
   const Real k_plus_one = static_cast<Real>(total_iterations + 1);
   const Real shrink = 1.0 - std::pow(k_plus_one, -0.3);
@@ -394,45 +371,11 @@ void PdlpSolver::adaptive_step(std::size_t total_iterations, Real& eta_inout) {
     const Real tau = eta / omega_;
     const Real sigma = eta * omega_;
 
-    // line 4: x' = proj_X(x - (eta/omega)(c - K'y))
-    for (std::size_t j = 0; j < n_; ++j) {
-      const Real step = x_[j] - tau * (problem_.c[j] - kt_y_[j]);
-      x_trial_[j] = std::clamp(step, problem_.col_lower[j], problem_.col_upper[j]);
-      extrapolated_[j] = 2.0 * x_trial_[j] - x_[j];
-    }
-
-    // line 5: y' = proj_Y(y + eta*omega (q - K(2x' - x)))
-    matvec_.multiply(in(extrapolated_), out(k_extrapolated_));
-    for (std::size_t i = 0; i < m_; ++i) {
-      const Real step = y_[i] + sigma * (problem_.b[i] - k_extrapolated_[i]);
-      y_trial_[i] = i < problem_.num_equality ? step : std::min(step, 0.0);
-    }
-
-    // line 6: eta_bar = ||dz||^2_omega / (2 dy' K dx).
-    //
-    // `K dx` needs no product of its own. With `u = 2x' - x` we have
-    // `u - x = 2(x' - x)`, so `K dx = (K u - K x) / 2` -- and both terms are
-    // already in hand.
-    Real interaction = 0.0;
-    for (std::size_t i = 0; i < m_; ++i) {
-      const Real k_dx = 0.5 * (k_extrapolated_[i] - k_x_current_[i]);
-      interaction += (y_trial_[i] - y_[i]) * k_dx;
-    }
-
-    Real dx_dy_norm_sq = 0.0;
-    {
-      Real px = 0.0;
-      for (std::size_t j = 0; j < n_; ++j) {
-        const Real d = x_trial_[j] - x_[j];
-        px += d * d;
-      }
-      Real py = 0.0;
-      for (std::size_t i = 0; i < m_; ++i) {
-        const Real d = y_trial_[i] - y_[i];
-        py += d * d;
-      }
-      dx_dy_norm_sq = omega_ * px + py / omega_;
-    }
+    // Lines 4-6, wherever the iterate lives. Three doubles come back and
+    // nothing else -- the whole reason this goes through IterationBackend.
+    const TrialMetrics metrics = backend_.trial(tau, sigma);
+    const Real interaction = metrics.interaction;
+    const Real dx_dy_norm_sq = omega_ * metrics.dx_sq + metrics.dy_sq / omega_;
 
     // DEVIATION from the paper, found by measurement -- see the header block
     // on this function. Equation (5) and Algorithm 2 line 6 write this
@@ -461,13 +404,7 @@ void PdlpSolver::adaptive_step(std::size_t total_iterations, Real& eta_inout) {
     const Real eta_next = std::min(shrink * eta_bar, growth * eta);
 
     if (eta <= eta_bar) {
-      // Accepted. `x_prev_` keeps the pre-step primal point because the
-      // restart machinery (C2) needs the iterate difference.
-      for (std::size_t j = 0; j < n_; ++j) {
-        x_prev_[j] = x_[j];
-        x_[j] = x_trial_[j];
-      }
-      for (std::size_t i = 0; i < m_; ++i) y_[i] = y_trial_[i];
+      backend_.accept_trial();
       eta_inout = std::isfinite(eta_next) && eta_next > 0.0 ? eta_next : eta;
       return;
     }
@@ -477,11 +414,7 @@ void PdlpSolver::adaptive_step(std::size_t total_iterations, Real& eta_inout) {
       // Not shrinking, so retrying cannot help. Take the step anyway rather
       // than spin: a slightly oversized step degrades convergence, a hang
       // does not degrade, it stops.
-      for (std::size_t j = 0; j < n_; ++j) {
-        x_prev_[j] = x_[j];
-        x_[j] = x_trial_[j];
-      }
-      for (std::size_t i = 0; i < m_; ++i) y_[i] = y_trial_[i];
+      backend_.accept_trial();
       eta_inout = eta;
       return;
     }
@@ -495,8 +428,26 @@ void PdlpSolver::adaptive_step(std::size_t total_iterations, Real& eta_inout) {
 /// iterates. Kept as running sums so a restart costs two `assign(0)` calls.
 void PdlpSolver::accumulate_average(Real eta) {
   weight_sum_ += eta;
-  for (std::size_t j = 0; j < n_; ++j) avg_x_[j] += eta * x_[j];
-  for (std::size_t i = 0; i < m_; ++i) avg_y_[i] += eta * y_[i];
+  backend_.accumulate_average(eta);
+}
+
+/// The cold path reads the iterate, the restart average and the certificate
+/// sequences; nothing else. Pulled here, once per `check_interval`, rather than
+/// kept in sync per iteration -- keeping them in sync per iteration is exactly
+/// the transfer cost this refactor exists to remove.
+void PdlpSolver::sync_from_backend() {
+  backend_.download(BackendVector::X, out(x_));
+  backend_.download(BackendVector::Y, out(y_));
+  if (opt_.pdlp.adaptive_restart) {
+    backend_.download(BackendVector::AverageX, out(avg_x_));
+    backend_.download(BackendVector::AverageY, out(avg_y_));
+  }
+  if (opt_.pdlp.infeasibility_detection) {
+    backend_.download(BackendVector::DifferenceX, out(diff_x_));
+    backend_.download(BackendVector::DifferenceY, out(diff_y_));
+    backend_.download(BackendVector::IterateSumX, out(iterate_sum_x_));
+    backend_.download(BackendVector::IterateSumY, out(iterate_sum_y_));
+  }
 }
 
 /// Paper section 3.2: choose a restart candidate, test three conditions, and
@@ -609,6 +560,10 @@ bool PdlpSolver::maybe_restart(std::size_t total_iterations) {
   avg_x_.assign(0.0);
   avg_y_.assign(0.0);
   weight_sum_ = 0.0;
+  // The backend holds the real copies. The candidate may have replaced the
+  // iterate with the average, so push it back down, and clear its average.
+  backend_.reset_average();
+  backend_.set_iterate(in(x_), in(y_));
   inner_iterations_ = 0;
   last_candidate_gap_ = std::numeric_limits<Real>::infinity();
   reference_gap_ = candidate_gap;
@@ -652,10 +607,6 @@ CertificateKind PdlpSolver::check_certificates(std::size_t total_iterations) {
 core::Expected<PdlpResult> PdlpSolver::run() {
   x_.resize(n_);
   x_.assign(0.0);
-  x_prev_.resize(n_);
-  x_prev_.assign(0.0);
-  extrapolated_.resize(n_);
-  extrapolated_.assign(0.0);
   kt_y_.resize(n_);
   kt_y_.assign(0.0);
   reduced_cost_.resize(n_);
@@ -666,14 +617,6 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   k_x_.assign(0.0);
   primal_residual_.resize(m_);
   primal_residual_.assign(0.0);
-  x_trial_.resize(n_);
-  x_trial_.assign(0.0);
-  y_trial_.resize(m_);
-  y_trial_.assign(0.0);
-  k_extrapolated_.resize(m_);
-  k_extrapolated_.assign(0.0);
-  k_x_current_.resize(m_);
-  k_x_current_.assign(0.0);
   x_restart_.resize(n_);
   x_restart_.assign(0.0);
   y_restart_.resize(m_);
@@ -712,9 +655,9 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   // PDHG projects, it does not follow a barrier.
   for (std::size_t j = 0; j < n_; ++j) {
     x_[j] = std::clamp(0.0, problem_.col_lower[j], problem_.col_upper[j]);
-    x_prev_[j] = x_[j];
     x_restart_[j] = x_[j];
   }
+  backend_.set_iterate(in(x_), in(y_));
 
   omega_ = opt_.pdlp.primal_weight_update ? initialize_primal_weight(problem_) : 1.0;
 
@@ -761,25 +704,13 @@ core::Expected<PdlpResult> PdlpSolver::run() {
 
   while (iteration < budget) {
     const Real step_taken = eta;
-    if (detect_infeasibility) {
-      for (std::size_t j = 0; j < n_; ++j) diff_x_[j] = x_[j];
-      for (std::size_t i = 0; i < m_; ++i) diff_y_[i] = y_[i];
-    }
+    if (detect_infeasibility) backend_.snapshot_iterate();
     if (adaptive) {
       adaptive_step(iteration, eta);
     } else {
-      fixed_step(fixed_tau, fixed_sigma);
+      backend_.fixed_step(fixed_tau, fixed_sigma);
     }
-    if (detect_infeasibility) {
-      for (std::size_t j = 0; j < n_; ++j) {
-        diff_x_[j] = x_[j] - diff_x_[j];
-        iterate_sum_x_[j] += x_[j];
-      }
-      for (std::size_t i = 0; i < m_; ++i) {
-        diff_y_[i] = y_[i] - diff_y_[i];
-        iterate_sum_y_[i] += y_[i];
-      }
-    }
+    if (detect_infeasibility) backend_.finish_difference();
     if (restarts_enabled) {
       // Algorithm 1 line 7 weights each iterate by the step size that
       // produced it, so a long step counts for more in the average than a
@@ -792,6 +723,7 @@ core::Expected<PdlpResult> PdlpSolver::run() {
     ++iteration;
 
     if (iteration % interval == 0) {
+      sync_from_backend();
       evaluate(conv);
       if (conv.converged(opt_.pdlp.termination_tolerance)) {
         outcome = SolverStatus::Optimal;
@@ -839,6 +771,7 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   // The loop may have exited on the iteration budget between two checks, in
   // which case `conv` is stale by up to `interval` iterations. Re-measure so
   // the reported residuals describe the iterate actually returned.
+  sync_from_backend();
   evaluate(conv);
   if (certificate_ == CertificateKind::None &&
       conv.converged(opt_.pdlp.termination_tolerance)) {
@@ -860,7 +793,8 @@ core::Expected<PdlpResult> solve_pdlp(const CanonicalProblem& problem,
                             "a quadratic objective");
   }
   HostMatVec matvec(problem);
-  PdlpSolver solver(problem, options, matvec);
+  HostIterationBackend backend(problem, matvec);
+  PdlpSolver solver(problem, options, matvec, backend);
   return solver.run();
 }
 
@@ -876,7 +810,25 @@ core::Expected<PdlpResult> solve_pdlp(const CanonicalProblem& problem,
     return core::make_error(ErrorCode::DimensionMismatch,
                             "solve_pdlp: the injected MatVec does not match the problem");
   }
-  PdlpSolver solver(problem, options, matvec);
+  HostIterationBackend backend(problem, matvec);
+  PdlpSolver solver(problem, options, matvec, backend);
+  return solver.run();
+}
+
+core::Expected<PdlpResult> solve_pdlp(const CanonicalProblem& problem,
+                                      const Options& options, MatVec& matvec,
+                                      IterationBackend& backend) {
+  if (!problem.Q.empty()) {
+    return core::make_error(ErrorCode::UnsupportedFeature,
+                            "solve_pdlp: PDLP solves linear programs; this model has "
+                            "a quadratic objective");
+  }
+  if (matvec.num_rows() != problem.num_rows() ||
+      matvec.num_cols() != problem.num_cols()) {
+    return core::make_error(ErrorCode::DimensionMismatch,
+                            "solve_pdlp: the injected MatVec does not match the problem");
+  }
+  PdlpSolver solver(problem, options, matvec, backend);
   return solver.run();
 }
 
