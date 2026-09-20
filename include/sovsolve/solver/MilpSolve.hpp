@@ -168,6 +168,15 @@ struct MilpStatistics {
   /// `presolve_rows_removed`, which stays a count of redundant rows.
   std::size_t presolve_substituted = 0;
   std::size_t presolve_merged = 0;
+  /// Wall seconds inside `presolve_canonical` -- the Module 29 root presolve
+  /// only, not the LP presolver and not the per-node propagation.
+  ///
+  /// Measured because a faster presolve is worth its own share of the runtime
+  /// and nothing more: the GPU-presolve literature (arXiv 2609.16182) reports
+  /// 11-42x on presolve time, which is transformative if presolve is a third
+  /// of the solve and irrelevant if it is a fiftieth. This number is how that
+  /// question gets answered here instead of assumed.
+  double presolve_seconds = 0.0;
   std::size_t cut_rounds = 0;
   std::size_t gomory_cuts = 0;
   std::size_t cmir_cuts = 0;
