@@ -82,6 +82,23 @@ struct Solution {
   std::size_t iterations = 0;
   double solve_time_seconds = 0.0;
 
+  /// Where `solve_time_seconds` went, by pipeline stage. All four are wall
+  /// time on the calling thread and sum to slightly less than the total (the
+  /// remainder is reconstruction and bookkeeping).
+  ///
+  /// These exist because "presolve is a bottleneck" is a claim that can only
+  /// be settled by measurement, and until now nothing in this project timed
+  /// it. An 11x faster presolve is worth 11x of whatever fraction presolve
+  /// actually is, and on this corpus that fraction was unknown. Reporting the
+  /// stages separately is also what makes an engine comparison honest: a
+  /// first-order method that finishes in 40 ms behind 200 ms of shared
+  /// canonicalization is not "slow", and the split says so.
+  double canonicalize_seconds = 0.0;
+  double presolve_seconds = 0.0;
+  double scale_seconds = 0.0;
+  /// The engine proper -- simplex, PDLP, HSD, IPM, or the concurrent race.
+  double engine_seconds = 0.0;
+
   /// Module 24 (PDLP) only: products by `K` and `K'`, counted separately; 0
   /// for every other engine.
   ///

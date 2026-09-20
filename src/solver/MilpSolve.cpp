@@ -2960,9 +2960,13 @@ core::Expected<Solution> solve_milp(const Problem& problem, const Options& optio
     std::vector<Real> integer_scale(canon->problem.num_cols(), 0.0);
     for (const IntegerColumn& ic : integers) integer_scale[ic.canonical] = ic.scale;
     CanonicalPresolveStats ps;
+    const auto presolve_started = std::chrono::steady_clock::now();
     const auto st = presolve_canonical(canon->problem, integer_scale,
                                        options.milp.presolve_rounds,
                                        options.milp.presolve_columns, postsolve, ps);
+    stats.presolve_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - presolve_started)
+            .count();
     stats.presolve_rounds = ps.rounds;
     stats.presolve_bounds = ps.bounds_tightened;
     stats.presolve_coefficients = ps.coefficients_tightened;

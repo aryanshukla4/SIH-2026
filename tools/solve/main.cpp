@@ -575,6 +575,13 @@ int main(int argc, char** argv) {
   }
 #endif
   std::printf("solve_time_seconds=%.6f\n", solution->solve_time_seconds);
+  // Where that time went. Printed unconditionally so the benchmark CSV always
+  // carries the split -- a stage fraction is only useful if it was recorded on
+  // the same run as the total.
+  std::printf("canonicalize_seconds=%.6f\n", solution->canonicalize_seconds);
+  std::printf("lp_presolve_seconds=%.6f\n", solution->presolve_seconds);
+  std::printf("scale_seconds=%.6f\n", solution->scale_seconds);
+  std::printf("engine_seconds=%.6f\n", solution->engine_seconds);
   if (is_milp) {
     std::printf("nodes_explored=%zu\n", solution->nodes_explored);
     std::printf("best_bound=%.10e\n", solution->best_bound);
@@ -611,6 +618,7 @@ int main(int argc, char** argv) {
       std::printf("presolve_fixed=%zu\n", milp_stats.presolve_fixed);
       std::printf("presolve_substituted=%zu\n", milp_stats.presolve_substituted);
       std::printf("presolve_merged=%zu\n", milp_stats.presolve_merged);
+      std::printf("presolve_seconds=%.6f\n", milp_stats.presolve_seconds);
       std::printf("cut_rounds=%zu\n", milp_stats.cut_rounds);
       std::printf("gomory_cuts=%zu\n", milp_stats.gomory_cuts);
       std::printf("cmir_cuts=%zu\n", milp_stats.cmir_cuts);
