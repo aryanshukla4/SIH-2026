@@ -318,12 +318,13 @@ class BranchAndBound {
  public:
   BranchAndBound(Problem& working, model::CanonicalResult& canon,
                  std::vector<IntegerColumn> integers, const Options& options,
-                 MilpStatistics& stats)
+                 MilpStatistics& stats, const CanonicalPostsolve* postsolve)
       : working_(working),
         canon_(canon),
         integers_(std::move(integers)),
         options_(options),
         stats_(stats),
+        postsolve_(postsolve != nullptr && postsolve->removes_columns() ? postsolve : nullptr),
         pseudocosts_(integers_.size()) {
     node_lp_ = options;
     node_lp_.simplex.method = model::Method::DualSimplex;
@@ -367,15 +368,62 @@ class BranchAndBound {
         break;
       }
     }
-    original_of_.assign(p.num_cols(), kNoColumn);
-    scale_of_.assign(p.num_cols(), 1.0);
+    // The transform stack is keyed by PLAIN canonical column -- the space the
+    // model had when it was canonicalized and scaled. Presolve stage B removes
+    // columns after that, so these two maps are built in the plain space the
+    // records speak and then compacted into the reduced one everything
+    // downstream (`lit.col` at the conflict pool, `j` in the RENS sub-MIP)
+    // indexes them by. With stage B off the two spaces coincide and the
+    // compaction is the identity.
+    const std::size_t plain_cols =
+        postsolve_ != nullptr ? postsolve_->plain_columns : p.num_cols();
+    std::vector<std::size_t> original_of_plain(plain_cols, kNoColumn);
+    std::vector<Real> scale_of_plain(plain_cols, 1.0);
     for (const auto& rec : canon_.transforms.records()) {
       if (rec.kind == model::TransformKind::KeepColumn) {
-        original_of_[static_cast<std::size_t>(rec.secondary)] =
-            static_cast<std::size_t>(rec.primary);
+        const auto at = static_cast<std::size_t>(rec.secondary);
+        if (at < plain_cols) original_of_plain[at] = static_cast<std::size_t>(rec.primary);
       } else if (rec.kind == model::TransformKind::ColumnScaling) {
-        scale_of_[static_cast<std::size_t>(rec.primary)] = rec.value;
+        const auto at = static_cast<std::size_t>(rec.primary);
+        if (at < plain_cols) scale_of_plain[at] = rec.value;
       }
+    }
+    original_of_.assign(p.num_cols(), kNoColumn);
+    scale_of_.assign(p.num_cols(), 1.0);
+    for (std::size_t j = 0; j < plain_cols; ++j) {
+      const std::size_t at =
+          postsolve_ != nullptr ? postsolve_->new_of_old[j] : j;
+      if (at == CanonicalPostsolve::kRemoved || at >= p.num_cols()) continue;
+      original_of_[at] = original_of_plain[j];
+      scale_of_[at] = scale_of_plain[j];
+    }
+    original_of_plain_ = std::move(original_of_plain);
+    scale_of_plain_ = std::move(scale_of_plain);
+
+    // What each REDUCED column is, written in plain columns. A stage B merge
+    // makes the survivor mean `x_j + lambda x_k`, so a point arriving from
+    // ORIGINAL space (the RENS sub-MIP's solution) cannot simply be read off
+    // the survivor's own original column -- it has to be re-folded the same
+    // way presolve folded it. Replayed FORWARD, which is the direction that
+    // composes: a later merge folds whatever the earlier ones already built.
+    std::vector<std::vector<std::pair<std::size_t, Real>>> fold(plain_cols);
+    for (std::size_t j = 0; j < plain_cols; ++j) fold[j].emplace_back(j, 1.0);
+    if (postsolve_ != nullptr) {
+      for (const auto& rec : postsolve_->undo) {
+        if (rec.kind == PostsolveColumn::Kind::MergeParallel) {
+          for (const auto& [pc, coef] : fold[rec.column]) {
+            fold[rec.partner].emplace_back(pc, rec.pivot * coef);
+          }
+        }
+        fold[rec.column].clear();  // removed either way
+      }
+    }
+    fold_.assign(p.num_cols(), {});
+    for (std::size_t j = 0; j < plain_cols; ++j) {
+      const std::size_t at =
+          postsolve_ != nullptr ? postsolve_->new_of_old[j] : j;
+      if (at == CanonicalPostsolve::kRemoved || at >= p.num_cols()) continue;
+      fold_[at] = std::move(fold[j]);
     }
     const auto& csc = p.A.csc;
     for (std::size_t k = 0; k < integers_.size(); ++k) {
@@ -473,6 +521,9 @@ class BranchAndBound {
   std::vector<IntegerColumn> integers_;
   const Options& options_;
   MilpStatistics& stats_;
+  /// Stage B's column map, or null when the presolved and plain column spaces
+  /// coincide. Set at construction because the constructor already needs it.
+  const CanonicalPostsolve* postsolve_ = nullptr;
   model::Options node_lp_;
   model::Options probe_lp_;
   PseudocostTable pseudocosts_;
@@ -502,6 +553,12 @@ class BranchAndBound {
   /// `kNoColumn` for a column with no original (a range column).
   std::vector<std::size_t> original_of_;
   std::vector<Real> scale_of_;
+  /// The same two maps in PLAIN canonical space, plus what each reduced
+  /// column is as a combination of plain ones. Only `to_canonical` needs
+  /// them, and only because stage B can merge two columns into one.
+  std::vector<std::size_t> original_of_plain_;
+  std::vector<Real> scale_of_plain_;
+  std::vector<std::vector<std::pair<std::size_t, Real>>> fold_;
   std::size_t last_improvement_node_ = 0;
   const model::CanonicalResult* plain_ = nullptr;
   std::shared_ptr<const Basis> root_basis_;
@@ -754,14 +811,28 @@ Real BranchAndBound::estimate(const std::vector<Candidate>& candidates, Real bou
 
 core::Expected<Solution> BranchAndBound::incumbent_solution(const SimplexResult& lp) {
   if (plain_ != nullptr) {
-    // Presolve (rows deleted, coefficients changed) and root cuts (rows
-    // appended) both leave the COLUMNS alone, so the structural part of `x` is
-    // a point of the plain canonical model: its logicals are recomputed there,
-    // as b - A x. Duals mean nothing for a MILP solution and are zeroed.
+    // Stage A presolve (rows deleted, coefficients changed) and root cuts
+    // (rows appended) leave the COLUMNS alone, so the structural part of `x`
+    // is already a point of the plain canonical model. Stage B does not: it
+    // removes columns, and `expand_canonical_point` replays its undo stack to
+    // put the missing ones back. Either way the logicals are then recomputed
+    // on the plain model as b - A x, and the duals -- meaningless for a MILP
+    // solution -- are zeroed.
     const model::CanonicalProblem& pp = plain_->problem;
     const std::size_t n = pp.num_cols();
     const std::size_t m0 = pp.num_rows();
     SimplexResult r = lp;
+    if (postsolve_ != nullptr) {
+      const std::size_t reduced = canon_.problem.num_cols();
+      if (r.x.size() < reduced) {
+        return core::make_error(core::ErrorCode::DimensionMismatch,
+                                "MIP postsolve: LP point shorter than the reduced model");
+      }
+      std::vector<Real> plain_x;
+      expand_canonical_point(*postsolve_, core::HostSpan<const Real>(r.x.data(), reduced),
+                             plain_x);
+      r.x.assign(plain_x.begin(), plain_x.end());
+    }
     r.x.resize(n + m0);
     const auto& csr = pp.A.csr;
     for (std::size_t i = 0; i < m0; ++i) {
@@ -2251,11 +2322,23 @@ bool BranchAndBound::to_canonical(const Solution& original, std::vector<Real>& x
   x.assign(n, 0.0);
   std::vector<std::size_t> unmapped;
   for (std::size_t j = 0; j < n; ++j) {
-    if (original_of_[j] == kNoColumn) {
+    // `fold_[j]` is one term per plain column folded into this one -- exactly
+    // one for a column stage B left alone, two or more for a merge survivor,
+    // whose value is the same combination presolve formed.
+    Real v = 0.0;
+    bool mapped = !fold_[j].empty();
+    for (const auto& [pc, coef] : fold_[j]) {
+      if (original_of_plain_[pc] == kNoColumn) {
+        mapped = false;
+        break;
+      }
+      v += coef * original.x[original_of_plain_[pc]] / scale_of_plain_[pc];
+    }
+    if (!mapped) {
       unmapped.push_back(j);
       continue;
     }
-    x[j] = original.x[original_of_[j]] / scale_of_[j];
+    x[j] = v;
   }
   // A range column t of `a'x + t = b` (Canonical.hpp) has no original; it is
   // whatever makes its own equality row hold.
@@ -2693,13 +2776,21 @@ core::Expected<Solution> BranchAndBound::run() {
   }
 
   // Map a canonical bound to the original objective. The canonical objective
-  // is the original's, negated for a maximization, and may differ from it by
-  // a constant (a substituted-out column's contribution). The constant is
-  // taken from the incumbent, whose value is known in both spaces, rather
-  // than assumed to be zero.
+  // is the original's, negated for a maximization, and differs from it by a
+  // constant: every column substituted out -- by the canonicalizer, by the LP
+  // presolver, or by stage B of the MIP presolve -- folded its contribution
+  // into `obj_offset`, and the reader's objective row contributes
+  // `obj_constant`. `incumbent_objective_` is c'x on the REDUCED model with
+  // neither term, so
+  //
+  //     original = sign * (c'x + obj_offset) + obj_constant.
+  //
+  // Taking the constant from the incumbent instead would give the same number
+  // whenever there is one, and zero -- which is wrong by exactly this
+  // constant -- when a limit is hit before any solution is found.
   const bool maximize = working_.sense == core::ObjSense::Maximize;
   const Real sign = maximize ? -1.0 : 1.0;
-  const Real offset = have_incumbent_ ? incumbent_.objective - sign * incumbent_objective_ : 0.0;
+  const Real offset = sign * canon_.problem.obj_offset + working_.obj_constant;
   auto to_original = [sign, offset](Real canonical) { return sign * canonical + offset; };
 
   Solution result;
@@ -2859,24 +2950,43 @@ core::Expected<Solution> solve_milp(const Problem& problem, const Options& optio
     return core::Status::Ok();
   };
 
-  // ---- MIP presolve (Module 29): [CIP] chapter 10, stage A. ----
+  // ---- MIP presolve (Module 29): [CIP] chapter 10, [AGH]. ----
+  // Stage B removes columns, so the presolved model no longer shares a column
+  // space with `plain`. `postsolve` is the map back, and it must outlive the
+  // search that produces points in the reduced space.
+  CanonicalPostsolve postsolve;
   if (options.milp.presolve && !integers.empty()) {
     if (const auto st = make_plain(); !st.ok()) return st.error();
     std::vector<Real> integer_scale(canon->problem.num_cols(), 0.0);
     for (const IntegerColumn& ic : integers) integer_scale[ic.canonical] = ic.scale;
     CanonicalPresolveStats ps;
     const auto st = presolve_canonical(canon->problem, integer_scale,
-                                       options.milp.presolve_rounds, ps);
+                                       options.milp.presolve_rounds,
+                                       options.milp.presolve_columns, postsolve, ps);
     stats.presolve_rounds = ps.rounds;
     stats.presolve_bounds = ps.bounds_tightened;
     stats.presolve_coefficients = ps.coefficients_tightened;
     stats.presolve_rows_removed = ps.rows_removed;
     stats.presolve_fixed = ps.columns_fixed;
+    stats.presolve_substituted = ps.columns_substituted;
+    stats.presolve_merged = ps.columns_merged;
     if (!st.ok()) {
       if (st.error().code == core::ErrorCode::PrimalInfeasible) {
         return verdict_solution(problem, SolverStatus::Infeasible);
       }
       return st.error();
+    }
+    // Stage B renumbers the columns. It never removes an INTEGER column
+    // (MilpCanonicalPresolve.hpp says why), so every one of these survives and
+    // this is a pure remap -- but assert that rather than trusting it, because
+    // a stale index here would branch on the wrong variable in silence.
+    for (IntegerColumn& ic : integers) {
+      const std::size_t moved = postsolve.new_of_old[ic.canonical];
+      if (moved == CanonicalPostsolve::kRemoved) {
+        return core::make_error(core::ErrorCode::DimensionMismatch,
+                                "MIP presolve removed an integer column");
+      }
+      ic.canonical = moved;
     }
   }
 
@@ -2897,8 +3007,16 @@ core::Expected<Solution> solve_milp(const Problem& problem, const Options& optio
                                        cut_basis.has_value() ? &*cut_basis : nullptr);
       if (!lp.has_value()) return lp.error();
       if (lp->status != SolverStatus::Optimal) break;
-      if (round == 0) stats.root_bound_before_cuts = lp->objective;
-      stats.root_bound_after_cuts = lp->objective;
+      // The CANONICAL (minimization) objective, INCLUDING obj_offset -- not
+      // the original one, so that "cuts never loosen the root bound" stays a
+      // >= for a maximization too. The offset has to be in it: `lp->objective`
+      // is c'x on the PRESOLVED model, and presolve stage B folds a
+      // substituted column's contribution into obj_offset, so without it the
+      // two arms of a stage B A/B differ by that constant and the reduced one
+      // reads as a weaker relaxation when it is nothing of the kind.
+      const Real root = lp->objective + canon->problem.obj_offset;
+      if (round == 0) stats.root_bound_before_cuts = root;
+      stats.root_bound_after_cuts = root;
       bool integral = true;
       for (const IntegerColumn& ic : integers) {
         const Real v = ic.scale * lp->x[ic.canonical];
@@ -2936,7 +3054,7 @@ core::Expected<Solution> solve_milp(const Problem& problem, const Options& optio
     }
   }
 
-  BranchAndBound search(working, *canon, std::move(integers), options, stats);
+  BranchAndBound search(working, *canon, std::move(integers), options, stats, &postsolve);
   if (plain.has_value()) search.set_reconstruction(&*plain);
   if (cut_basis.has_value()) search.set_root_basis(std::move(*cut_basis));
   auto result = search.run();

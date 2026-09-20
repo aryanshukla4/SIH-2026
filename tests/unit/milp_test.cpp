@@ -26,6 +26,7 @@
 #include "sovsolve/solver/LpSolve.hpp"
 #include "sovsolve/solver/MilpCanonicalPresolve.hpp"
 #include "sovsolve/solver/MilpSolve.hpp"
+#include "sovsolve/solver/simplex/SolveSimplex.hpp"
 #include "tests/TestMain.hpp"
 
 using namespace sovsolve;  // NOLINT(build/namespaces)
@@ -82,6 +83,15 @@ struct RandomIp {
   std::vector<int> rhs;
   std::vector<char> sense;          ///< 'L' <=, 'G' >=, 'E' =
   std::vector<int> lo, hi;
+  /// 1 for an integer column, 0 for a continuous one. Empty means "all
+  /// integer", which is what every enumeration-oracle test builds; only the
+  /// Module 29 stage B tests, whose reductions apply to continuous columns,
+  /// set it.
+  std::vector<char> integral;
+
+  [[nodiscard]] bool is_integer(std::size_t j) const {
+    return integral.empty() || integral[j] != 0;
+  }
 };
 
 RandomIp make_random_ip(unsigned seed, int n, int m) {
@@ -128,9 +138,73 @@ std::string to_lp(const RandomIp& ip) {
          std::to_string(ip.hi[j]) + "\n";
   }
   t += "General\n";
-  for (std::size_t j = 0; j < ip.c.size(); ++j) t += " x" + std::to_string(j) + "\n";
+  for (std::size_t j = 0; j < ip.c.size(); ++j) {
+    if (ip.is_integer(j)) t += " x" + std::to_string(j) + "\n";
+  }
   t += "End\n";
   return t;
+}
+
+/// A MILP with continuous columns, for the stage B reductions -- which apply
+/// only to continuous columns (MilpCanonicalPresolve.hpp).
+///
+/// Two things are planted on purpose, because a uniformly random model offers
+/// neither often enough to test:
+///   - the continuous columns get WIDE bounds and appear in EQUALITY rows, so
+///     the range the row implies for them fits inside their own bounds and
+///     they are implied free ([AGH] 4.5);
+///   - one continuous pair is made PARALLEL, `A_.k = lambda A_.j` with
+///     `c_k = lambda c_j`, which is what [AGH] 6.3 merges, and a SECOND pair
+///     is made parallel with MISMATCHED costs, which it must refuse to merge.
+///     Without the second pair nothing tests the cost condition, because a
+///     random model never offers two parallel columns by accident.
+///
+/// The merged-away column of the first pair is given bounds that EXCLUDE
+/// zero. Postsolve splits `y` back by taking the admissible value of `x_k`
+/// nearest zero, so with zero available the split is `x_k = 0` and the sign
+/// of `lambda` in `x_j = y - lambda x_k` never shows.
+RandomIp make_random_milp(unsigned seed, int n, int m, int continuous) {
+  auto next = [&seed]() {
+    seed = seed * 1664525u + 1013904223u;
+    return static_cast<int>((seed >> 8) % 10007u);
+  };
+  RandomIp ip = make_random_ip(seed ^ 0x5bf03635u, n, m);
+  ip.integral.assign(static_cast<std::size_t>(n), 1);
+
+  // The trailing columns go continuous, with bounds wide enough that no row
+  // can push them outside.
+  const std::size_t first_cont = static_cast<std::size_t>(n - continuous);
+  for (std::size_t j = first_cont; j < static_cast<std::size_t>(n); ++j) {
+    ip.integral[j] = 0;
+    ip.lo[j] = -60;
+    ip.hi[j] = 60;
+  }
+  // At least one equality, or nothing can be substituted.
+  if (!ip.sense.empty()) ip.sense[0] = 'E';
+  if (ip.sense.size() > 2) ip.sense[2] = 'E';
+
+  // Pair A: genuinely mergeable -- parallel columns AND matching costs.
+  if (continuous >= 2) {
+    const std::size_t j = first_cont, k = first_cont + 1;
+    const int lambda = next() % 2 == 0 ? 1 : -1;
+    for (std::size_t i = 0; i < ip.a.size(); ++i) {
+      ip.a[i][k] = lambda * ip.a[i][j];
+    }
+    ip.c[k] = lambda * ip.c[j];
+    ip.lo[k] = 1;  // excludes zero, so the split is forced off it
+    ip.hi[k] = 60;
+  }
+  // Pair B: parallel columns with costs that do NOT match. Merging these
+  // would move the objective, so the merge must not happen.
+  if (continuous >= 4) {
+    const std::size_t j = first_cont + 2, k = first_cont + 3;
+    const int lambda = next() % 2 == 0 ? 2 : -2;
+    for (std::size_t i = 0; i < ip.a.size(); ++i) {
+      ip.a[i][k] = lambda * ip.a[i][j];
+    }
+    ip.c[k] = lambda * ip.c[j] + 3;  // deliberately wrong by 3
+  }
+  return ip;
 }
 
 /// Every integer point in the box, checked against every row. Returns false
@@ -1002,7 +1076,13 @@ void test_presolve_keeps_the_integer_points() {
     if (p.num_cols() != n) continue;
     std::vector<Real> integer_scale(n, 1.0);
     solver::CanonicalPresolveStats ps;
-    const auto st = solver::presolve_canonical(p, integer_scale, 20, ps);
+    solver::CanonicalPostsolve post;
+    // Stage A only: this test indexes the presolved model by the ORIGINAL
+    // column number, which is exactly the property stage A guarantees and
+    // stage B gives up. Stage B has its own test below.
+    const auto st = solver::presolve_canonical(p, integer_scale, 20, false, post, ps);
+    CHECK_EQ(post.undo.size(), std::size_t{0});
+    CHECK_EQ(p.num_cols(), n);
     coefficients += ps.coefficients_tightened;
     rows_removed += ps.rows_removed;
     bounds += ps.bounds_tightened;
@@ -1127,6 +1207,159 @@ void test_presolve_never_changes_the_answer() {
   }
   CHECK(reductions > 0);
 }
+
+/// Module 29 stage B, checked where it can actually be wrong: the postsolve
+/// stack. Stage B removes columns, so a point of the reduced model is no
+/// longer a point of the model the search has to report against. The claim is
+/// that `expand_canonical_point` closes that gap exactly --
+///
+///   - the expanded point is FEASIBLE for the model as it stood before stage
+///     B (every row, every bound), and
+///   - it carries the SAME objective, offsets included.
+///
+/// Both matter: the first is what stops the solver reporting an infeasible
+/// incumbent, and the second is what stops it reporting the wrong value for a
+/// genuine one. The LP relaxation supplies the point, because a substituted
+/// column's value is only determined once the others are fixed, and an
+/// arbitrary point of the reduced box would not be feasible to begin with.
+void test_postsolve_rebuilds_the_point() {
+  std::size_t substituted = 0, merged = 0, checked = 0;
+  for (unsigned seed = 1; seed <= 60; ++seed) {
+    const RandomIp ip = make_random_milp(seed * 2654435761u, 10, 5, 4);
+    model::Problem problem;
+    if (!parse(to_lp(ip), problem)) continue;
+    // Canonicalization is deterministic, so a second run gives the model as
+    // it stood before stage B -- the same trick, and the same role, as
+    // MilpSolve.cpp's `plain`. (CanonicalProblem is deliberately non-copyable:
+    // Vector.hpp makes duplication explicit.)
+    auto before = model::canonicalize(problem);
+    auto canon = model::canonicalize(problem);
+    CHECK(canon.has_value() && before.has_value());
+    if (!canon.has_value() || !before.has_value()) continue;
+    const model::CanonicalProblem& plain = before->problem;
+    const std::size_t n_plain = plain.num_cols();
+
+    std::vector<Real> integer_scale(n_plain, 0.0);
+    for (std::size_t j = 0; j < n_plain && j < ip.c.size(); ++j) {
+      if (ip.is_integer(j)) integer_scale[j] = 1.0;
+    }
+
+    model::CanonicalProblem& reduced = canon->problem;
+    solver::CanonicalPresolveStats ps;
+    solver::CanonicalPostsolve post;
+    const auto st = solver::presolve_canonical(reduced, integer_scale, 20, true, post, ps);
+    if (!st.ok()) {
+      CHECK(st.error().code == core::ErrorCode::PrimalInfeasible);
+      continue;
+    }
+    substituted += ps.columns_substituted;
+    merged += ps.columns_merged;
+    CHECK_EQ(post.plain_columns, n_plain);
+    CHECK_EQ(reduced.num_cols(), n_plain - post.undo.size());
+    // An integer column is never removed: MilpSolve.cpp remaps rather than
+    // re-deriving, and would branch on the wrong variable if one vanished.
+    for (std::size_t j = 0; j < n_plain; ++j) {
+      if (integer_scale[j] != 0.0) {
+        CHECK(post.new_of_old[j] != solver::CanonicalPostsolve::kRemoved);
+      }
+    }
+
+    model::Options lp_options;
+    auto lp = solver::simplex::solve_simplex(reduced, lp_options);
+    CHECK(lp.has_value());
+    if (!lp.has_value() || lp->status != SolverStatus::Optimal) continue;
+
+    std::vector<Real> x;
+    solver::expand_canonical_point(
+        post, core::HostSpan<const Real>(lp->x.data(), reduced.num_cols()), x);
+    CHECK_EQ(x.size(), n_plain);
+    if (x.size() != n_plain) continue;
+
+    for (std::size_t j = 0; j < n_plain; ++j) {
+      const Real tol = 1e-6 * (1.0 + std::fabs(x[j]));
+      if (core::is_finite_bound(plain.col_lower[j])) CHECK(x[j] >= plain.col_lower[j] - tol);
+      if (core::is_finite_bound(plain.col_upper[j])) CHECK(x[j] <= plain.col_upper[j] + tol);
+    }
+    const auto& csr = plain.A.csr;
+    for (std::size_t i = 0; i < plain.num_rows(); ++i) {
+      Real act = 0.0;
+      for (std::size_t q = csr.slice_begin(i); q < csr.slice_end(i); ++q) {
+        act += csr.values()[q] * x[static_cast<std::size_t>(csr.indices()[q])];
+      }
+      const Real tol = 1e-6 * (1.0 + std::fabs(plain.b[i]));
+      if (i < plain.num_equality) {
+        CHECK(std::fabs(act - plain.b[i]) <= tol);
+      } else {
+        CHECK(act <= plain.b[i] + tol);
+      }
+    }
+
+    Real plain_obj = plain.obj_offset;
+    for (std::size_t j = 0; j < n_plain; ++j) plain_obj += plain.c[j] * x[j];
+    Real reduced_obj = reduced.obj_offset;
+    for (std::size_t j = 0; j < reduced.num_cols(); ++j) reduced_obj += reduced.c[j] * lp->x[j];
+    CHECK_NEAR(plain_obj, reduced_obj, 1e-6 * (1.0 + std::fabs(plain_obj)));
+    ++checked;
+  }
+  CHECK(checked > 0);
+  // Both stage B reductions must actually have fired, or the checks above
+  // proved nothing about them.
+  CHECK(substituted > 0);
+  CHECK(merged > 0);
+}
+
+/// Module 29 stage B through the search. A MILP with continuous columns is
+/// solved three ways -- no presolve, stage A only, stage A and B -- and all
+/// three must agree on the objective and on the verdict. Enumeration is not
+/// the oracle here (the continuous columns make the point set infinite);
+/// agreement among the three is, and it is the property that matters: turning
+/// a reduction on must not move the answer.
+void test_column_reductions_never_change_the_answer() {
+  std::size_t substituted = 0, merged = 0, compared = 0;
+  for (unsigned seed = 1; seed <= 40; ++seed) {
+    const RandomIp ip = make_random_milp(seed * 1000003u, 10, 5, 4);
+    model::Problem problem;
+    if (!parse(to_lp(ip), problem)) continue;
+
+    Real reference = 0.0;
+    SolverStatus reference_status = SolverStatus::NotConverged;
+    bool have_reference = false;
+    for (int mode = 0; mode < 3; ++mode) {
+      model::Options o = options_for(BranchingRule::Reliability);
+      o.milp.presolve = mode > 0;
+      o.milp.presolve_columns = mode == 2;
+      solver::MilpStatistics stats;
+      auto result = solver::solve_milp(problem, o, &stats);
+      CHECK(result.has_value());
+      if (!result.has_value()) continue;
+      if (mode == 2) {
+        substituted += stats.presolve_substituted;
+        merged += stats.presolve_merged;
+      } else {
+        CHECK_EQ(stats.presolve_substituted, std::size_t{0});
+        CHECK_EQ(stats.presolve_merged, std::size_t{0});
+      }
+      if (!have_reference) {
+        reference = result->objective;
+        reference_status = result->status;
+        have_reference = true;
+        continue;
+      }
+      CHECK(result->status == reference_status);
+      if (reference_status == SolverStatus::Optimal) {
+        CHECK_NEAR(result->objective, reference, 1e-6 * (1.0 + std::fabs(reference)));
+        // The reported bound must close on the reported objective, which is
+        // what catches an objective constant left behind by a substitution.
+        CHECK_NEAR(result->best_bound, result->objective,
+                   1e-6 * (1.0 + std::fabs(reference)));
+        ++compared;
+      }
+    }
+  }
+  CHECK(compared > 0);
+  CHECK(substituted > 0);
+  CHECK(merged > 0);
+}
 }  // namespace
 
 int main() {
@@ -1142,6 +1375,8 @@ int main() {
   test_conflict_analysis_never_changes_the_answer();
   test_presolve_keeps_the_integer_points();
   test_presolve_never_changes_the_answer();
+  test_postsolve_rebuilds_the_point();
+  test_column_reductions_never_change_the_answer();
   test_tiny_knapsack();
   test_integer_infeasible();
   test_maximization_sign();

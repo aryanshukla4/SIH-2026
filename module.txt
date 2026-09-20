@@ -2442,7 +2442,174 @@ implied-free substitution, 1.32x for all single-column reductions, 1.34x for
 multi-row reductions and 1.17x for probing. Default ON ([CIP]'s);
 --mip-presolve=0 turns it off.
 
-NEXT, ranked by [AGH]'s >= 10 s time ratios: column reductions that REMOVE
-columns (implied-free substitution, singleton columns, parallel columns --
-these need a real postsolve stack, which stage A was built to avoid), then
-probing ([CIP] 10.6), then multi-row (parallel rows, non-zero cancellation).
+STAGE B -- added 2026-09-20, `--mip-presolve-columns`. The reductions that
+REMOVE a column, which is what stage A was built to avoid, and what makes a
+postsolve stack unavoidable.
+
+  1. SUBSTITUTE IMPLIED FREE VARIABLES ([AGH] 4.5 -- at 1.42x in the >= 10 s
+     bracket, Table 13, "the most important presolve algorithm within
+     Gurobi's set of single-column reductions", and the largest entry
+     reachable short of node presolve). When the range row i alone forces on
+     x_j, computed from the OTHER columns' bounds, sits inside x_j's own
+     bounds, those bounds can never bind; an equality
+     A_iS x_S + a_ij x_j = b_i then determines the column, and substituting
+     x_j := (b_i - A_iS x_S)/a_ij into every other row and into the objective
+     removes the column AND the row. The test uses row i alone, which is
+     WEAKER than [AGH]'s (it propagates the whole model first) and therefore
+     safe: the reduced model keeps S's bounds, so any point of it recovers an
+     x_j inside the old range. A FREE COLUMN SINGLETON is the degenerate
+     case -- no other row holds the column, so the substitution is exact and
+     creates no fill-in.
+
+     Two guards from [AGH] 4.5: a MARKOWITZ THRESHOLD on the pivot
+     (|a_ij| >= 0.01 max|a_.j| or >= 0.01 max|a_i.| -- the paper's own 0.01,
+     and its own warning that this reduction is "one of the main sources for
+     numerical issues in the presolving step"), and a FILL-IN LIMIT, since
+     the substitution writes row i into every other row holding the column.
+     [AGH] does not state the limit; kMaxSubstitutionFill = 32 is OURS, as
+     are the absolute pivot floor (1e-7, because the Markowitz test passes
+     trivially for a singleton column however small its entry) and the
+     cancellation drop tolerance.
+
+  2. PARALLEL COLUMNS ([AGH] 6.3, 1.09x). Columns with A_.k = lambda A_.j and
+     c_k = lambda c_j reach every row and the objective only through
+     x_j + lambda x_k, so the pair merges into one column y := x_j +
+     lambda x_k carrying A_.j and c_j, with [AGH] (6.1)'s Minkowski-sum
+     bounds. Detection hashes the SUPPORT only and scans each bucket
+     pairwise; hashing the ratios would make the bucketing depend on
+     rounding. Postsolve splits y back by taking the admissible x_k nearest
+     zero.
+
+ONLY CONTINUOUS COLUMNS are substituted or merged, so no integer column is
+ever removed and MilpSolve.cpp's IntegerColumn list needs only an index
+remap. [AGH] 4.5 does permit an integer x_j when S is integer and a_ik/a_ij
+is integral for every k in S (with b_i/a_ij non-integral then proving
+infeasibility); in OUR canonical space that condition has to be re-derived in
+original units, because a canonical column is x_original/s -- with
+A_k = a_ik/s_k the condition becomes A_k/A_j integral for all k in S and
+b_i/A_j integral. Not implemented; it is the single biggest gap in stage B's
+coverage (see the scan below). Merging integer columns needs [AGH] 6.3's
+further condition that the image of x_j + lambda x_k be an interval of
+integers without holes, likewise in original units.
+
+THE POSTSOLVE STACK. `CanonicalPostsolve` holds `new_of_old` (plain canonical
+column -> reduced column, or kRemoved) and an undo record per removed column.
+Everything is keyed in PLAIN canonical space -- the space the model had when
+presolve_canonical was entered, which is the space of the unpresolved model
+MilpSolve.cpp keeps for rebuilding solutions. `expand_canonical_point`
+replays the records in REVERSE, which is what makes two things work at once:
+a record may name a column a LATER record removed (already restored by then),
+and it may name the survivor of a later merge, which at that point still
+holds the merged value y the record was built against.
+
+WHAT STAGE B BREAKS DOWNSTREAM, and where it is repaired:
+  - `BranchAndBound::incumbent_solution` assumed the search's columns were
+    the plain model's. It now expands first.
+  - `original_of_` / `scale_of_` are built from the transform stack, which is
+    keyed by PLAIN column, but are INDEXED by reduced column (the conflict
+    pool's literals, the RENS sub-MIP). They are now built in plain space and
+    compacted. Getting this wrong wrote past the end of both vectors -- heap
+    corruption, caught only because the allocator noticed at teardown.
+  - The canonical-to-original objective constant was taken from the
+    incumbent, which is right whenever there is one and silently zero when a
+    limit is hit first. Stage B folds a substituted column's contribution
+    into obj_offset, making that constant matter, so it is now computed
+    exactly: original = sign * (c'x + obj_offset) + obj_constant.
+
+TESTS (milp_test). test_postsolve_rebuilds_the_point: presolve with column
+removal on, solve the REDUCED LP relaxation, expand, and require the expanded
+point to be feasible for the model as it stood before stage B -- every row,
+every bound -- and to carry the same objective, offsets included. The first
+claim is what stops the solver reporting an infeasible incumbent, the second
+what stops it reporting the wrong value for a genuine one.
+test_column_reductions_never_change_the_answer solves each model three ways
+(no presolve, stage A, stage A+B) and requires all three to agree on the
+verdict, the objective and the closing bound. Enumeration is not the oracle
+here -- continuous columns make the point set infinite -- so agreement is.
+
+The generator plants what random data does not offer: continuous columns with
+wide bounds inside equality rows (or nothing is implied free), one parallel
+pair with MATCHING costs, and a second parallel pair with MISMATCHED costs
+that must NOT be merged. The merged-away column's bounds exclude zero,
+because postsolve splits y by taking the admissible x_k nearest zero -- with
+zero available the split is x_k = 0 and the sign of lambda never shows. Both
+of those were found by mutants surviving, not by inspection.
+
+MUTANTS, 14/14 caught: the implied-free test ignoring the lower bound, the
+upper bound, or with the range endpoints swapped; substituting integer
+columns without [AGH]'s side condition; the eliminated row added with the
+wrong sign; the right-hand side not updated; the objective constant dropped;
+the cost not pushed onto the remaining columns; the substituted column
+rebuilt with the wrong sign or multiplied by the pivot instead of divided;
+the merged column split with the wrong sign; parallel columns merged without
+the cost check; the Minkowski bounds wrong for negative lambda; and
+non-parallel columns merged.
+
+MEASURED -- coverage first, because it is the headline. Root presolve only
+(node limit 1) over the 44 smallest MIPLIB instances in tests/data/MILP:
+stage B fires on 11 of 44. Where it does:
+
+    n5-3        170 substituted, 166 merged     beasleyC3   161 substituted
+    sp150x300d   69 substituted                 binkar10_1   16 substituted
+    tr12-30      12 substituted                 timtab1       6 sub, 1 merged
+    csched007     3 substituted                 kasai         3 substituted
+    mcsched       2 substituted                 gmu-35-40/50  1 each
+
+On the other 33 it does nothing at all, and the reason is structural: those
+are pure-integer programs, and stage B only touches continuous columns. That
+is a property of this corpus meeting this restriction, not of the reduction
+-- and it is exactly what the integer case above would fix.
+
+A/B at 2000 nodes, defaults otherwise, `--mip-presolve-columns` 0 -> 1. The
+DUAL BOUND is the comparable number: it is reported in the original objective
+(to_original applies obj_offset and obj_constant), while the incumbent at a
+fixed node count is a path effect of a different tree and moved both ways
+here. Times were not pinned and are not quoted.
+
+    instance       sub/merged   dual bound off -> on             LP iters off -> on
+    n5-3           170 / 166    7509.13   -> 7632.11    better   269936 -> 189694  -30%
+    beasleyC3      161 /   0     247.28   ->  275.08    better    85415 ->  71502  -16%
+    sp150x300d      69 /   0      42.980  ->   44.555   better    70777 ->  75343  + 6%
+    binkar10_1      16 /   0    6679.280  -> 6679.877   better    55539 ->  52249  - 6%
+    tr12-30         12 /   0    119295.7  -> 117648.1   worse     20308 ->  18007  -11%
+    timtab1          6 /   1    476358.8  -> 469455.6   worse     55777 ->  73737  +32%
+    csched007        3 /   0     304.243  ->  298.583   worse    564549 -> 539289  - 4%
+    kasai            3 /   0    960501.2  -> 966988.2   better    92492 -> 196070  +112%
+    mcsched          2 /   0    197807.8  -> 195629.0   worse    133523 -> 144005  + 8%
+    gmu-35-40        1 /   0    -2406911.06 -> -2406910.90  better  16648 -> 15038
+    gmu-35-50        1 /   0    -2608070.3028 -> -2608070.3027 better 20243 -> 20643
+    mas74, pk1, glass4 (controls): nothing reduced, every counter identical,
+    LP iteration counts identical to the digit -- the flag is inert when it
+    finds nothing, which is the first thing an A/B has to establish.
+
+Seven bounds better, four worse. The split is not random: the four instances
+with the MOST reductions (170, 161, 69, 16) are all better and by the widest
+margins, and the four worse ones have 12, 6, 3 and 2 reductions, where a
+handful of substitutions changes the branching order and the result is
+search-path noise rather than a property of the reduction. n5-3 is the case
+worth keeping in mind -- 170 substitutions and 166 merges, a better bound and
+30% fewer LP iterations for the same incumbent.
+
+WATCH OUT, and fixed here: `root_bound_before_cuts` used to be recorded as
+`lp->objective`, the presolved model's c'x with NO obj_offset. That was a
+constant that cancelled in every A/B until stage B started folding
+substituted columns into it; raw, binkar10_1's two arms read 6.72e3 against
+1.01e6 and the reduced model looked catastrophically weaker when it was not.
+It now carries obj_offset. It stays in the CANONICAL (minimization) sense
+rather than the original one, so that "cuts never loosen the root bound"
+remains a `>=` for a maximization too -- which is what milp_test asserts.
+
+With that corrected, binkar10_1's root LP bound before cuts is 6.7231190309e3
+with stage B OFF and 6.7231190309e3 with it ON -- identical to every digit,
+after 16 columns and their rows have been substituted out. That is the whole
+claim of an implied-free substitution stated as a measurement: the columns it
+removes were never constraining the relaxation, so removing them cannot move
+it. A reduction that moved this number would be wrong, not clever.
+
+NEXT, ranked by [AGH]'s >= 10 s time ratios: the integer case of implied-free
+substitution (the coverage gap above), then probing ([CIP] 10.6, [AGH] 7.2,
+1.17x), then multi-row reductions ([AGH] section 5, 1.34x: parallel rows,
+non-zero cancellation), then implied integer detection ([AGH] 7.6, 1.13x)
+and dominated columns ([AGH] 6.4). Node presolve ([AGH] section 8) remains
+the largest single entry in the paper at 1.51x, and 3.12x on the >= 1000 s
+models.
