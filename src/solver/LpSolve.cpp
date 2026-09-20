@@ -61,7 +61,22 @@ Solution verdict(const Problem& problem, core::SolverStatus status) {
 
 Expected<Solution> solve_lp(const Problem& problem, const Options& options,
                             const PdlpBackendProvider& backend_provider) {
-  const auto start = std::chrono::steady_clock::now();
+  using Clock = std::chrono::steady_clock;
+  const auto start = Clock::now();
+
+  // Stage timings. Wall time on this thread, recorded so that "presolve is a
+  // bottleneck" is a measurement rather than a belief -- nothing in this
+  // project timed the stages before, so the fraction each one costs was
+  // simply unknown.
+  auto mark = Clock::now();
+  const auto lap = [&mark]() {
+    const auto now = Clock::now();
+    const double seconds = std::chrono::duration<double>(now - mark).count();
+    mark = now;
+    return seconds;
+  };
+  double canonicalize_seconds = 0.0, presolve_seconds = 0.0;
+  double scale_seconds = 0.0, engine_seconds = 0.0;
 
   if (problem.has_quadratic()) {
     return core::make_error(core::ErrorCode::UnsupportedFeature,
@@ -76,6 +91,7 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options,
     }
     return canon.error();
   }
+  canonicalize_seconds = lap();
 
   core::Status status = presolve(canon->problem, options, canon->transforms);
   if (!status.ok()) {
@@ -84,9 +100,11 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options,
     }
     return status.error();
   }
+  presolve_seconds = lap();
 
   status = scale(canon->problem, options, canon->transforms);
   if (!status.ok()) return status.error();
+  scale_seconds = lap();
 
   // Four engines, one pipeline. Everything above and below this block is
   // shared; only the middle differs, and each engine is responsible for
@@ -130,12 +148,18 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options,
     canonical = simplex::to_canonical_solution(canon->problem, *result);
   }
 
+  engine_seconds = lap();
+
   auto recovered =
       reconstruct_solution(problem, canon->problem, canon->transforms, canonical);
   if (!recovered.has_value()) return recovered.error();
 
-  const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
+  const std::chrono::duration<double> elapsed = Clock::now() - start;
   recovered->solve_time_seconds = elapsed.count();
+  recovered->canonicalize_seconds = canonicalize_seconds;
+  recovered->presolve_seconds = presolve_seconds;
+  recovered->scale_seconds = scale_seconds;
+  recovered->engine_seconds = engine_seconds;
   return recovered;
 }
 
