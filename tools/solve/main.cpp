@@ -135,6 +135,8 @@ void print_usage(const char* argv0) {
       "  --mip-cut-margin=X    MilpOptions::cut_violation_margin (default 1e-6)\n"
       "  --mip-presolve=0|1    MilpOptions::presolve (default 1): CIP ch. 10\n"
       "  --mip-presolve-rounds=N  MilpOptions::presolve_rounds (default 20, OURS)\n"
+      "  --mip-presolve-columns=0|1  MilpOptions::presolve_columns (default 1):\n"
+      "                        the reductions that REMOVE a column (AGH 4.5, 6.3)\n"
       "  --mip-gomory=0|1      MilpOptions::gomory_cuts (default 1)\n"
       "  --mip-cmir=0|1        MilpOptions::cmir_cuts (default 1)\n"
       "  --mip-cut-rounds=N    MilpOptions::cut_rounds (default 15)\n"
@@ -266,6 +268,8 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.milp.presolve = (val != "0");
     } else if (key == "mip-presolve-rounds") {
       options.milp.presolve_rounds = static_cast<std::size_t>(std::stoul(val));
+    } else if (key == "mip-presolve-columns") {
+      options.milp.presolve_columns = (val != "0");
     } else if (key == "mip-gomory") {
       options.milp.gomory_cuts = (val != "0");
     } else if (key == "mip-cmir") {
@@ -586,6 +590,8 @@ int main(int argc, char** argv) {
       std::printf("presolve_coefficients=%zu\n", milp_stats.presolve_coefficients);
       std::printf("presolve_rows_removed=%zu\n", milp_stats.presolve_rows_removed);
       std::printf("presolve_fixed=%zu\n", milp_stats.presolve_fixed);
+      std::printf("presolve_substituted=%zu\n", milp_stats.presolve_substituted);
+      std::printf("presolve_merged=%zu\n", milp_stats.presolve_merged);
       std::printf("cut_rounds=%zu\n", milp_stats.cut_rounds);
       std::printf("gomory_cuts=%zu\n", milp_stats.gomory_cuts);
       std::printf("cmir_cuts=%zu\n", milp_stats.cmir_cuts);

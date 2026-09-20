@@ -163,6 +163,11 @@ struct MilpStatistics {
   std::size_t presolve_coefficients = 0;
   std::size_t presolve_rows_removed = 0;
   std::size_t presolve_fixed = 0;
+  /// Stage B, the column-removing reductions. Each substitution also deletes
+  /// the equality row it pivoted on; those rows are NOT counted in
+  /// `presolve_rows_removed`, which stays a count of redundant rows.
+  std::size_t presolve_substituted = 0;
+  std::size_t presolve_merged = 0;
   std::size_t cut_rounds = 0;
   std::size_t gomory_cuts = 0;
   std::size_t cmir_cuts = 0;
