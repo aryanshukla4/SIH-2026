@@ -389,6 +389,11 @@ core::Expected<SimplexResult> PrimalSolver::run(const Basis* warm_start) {
       outcome = core::SolverStatus::TimeLimit;
       break;
     }
+    // Another engine already won the race -- see DualSimplex.cpp.
+    if (iterations_ % kTimeCheckInterval == 0 && cancelled()) {
+      outcome = core::SolverStatus::NotConverged;
+      break;
+    }
     if (force_refactor_ || lu_.num_updates() >= opt_.refactor_interval) {
       status = refactorize();
       if (!status.ok()) {

@@ -1,6 +1,29 @@
 #include "sovsolve/solver/Logging.hpp"
 
+#include "sovsolve/solver/ConcurrentSolve.hpp"
+
 namespace sovsolve::solver {
+
+namespace {
+
+/// Local to this file on purpose: Module 20 is presentation, so the spelling
+/// of a status belongs here rather than in core, where it would invite every
+/// other module to format its own output.
+[[nodiscard]] const char* spell(core::SolverStatus s) {
+  switch (s) {
+    case core::SolverStatus::NotConverged: return "NotConverged";
+    case core::SolverStatus::Optimal: return "Optimal";
+    case core::SolverStatus::Infeasible: return "Infeasible";
+    case core::SolverStatus::Unbounded: return "Unbounded";
+    case core::SolverStatus::Nonconvex: return "Nonconvex";
+    case core::SolverStatus::MaxIterations: return "MaxIterations";
+    case core::SolverStatus::TimeLimit: return "TimeLimit";
+    case core::SolverStatus::NumericalError: return "NumericalError";
+  }
+  return "unknown";
+}
+
+}  // namespace
 
 void log_iteration(const IterationRecord& record, const LogOptions& options,
                     std::FILE* out) {
@@ -33,6 +56,19 @@ void log_presolve_summary(std::size_t rows_before, std::size_t cols_before,
                "presolve: rows %zu(-%zu)  cols %zu(-%zu)  nnz %zu(-%zu)\n",
                rows_after, rows_before - rows_after, cols_after, cols_before - cols_after,
                nnz_after, nnz_before - nnz_after);
+}
+
+void log_concurrent_race(const ConcurrentReport& report, const LogOptions& options,
+                         std::FILE* out) {
+  if (options.level == LogOptions::Level::Silent) return;
+
+  std::fprintf(out, "concurrent: %zu engines on %zu threads\n",
+               report.entries.size(), report.threads);
+  for (const ConcurrentEntry& e : report.entries) {
+    std::fprintf(out, "  %-16s %-14s %10.3fs  iters=%-8zu %s\n", e.name.c_str(),
+                 e.failed ? "failed" : spell(e.status), e.seconds,
+                 e.iterations, e.won ? "<-- winner" : "");
+  }
 }
 
 }  // namespace sovsolve::solver

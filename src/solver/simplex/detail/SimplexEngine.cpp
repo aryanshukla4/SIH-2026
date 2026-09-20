@@ -12,6 +12,7 @@ SimplexEngine::SimplexEngine(const model::CanonicalProblem& problem,
                              const std::vector<Real>* costs)
     : matrix_(problem),
       opt_(options.simplex),
+      cancel_(options.cancel),
       time_limit_(options.limits.time_limit_seconds),
       m_(problem.num_rows()),
       n_(problem.num_cols()),

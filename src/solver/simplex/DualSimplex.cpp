@@ -672,6 +672,13 @@ core::Expected<SimplexResult> DualSolver::run(const Basis* warm_start) {
         outcome = core::SolverStatus::TimeLimit;
         break;
       }
+      // Another engine already won the race. Stop where we are and report
+      // NotConverged -- we did not prove anything, and the driver discards
+      // this result anyway.
+      if (iterations_ % kTimeCheckInterval == 0 && cancelled()) {
+        outcome = core::SolverStatus::NotConverged;
+        break;
+      }
       if (force_refactor_ || lu_.num_updates() >= opt_.refactor_interval) {
         status = refactorize();
         if (!status.ok()) {
