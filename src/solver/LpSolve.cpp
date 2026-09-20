@@ -3,6 +3,8 @@
 #include <chrono>
 
 #include "sovsolve/model/Canonical.hpp"
+#include "sovsolve/solver/ConcurrentSolve.hpp"
+#include "sovsolve/solver/Logging.hpp"
 #include "sovsolve/solver/Presolver.hpp"
 #include "sovsolve/solver/Scaler.hpp"
 #include "sovsolve/solver/SolutionReconstructor.hpp"
@@ -90,7 +92,17 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options,
   // shared; only the middle differs, and each engine is responsible for
   // producing the same five canonical-space vectors.
   Solution canonical;
-  if (options.simplex.method == model::Method::Pdlp) {
+  if (options.simplex.method == model::Method::Concurrent) {
+    // Module 30: race several engines and keep the first verdict. The GPU
+    // PDLP backend is deliberately NOT forwarded -- one device shared by
+    // three racing threads would serialize them on the same hardware, which
+    // is the opposite of the point.
+    ConcurrentReport report;
+    auto result = solve_concurrent(canon->problem, options, {}, &report);
+    log_concurrent_race(report, options.log);
+    if (!result.has_value()) return result.error();
+    canonical = std::move(*result);
+  } else if (options.simplex.method == model::Method::Pdlp) {
     // The injected backend, when there is one. PDLP's only contact with the
     // matrix is through this, so the GPU path differs from the host path in
     // exactly one object and nothing else.

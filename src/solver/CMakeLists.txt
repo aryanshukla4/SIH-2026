@@ -11,6 +11,8 @@ add_library(sovsolve_solver STATIC
   MilpCuts.cpp
   MilpSeparators.cpp
   MilpSolve.cpp
+  # Module 30: the concurrent optimizer. Needs Threads::Threads (below).
+  ConcurrentSolve.cpp
   Homogeneous.cpp
   HomogeneousSolve.cpp
   HostKkt.cpp
@@ -53,8 +55,11 @@ add_library(sovsolve_solver STATIC
 
 target_include_directories(sovsolve_solver PUBLIC
   $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>)
+# Module 30 races the engines on std::thread. On MinGW and on Linux this needs
+# the platform's thread library linked explicitly; on MSVC it is a no-op.
+find_package(Threads REQUIRED)
 target_link_libraries(sovsolve_solver PUBLIC
-  sovsolve_core sovsolve_model sovsolve_analysis)
+  sovsolve_core sovsolve_model sovsolve_analysis Threads::Threads)
 sovsolve_set_warnings(sovsolve_solver)
 sovsolve_set_sanitizers(sovsolve_solver)
 

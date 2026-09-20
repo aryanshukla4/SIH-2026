@@ -33,6 +33,18 @@ void log_presolve_summary(std::size_t rows_before, std::size_t cols_before,
                           std::size_t cols_after, std::size_t nnz_after,
                           const LogOptions& options, std::FILE* out = stdout);
 
+/// Writes one line per entrant in a Module 30 concurrent solve: the engine,
+/// its verdict, how long it ran and which one won. Declared here rather than
+/// in ConcurrentSolve.hpp so that module stays free of presentation, the
+/// same split Module 20 keeps from Diagnostics.
+///
+/// The times are also the per-engine runtime record an algorithm-selection
+/// model would be trained on, which is why every entrant is printed and not
+/// just the winner. `Level::Silent` writes nothing.
+struct ConcurrentReport;
+void log_concurrent_race(const ConcurrentReport& report, const LogOptions& options,
+                         std::FILE* out = stdout);
+
 }  // namespace sovsolve::solver
 
 #endif  // SOVSOLVE_SOLVER_LOGGING_HPP

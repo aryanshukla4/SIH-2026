@@ -2613,3 +2613,120 @@ non-zero cancellation), then implied integer detection ([AGH] 7.6, 1.13x)
 and dominated columns ([AGH] 6.4). Node presolve ([AGH] section 8) remains
 the largest single entry in the paper at 1.51x, and 3.12x on the >= 1000 s
 models.
+
+
+## 30. Concurrent optimization -- added 2026-09-20, `--method=concurrent`
+
+PS 26119 requires "multi-core parallelization". Until this module the solver
+had none: no std::thread, no OpenMP, nothing. It was the only required
+technique in the problem statement with literally nothing behind it, while
+the CONDITIONAL one next to it -- "GPU acceleration considered where it
+provides measurable benefits" -- was already done (Modules 24E/24F).
+
+WHY RACING RATHER THAN SPLITTING ONE ENGINE. A simplex pivot depends on the
+basis the previous pivot produced, so the iteration is a sequential chain;
+that is why essentially every solver's simplex, ours included, is
+single-threaded. What several cores CAN do for one LP is run DIFFERENT
+algorithms at once and keep the first to finish. This is not a workaround: it
+is what Gurobi ships as the DEFAULT for LP models, one thread on dual
+simplex, several on barrier, one on primal
+(docs.gurobi.com, "Concurrent Optimization").
+
+WHY NOT PREDICT THE BEST ENGINE. That is the "algorithm selection" literature
+-- Rice's 1976 framing, Hutter/Xu/Hoos/Leyton-Brown, "Algorithm runtime
+prediction" (Artificial Intelligence 206:79-111, 2014), Xu et al.'s Hydra-MIP
+for the MIP case. Those methods need hundreds of training instances per
+engine to fit a runtime model; our LP corpus is 19 Netlib instances, on which
+a predictor would be noise. Racing needs no training data and CANNOT be
+wrong, only wasteful. And it produces, as a side effect, exactly the
+per-engine timing record such a model would later be trained on -- which is
+why ConcurrentReport keeps an entry for every entrant, not just the winner.
+
+WHAT IT IS AND IS NOT. It does not beat the best engine on a given model; the
+winner is the engine that would have won anyway, less a little
+memory-bandwidth contention. What it removes is the risk of CHOOSING WRONG,
+and on a mixed corpus that is the larger effect by far.
+
+MEASURED, Netlib, this machine (8 cores), each engine alone vs the race:
+
+    instance      dual      primal    pdlp      hsd       best        concurrent
+    rgn           1.428401  1.437268  0.002658  0.000400  hsd         0.000837
+    greenbea      0.828238 42.243713  -         -         dual        1.064316
+    25fv47        0.413265  0.680674  -         1.996929  dual        0.380985
+    80bau3b       0.227433  1.508515  -        32.168416  dual        0.216079
+    gt2           0.033447  0.033733  0.000406  0.000533  pdlp        0.000956
+    flugpl        0.018363  0.019457  0.000169  0.000184  pdlp        0.002760
+    bell5         -         -         -         0.009436  hsd         0.002039
+
+NO ENGINE WINS EVERYWHERE, and the spread is not marginal: on rgn the dual
+simplex takes 1.43 s and HSD takes 0.0004 s, a factor of 3571. flugpl is
+109x, gt2 82x. Over the 17 Netlib instances the dual simplex solves -- and it
+is the best SINGLE fixed choice -- dual alone totals 3.015 s and the race
+totals 1.760 s, so racing is 1.71x faster than the best fixed engine while
+being told nothing about which instance suits which engine. It also returns
+bell5, which three of the four engines fail outright.
+
+WHERE IT COSTS. Thread start-up is a fixed ~0.5-4 ms, so on instances that
+solve in microseconds the race is SLOWER than a single engine: chip 0.000076
+-> 0.004199, avgas 0.000101 -> 0.000847. Honest, and the obvious fix is a
+size threshold below which the race is not worth entering. Not implemented.
+
+A CONFOUND WORTH RECORDING. Selecting `--method=concurrent` also selects
+Ruiz/Pock-Chambolle scaling, because PDLP is in the line-up and its
+convergence depends on the preconditioning its paper specifies. Every
+entrant therefore races on a differently scaled model than it would see
+under `--method=dual-simplex`. That is how the race solves bell5 while the
+dual simplex alone does not -- the win is partly the scaling, not purely the
+racing. Per-engine scaling would need a per-engine copy of the model.
+
+CANCELLATION. core/Cancel.hpp: one relaxed atomic flag, set by the winner,
+read by every other engine once per iteration (the simplices piggyback on the
+existing 64-iteration wall-clock check; PDLP checks on its convergence
+interval; HSD every iteration, each being a KKT solve). Relaxed is
+sufficient: the flag carries no data, and the join provides the ordering the
+results need. An engine stopping for this reason reports NotConverged, never
+Optimal -- it proved nothing.
+
+TWO BUGS THIS FOUND, both the same shape. HSD's and PDLP's cancellation exits
+originally returned before the result was published/synced, handing the
+converter vectors that had never been sized. HSD segfaulted on the first run.
+Both now stop only where the normal exit paths do: HSD publishes first, PDLP
+checks after sync_from_backend(). The lesson generalizes -- an early return
+added to an iterative solver has to leave by the same door as every other
+exit.
+
+NOT TUNED TO ONE MACHINE, deliberately, since the deployment target is a
+large CPU/GPU system and not the laptop this was written on. The line-up is a
+PRIORITY ORDER truncated at run time by std::thread::hardware_concurrency(),
+so the same binary races two engines on a small box and all four on a large
+one; `--concurrent-threads=N` overrides. The GPU interior-point engine is out
+of the default line-up because on a CONSUMER Ampere card FP64 runs at 1/64
+rate (ARCHITECTURE-REVIEW 3.5) -- on a datacentre card that reverses and it
+costs no CPU core, so `--concurrent-gpu-ipm=1` exists for that hardware.
+
+TESTS (concurrent_test, 167 checks). The oracle is the single-engine answer:
+the race must match every engine that can solve the model alone, on verdict
+and objective. Repeated races must agree with each other (the WINNER may
+differ -- that is the scheduler -- but the answer may not; this is what would
+break first if a cancelled engine were ever allowed to report Optimal). The
+thread budget must select the line-up and one thread must still be a correct
+solve. An infeasible model must still get a verdict, which is the case where
+"first definitive status wins" has to fire on something other than Optimal
+and where a race waiting for an optimum would hang. The report must account
+for every entrant with exactly one winner.
+
+DEFAULT OFF. `--method=concurrent` is opt-in: which optimal BASIS comes back
+is not deterministic, because a degenerate LP has many optimal vertices and
+which thread finishes first decides. The objective is deterministic; the
+vertex is not. Gurobi documents the same tradeoff and its deterministic
+concurrent mode is "significantly slower". Leaving it off keeps every
+existing test and the MILP search -- which compares solution vectors, not
+just objectives -- on the single-engine behaviour they were validated with.
+
+NEXT, and this is where the cores actually go on a large machine: racing four
+engines cannot use fifty cores. Parallel strong branching is the measured
+MILP hotspot -- strong branching is 46-72% of all LP iterations (pk1 72%,
+binkar10_1 57%, timtab1 52%, mas74 46%) and every probe is an independent LP.
+Amdahl on those shares puts it at 1.5-2.2x end-to-end. After that, parallel
+tree search, which has the highest ceiling and is the only one that is
+inherently non-deterministic.

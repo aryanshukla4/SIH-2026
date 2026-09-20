@@ -36,6 +36,7 @@
 #include <cstddef>
 #include <vector>
 
+#include "sovsolve/core/Cancel.hpp"
 #include "sovsolve/core/Span.hpp"
 #include "sovsolve/core/Status.hpp"
 #include "sovsolve/core/Types.hpp"
@@ -153,6 +154,11 @@ class SimplexEngine {
     return elapsed.count() >= time_limit_;
   }
 
+  /// True once the concurrent optimizer has declared another engine the
+  /// winner (core/Cancel.hpp). Checked beside `time_exhausted()` on the same
+  /// interval; null -- the normal single-engine case -- costs one comparison.
+  [[nodiscard]] bool cancelled() const { return core::is_cancelled(cancel_); }
+
   /// Assemble the answer from the current state.
   [[nodiscard]] SimplexResult pack_result(core::SolverStatus outcome) const;
 
@@ -160,6 +166,7 @@ class SimplexEngine {
 
   AugmentedMatrix matrix_;
   const model::SimplexOptions& opt_;
+  const core::CancelToken* cancel_ = nullptr;
   double time_limit_;
   std::size_t m_;
   std::size_t n_;

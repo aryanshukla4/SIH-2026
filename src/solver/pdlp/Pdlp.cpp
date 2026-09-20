@@ -733,6 +733,14 @@ core::Expected<PdlpResult> PdlpSolver::run() {
         outcome = SolverStatus::Optimal;
         break;
       }
+      // Another engine already won the race (core/Cancel.hpp). Checked HERE,
+      // after `sync_from_backend()`, and not at the top of the loop: the host
+      // iterate is only current at this point, and packing a result from an
+      // unsynced backend would report whatever the host copy last held.
+      if (core::is_cancelled(opt_.cancel)) {
+        outcome = SolverStatus::NotConverged;
+        break;
+      }
       if (!std::isfinite(conv.primal) || !std::isfinite(conv.dual) ||
           !std::isfinite(conv.gap)) {
         outcome = SolverStatus::NumericalError;

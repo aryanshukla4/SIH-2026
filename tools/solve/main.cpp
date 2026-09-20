@@ -53,7 +53,16 @@ void print_usage(const char* argv0) {
       "tuning flags (each is a field on model::Options -- see Options.hpp\n"
       "for the full doc comment on why each default is what it is):\n"
       "\n"
-      "  --method=ipm|dual-simplex|primal-simplex|pdlp|hsd  SimplexOptions::method\n"
+      "  --method=ipm|dual-simplex|primal-simplex|pdlp|hsd|concurrent\n"
+      "                        `concurrent` (Module 30) races dual simplex, PDLP,\n"
+      "                        primal simplex and HSD on separate cores and keeps\n"
+      "                        the first verdict. SimplexOptions::method\n"
+      "  --concurrent-threads=N  ConcurrentOptions::max_threads (0 = use the\n"
+      "                        machine's own core count; the engine line-up is\n"
+      "                        truncated to this)\n"
+      "  --concurrent-gpu-ipm=0|1  race the GPU interior-point engine too\n"
+      "                        (default 0 -- worth turning on for a datacentre\n"
+      "                        card, where FP64 is not 1/64 rate)\n"
       "                        (default ipm; simplex, pdlp and hsd are host-only,\n"
       "                        and are the only engines a non-CUDA build has)\n"
       "  --scaling=geometric|ruiz  ScalingOptions::mode (ruiz is implied by\n"
@@ -237,10 +246,16 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
         options.scaling.mode = sovsolve::model::ScalingMode::RuizPockChambolle;
       } else if (val == "hsd" || val == "homogeneous") {
         options.simplex.method = sovsolve::model::Method::Hsd;
+      } else if (val == "concurrent") {
+        options.simplex.method = sovsolve::model::Method::Concurrent;
+        // The race includes PDLP, and PDLP wants its paper's preconditioning
+        // (see above). The other entrants are indifferent to it.
+        options.scaling.mode = sovsolve::model::ScalingMode::RuizPockChambolle;
       } else {
         std::fprintf(
             stderr,
-            "unknown --method: %s (ipm, dual-simplex, primal-simplex, pdlp, hsd)\n",
+            "unknown --method: %s (ipm, dual-simplex, primal-simplex, pdlp, hsd, "
+            "concurrent)\n",
             val.c_str());
         return false;
       }
@@ -268,6 +283,10 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.milp.presolve = (val != "0");
     } else if (key == "mip-presolve-rounds") {
       options.milp.presolve_rounds = static_cast<std::size_t>(std::stoul(val));
+    } else if (key == "concurrent-threads") {
+      options.concurrent.max_threads = static_cast<std::size_t>(std::stoul(val));
+    } else if (key == "concurrent-gpu-ipm") {
+      options.concurrent.include_gpu_interior_point = (val != "0");
     } else if (key == "mip-presolve-columns") {
       options.milp.presolve_columns = (val != "0");
     } else if (key == "mip-gomory") {
