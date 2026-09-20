@@ -170,6 +170,20 @@ core::Expected<HsdResult> solve_hsd(const model::CanonicalProblem& problem,
 
   const std::size_t max_iterations = options.hsd.max_iterations;
   for (std::size_t iteration = 0; iteration < max_iterations; ++iteration) {
+    // Another engine already won the race (core/Cancel.hpp). Every check here
+    // is one interior-point iteration apart, each costing a KKT solve, so
+    // there is no reason to batch it.
+    //
+    // `publish` FIRST, exactly as the numerical-failure path below does: it is
+    // what sizes and fills `result`'s vectors, and a caller handed an
+    // unpublished result reads uninitialized storage. Leaving it out is how
+    // the first version of this crashed.
+    if (core::is_cancelled(options.cancel)) {
+      publish(problem, state, result);
+      result.status = core::SolverStatus::NotConverged;
+      result.objective = problem.objective(result.x.span());
+      return result;
+    }
     result.iterations = iteration;
 
     status = compute_homogeneous_residuals(problem, state, 0.0, residuals);

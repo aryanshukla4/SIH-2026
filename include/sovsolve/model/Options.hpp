@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "sovsolve/core/Cancel.hpp"
 #include "sovsolve/core/Types.hpp"
 
 namespace sovsolve::model {
@@ -525,6 +526,9 @@ enum class Method : std::uint8_t {
   /// host-only module cannot be called from inside it. The two share the
   /// interior-point FAMILY and nothing else; see solver/HomogeneousSolve.hpp.
   Hsd,
+  /// Module 30: run several of the engines above at once, on separate cores,
+  /// and keep whichever finishes first. See solver/ConcurrentSolve.hpp.
+  Concurrent,
 };
 
 /// Module 25 controls: the homogeneous self-dual embedding
@@ -806,6 +810,33 @@ struct SimplexOptions {
 };
 
 /// Everything, in one object.
+/// Module 30, the concurrent optimizer.
+///
+/// DELIBERATELY NOT TUNED TO ANY ONE MACHINE. The engine line-up is chosen at
+/// run time from `std::thread::hardware_concurrency()`, so the same binary
+/// races two engines on a small laptop and every engine it has on a large
+/// workstation, with no rebuild and no per-machine constant. A deployment
+/// target with dozens of cores should also raise `max_threads` above the
+/// number of engines only once there is intra-engine parallelism to spend it
+/// on -- racing five engines cannot use fifty cores.
+struct ConcurrentOptions {
+  /// Upper bound on racing threads. 0 means "decide from the hardware".
+  /// A value of 1 makes the concurrent method run a single engine, which is
+  /// how it behaves on a single-core machine.
+  std::size_t max_threads = 0;
+
+  /// Race the GPU interior-point engine too, where a build has one.
+  ///
+  /// OFF by default, and that default is a statement about CONSUMER cards,
+  /// not about the algorithm: on a consumer Ampere part FP64 runs at 1/64 of
+  /// FP32 (docs/ARCHITECTURE-REVIEW.md 3.5), so a factorization-based GPU
+  /// engine loses to the CPU simplex and only burns a thread supervising it.
+  /// On a datacentre card (A100 and later: 1:2 FP64, HBM bandwidth) that
+  /// reverses, and the GPU engine costs no CPU core to run -- it should be in
+  /// the race there. Turn it on when the deployment hardware warrants it.
+  bool include_gpu_interior_point = false;
+};
+
 struct Options {
   Tolerances tolerances;
   IpmOptions ipm;
@@ -818,6 +849,20 @@ struct Options {
   ScalingOptions scaling;
   PdlpOptions pdlp;
   HsdOptions hsd;
+  ConcurrentOptions concurrent;
+
+  /// Cooperative cancellation, set by the concurrent optimizer so an engine
+  /// that has already lost the race stops instead of running to completion.
+  /// Null in a normal solve, and then every engine's check costs one
+  /// predictable null comparison per iteration.
+  ///
+  /// It lives here rather than in each engine's signature because every
+  /// engine already takes `const Options&`, so this adds a capability to all
+  /// four without touching four different call sites and their overloads.
+  /// NOT OWNED -- the token must outlive the solve, which it does: the
+  /// concurrent driver keeps it on its own stack and joins every thread
+  /// before returning.
+  const core::CancelToken* cancel = nullptr;
 };
 
 }  // namespace sovsolve::model
