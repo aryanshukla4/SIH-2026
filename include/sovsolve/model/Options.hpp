@@ -402,6 +402,12 @@ struct MilpOptions {
   /// Presolve rounds, stopping earlier when a round changes nothing. [CIP]
   /// runs its outer loop until no reduction is found; the cap is OURS.
   std::size_t presolve_rounds = 20;
+  /// Stage B: the reductions that REMOVE a column -- substitution of implied
+  /// free variables ([AGH] 4.5, its largest single-column entry at 1.42) and
+  /// parallel column merging ([AGH] 6.3, 1.09). Needs `presolve`. Separate
+  /// from it because these are the reductions that need a postsolve stack,
+  /// so switching them off returns the solver to stage A's simpler shape.
+  bool presolve_columns = true;
 
   /// Root cutting planes in canonical space, cut-and-branch as [CIP] 8.10
   /// measures SCIP's default: Gomory mixed integer cuts ([CIP] 8.3 with
