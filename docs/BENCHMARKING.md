@@ -29,6 +29,7 @@ MIPLIB instances go in `tests/data/MILP/` by hand (they are not committed).
 |---|---|
 | `--corpus lp\|mip\|large\|all` | which built-in corpus (default `lp`) |
 | `--instances FILE/DIR ...` | explicit models instead of a corpus |
+| `--no-auto-family` | disable automatic LP/MILP classification (enabled by default) |
 | `--compare` | every engine, not just the default one |
 | `--configs a,b,c` | named configurations to run |
 | `--config "name=--flags"` | define your own, repeatable |
@@ -55,6 +56,16 @@ concurrent_winner, timed_out, exit_code`.
 `solve_time_seconds` is the solver's own timing; `wall_seconds` includes
 process start-up and parsing. Both are present so the difference is visible
 rather than assumed.
+
+## Automatic LP/MILP selection
+
+When a model is supplied through `--instances`, the harness detects standard
+integrality declarations before selecting a configuration: MPS `INTORG`/`BV`,
+CPLEX LP `General`/`Integer`/`Binary` sections, and QPLIB's variable-type
+code. A detected discrete model gets the `mip` configuration by default;
+continuous models use the normal LP default. The CSV's `family` column shows
+the choice. Pass `--no-auto-family` to retain the original `custom` family,
+or use `--configs` to choose configurations explicitly.
 
 ## GPU
 

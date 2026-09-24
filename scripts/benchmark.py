@@ -229,6 +229,52 @@ def collect(paths, pattern):
 
 
 MODEL_RE = re.compile(r"\.(mps|lp|qplib)$", re.IGNORECASE)
+MPS_DISCRETE_RE = re.compile(r"(?:INTORG|(?:^|\s)BV(?:\s|$))", re.IGNORECASE)
+LP_DISCRETE_SECTION_RE = re.compile(
+    r"^\s*(?:general(?:s)?|integer(?:s)?|binary|binaries)\s*$",
+    re.IGNORECASE)
+
+
+def has_discrete_variables(path):
+    """Best-effort, format-aware classification before choosing a configuration.
+
+    The solver remains the authority on parsing the model.  This deliberately
+    recognizes only the standard declarations of integrality, so a failed
+    inspection is safe: it selects the LP configuration rather than claiming
+    an LP is an MILP.  `--corpus mip` is still an explicit MIP override.
+    """
+    suffix = os.path.splitext(path)[1].lower()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            if suffix == ".mps":
+                for line in fh:
+                    # An asterisk in column one starts an MPS comment; Netlib
+                    # comments often contain the word "integer".
+                    if not line.lstrip().startswith("*") and MPS_DISCRETE_RE.search(line):
+                        return True
+                return False
+            if suffix == ".lp":
+                # CPLEX LP's discrete declarations are section headers.
+                return any(LP_DISCRETE_SECTION_RE.match(line) for line in fh)
+            if suffix == ".qplib":
+                # QPLIB's first data record is its three-letter type. Its
+                # second character is C (continuous), B/I (all binary/integer),
+                # or M (per-variable mixed types).
+                for line in fh:
+                    text = line.strip()
+                    if text and not text.startswith(("!", "#")):
+                        code = text.split()[0].upper()
+                        return len(code) >= 2 and code[1] != "C"
+    except OSError:
+        pass
+    return False
+
+
+def family_for_model(path, fallback, auto_family):
+    """Return MIP for a detected discrete model, otherwise its fallback family."""
+    if fallback == "mip" or not auto_family:
+        return fallback
+    return "mip" if has_discrete_variables(path) else fallback
 
 
 def default_corpora(which):
@@ -325,11 +371,12 @@ def benchmark(args):
     # --- which models -----------------------------------------------------
     models = []
     if args.instances:
-        models = [("custom", m) for m in collect(args.instances, MODEL_RE)]
+        models = [(family_for_model(m, "custom", args.auto_family), m)
+                  for m in collect(args.instances, MODEL_RE)]
     else:
         for family, directory in default_corpora(args.corpus):
             for path in collect([directory], MODEL_RE):
-                models.append((family, path))
+                models.append((family_for_model(path, family, args.auto_family), path))
     if args.limit:
         models = models[: args.limit]
     if not models:
@@ -521,6 +568,10 @@ def main():
 
   python scripts/benchmark.py --all --repeat 3 --out results/full.csv
       Everything, best of 3, for a reporting run.
+
+  python scripts/benchmark.py --instances my-models
+      Automatically uses MIP settings for MPS/LP/QPLIB files that declare
+      integer or binary variables. Pass --no-auto-family to disable this.
 """)
     parser.add_argument("--solver", help="path to the solve binary (auto-detected)")
     parser.add_argument("--corpus", choices=["lp", "mip", "large", "all"],
@@ -529,6 +580,9 @@ def main():
                         help="shorthand for --corpus all")
     parser.add_argument("--instances", nargs="+",
                         help="explicit model files or directories")
+    parser.add_argument("--no-auto-family", dest="auto_family", action="store_false",
+                        default=True,
+                        help="do not detect discrete models; retain the corpus/custom family")
     parser.add_argument("--configs",
                         help="comma-separated configuration names to run")
     parser.add_argument("--compare", action="store_true",

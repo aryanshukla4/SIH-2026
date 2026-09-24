@@ -69,3 +69,5 @@ HIGHS/
 # they work fine against files that live only on the machine running them.
 tests/data/bab2.mps
 tests/data/*.mps.gz
+/*.csv
+tests/data/mittelman/
