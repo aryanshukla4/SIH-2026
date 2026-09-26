@@ -109,8 +109,9 @@ DEFAULT_MIP = ["mip"]
 # configuration it should be compared against, because "the GPU took 0.4s" is
 # not a result -- "the GPU took 0.4s where the same engine on the host took
 # 0.9s" is. `concurrent` leads so the row is also comparable to a default run.
-GPU_COMPARE_LP = ["concurrent", "pdlp", "pdlpx", "pdlp-gpu", "pdlpx-gpu",
-                  "pdlpx-gpu-nograph", "pdlp-gpu-spmv", "ipm"]
+#NOTE: yaha mene change kiya hai ek for temp basis
+GPU_COMPARE_LP = [ "concurrent","pdlpx-gpu"
+                   ]
 
 # Columns that lead the CSV, in this order. Everything the solver printed is
 # appended after them, so new statistics need no change here.
