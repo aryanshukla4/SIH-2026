@@ -29,7 +29,8 @@ constexpr std::size_t kNoWinner = std::numeric_limits<std::size_t>::max();
   switch (m) {
     case Method::DualSimplex: return "dual-simplex";
     case Method::PrimalSimplex: return "primal-simplex";
-    case Method::Pdlp: return "pdlp";
+    // discarding pdlp for now
+   // case Method::Pdlp: return "pdlp"; 
     case Method::PdlpX: return "pdlpx";
     case Method::Hsd: return "hsd";
     case Method::InteriorPoint: return "ipm";
