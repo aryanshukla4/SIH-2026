@@ -37,7 +37,7 @@
 // It does NOT make the solver faster than its best engine on a given model --
 // on a single instance the winner is the engine that would have won anyway,
 // minus a little memory-bandwidth contention. What it removes is the risk of
-// CHOOSING WRONG, which on a mixed corpus is the larger effect: PDLP wins on
+// CHOOSING WRONG, which on a mixed corpus is the larger effect: cuPDLPx wins on
 // very large sparse LPs, the dual simplex on medium ones, and nothing about
 // the model tells you which in advance.
 //
