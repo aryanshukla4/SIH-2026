@@ -1,688 +1,397 @@
-# sovsolve — model ingestion & storage layer
+# sovsolve
 
-Foundation layer for the sovereign LP/MILP/QP solver core (SIH PS 26119, MRPL).
+**A from-scratch optimization solver for linear, mixed-integer and quadratic
+programs — CPU and GPU — built for SIH 2026, problem statement 26119 (MRPL).**
 
-This subproject owns everything between a model file on disk and the numbers the
-solver iterates on:
+sovsolve reads a model from a standard file, solves it with one of several
+engines that were each implemented here from their published papers, and
+returns the answer in the model's own terms. No open-source or commercial
+solver library is linked, vendored or called at solve time — see
+[On the "from scratch" constraint](#on-the-from-scratch-constraint).
 
-| Module | Responsibility |
-|---|---|
-| `core` | storage primitives — aligned vectors, CSR/CSC matrices, spans, workspace arena |
-| `model` | the faithful `Problem`, the canonicalizer, the reversible transform stack |
-| `io` | MPS / LP / QPLIB readers, MPS writer |
-| `analysis` | matrix structure and conditioning report |
+```text
+$ solve tests/data/netlib/afiro.mps --method=concurrent
+concurrent: 4 engines on 4 threads
+  dual-simplex     NotConverged        0.001s  iters=13
+  pdlpx            Optimal             0.001s  iters=320      <-- winner
+  primal-simplex   Optimal             0.001s  iters=16
+  hsd              NotConverged        0.001s  iters=9
+status=Optimal
+objective=-4.6475314202e+02
+...
+```
 
-Downstream modules — residuals, KKT builder, linear solver, IPM loop — consume what
-this layer produces.
+(Engines that lose the race are stopped early, so `NotConverged` next to a
+loser means "cancelled", not "failed".)
 
 ---
 
-## Build
+## Contents
 
-Requires a C++20 compiler, CMake ≥ 3.24, and Ninja.
+- [What it can do](#what-it-can-do)
+- [Quick start](#quick-start)
+- [Which method should I use?](#which-method-should-i-use)
+- [How it works](#how-it-works)
+- [Results](#results)
+- [How the results are checked](#how-the-results-are-checked)
+- [Benchmarking it yourself](#benchmarking-it-yourself)
+- [On the "from scratch" constraint](#on-the-from-scratch-constraint)
+- [Repository map](#repository-map)
+- [References](#references)
+
+---
+
+## What it can do
+
+| Problem | Engines | Notes |
+|---|---|---|
+| **LP** — linear programs | dual simplex, primal simplex, PDLP, **cuPDLPx**, homogeneous self-dual interior point, GPU interior point, and a **concurrent** race of several of these | every engine returns the same `Optimal` / `Infeasible` / `Unbounded` verdicts in the model's original terms |
+| **MILP** — mixed-integer | branch-and-bound on the dual simplex | presolve, cutting planes, conflict analysis, propagation, primal heuristics (details below) |
+| **QP** — convex quadratic | GPU interior point | implemented and verified on small instances; not yet benchmarked at scale |
+
+**Input formats:** MPS (fixed and free), CPLEX LP, and QPLIB. `.mps.gz` works
+when zlib is installed.
+
+**The LP engines, one line each**
+
+| `--method=` | Algorithm | Runs on | Strength |
+|---|---|---|---|
+| `dual-simplex` | revised dual simplex: LU factorization, dual steepest edge, bound flipping, cost perturbation | CPU | exact vertex solutions; the most reliable engine on small and medium LPs |
+| `primal-simplex` | revised primal simplex on the same machinery | CPU | wins where the dual stalls; finishes dual runs as a cleanup |
+| `pdlp` | PDLP — primal-dual hybrid gradient with adaptive restarts (Applegate et al. 2021) | CPU or GPU | factorization-free: only matrix-vector products, so it scales to very large models |
+| `pdlpx` | **cuPDLPx** — reflected restarted Halpern PDHG (2025) | CPU or GPU | the newest first-order method here; the one to use on **large LPs on a GPU** |
+| `hsd` | homogeneous self-dual interior point (Andersen & Andersen) | CPU | proves infeasibility and unboundedness by construction |
+| `ipm` | primal-dual interior point, Mehrotra predictor-corrector | GPU | also solves convex **QP** |
+| `concurrent` | races dual simplex, cuPDLPx, primal simplex and HSD on separate cores; first verdict wins | CPU | you do not have to guess which engine suits the model |
+
+**MILP features** (all on by default, each with a flag to switch it off):
+presolve including column-removing reductions; Gomory mixed-integer and c-MIR
+cuts plus root cover/GCD cuts; conflict analysis; domain propagation;
+reliability branching; best-estimate node selection with plunging; and
+primal heuristics — simple rounding, diving, the feasibility pump and RENS.
+
+---
+
+## Quick start
+
+### 1. Build — CPU only (Windows or Linux)
+
+Needs a C++20 compiler, CMake ≥ 3.24 and Ninja.
 
 ```sh
 cmake --preset release
 cmake --build build
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure      # 28 test suites
 ```
 
-Other presets: `debug`, and `asan`.
+### 2. Build — with the GPU engines (Linux or WSL2 + CUDA toolkit)
 
-**C++20, not C++23**, deliberately: `nvcc` on Windows requires MSVC, whose C++23
-support lags. Core headers must compile under both MinGW g++ and MSVC/nvcc, so
-GCC-only builtins stay behind `#ifdef`.
-
-### "zlib NOT found" at configure time
-
-```
--- zlib NOT found: .mps.gz input will report UnsupportedFeature
+```sh
+export PATH=/usr/local/cuda/bin:$PATH
+cmake --preset cuda
+cmake --build build-cuda
+ctest --test-dir build-cuda --output-on-failure # 31 test suites
 ```
 
-**This is informational, not a warning, and the build is fine.** zlib is an
-*optional system dependency*, looked up with `find_package(ZLIB QUIET)`; it is
-not vendored in this repository.
+A CPU-only build still has every engine except the GPU ones, and says so
+plainly if a GPU method is requested.
 
-| | With zlib | Without zlib |
+### 3. Solve something
+
+```sh
+# let the solver race engines and keep the fastest verdict
+./build/tools/solve/solve tests/data/netlib/afiro.mps --method=concurrent
+
+# a mixed-integer model: branch-and-bound
+./build/tools/solve/solve model.mps --method=dual-simplex
+
+# a large LP on the GPU
+./build-cuda/tools/solve/solve big.mps --method=pdlpx --gpu-resident=1
+
+# every option, with its default and why
+./build/tools/solve/solve
+```
+
+The output is one `key=value` line per quantity — status, objective, iterations,
+residuals, and the time spent in each pipeline stage — so it is easy to read
+by eye and trivial to parse. On Windows the binary is `solve.exe`.
+
+---
+
+## Which method should I use?
+
+| Your model | Use | Why |
 |---|---|---|
-| `.mps`, `.lp`, `.qplib` | works | works |
-| `.mps.gz` (MIPLIB) | works | `UnsupportedFeature`, naming the cause |
+| Small or medium LP | `--method=concurrent` | Races several engines; measured **1.71×** faster than always using the best single engine (see [Results](#results)) |
+| **Large LP, GPU available** | `--method=pdlpx --gpu-resident=1` | Matrix-free, whole iteration on the GPU, replayed as CUDA graphs |
+| Large LP, CPU only | `--method=pdlpx` | Same algorithm on the CPU |
+| Mixed-integer | `--method=dual-simplex` | Runs branch-and-bound |
+| Convex QP | `--method=ipm` (CUDA build) | The interior-point path handles the quadratic term |
+| Need a certificate that the model is infeasible or unbounded | `--method=hsd` | The homogeneous embedding produces these verdicts by construction |
 
-Compressed input is **refused, never mis-parsed** — reading gzip bytes as text
-would silently produce a garbage model, which is worse than failing.
-
-Everything in the current test corpus is uncompressed Netlib, so zlib is not
-needed to build, test, or benchmark. Install it when you want MIPLIB (which
-ships `.mps.gz`, and is where the MILP and large instances live):
-
-```sh
-pacman -S mingw-w64-x86_64-zlib      # MSYS2 / MinGW
-sudo apt install zlib1g-dev          # Debian / Ubuntu
-```
-
-Re-run `cmake --preset release` afterwards; the line becomes
-`zlib found: gzip (.mps.gz) input enabled`. Alternatively just
-`gzip -d problem.mps.gz` and read the plain file.
-
-### ASan / UBSan on MinGW
-
-The `asan` preset needs sanitizer runtimes that MinGW-w64 GCC does **not** ship —
-`-fsanitize=address` fails at link time there. It works on Linux/macOS CI.
-
-The fuzz suite does not depend on it: `tests/fuzz/parser_fuzz.cpp` supplies its
-own detector by placing each input against a **guard page**, so any read past the
-end faults deterministically, and it verifies the guard actually faults before
-trusting a clean run.
+Nothing chooses the GPU for you: GPU engines are used only when you ask for
+them, so a run's hardware is always explicit.
 
 ---
 
-## Tools
+## How it works
 
-```sh
-# structure, bounds, dense columns, conditioning proxy for any model
-./build/tools/mpsinfo/mpsinfo.exe tests/data/netlib/afiro.mps
+Every engine sits in the middle of the same pipeline. Everything before and
+after it is shared, which is why all engines report answers in the same form.
 
-# dump the faithful AND canonical models as plain numbers
-./build/tools/modeldump/modeldump.exe tests/data/netlib/afiro.mps
-
-# parse throughput, bytes/nnz, peak RSS — read the spread column, see below
-./build/bench/parse_bench.exe
+```text
+ model file ─► parse ─► canonicalize ─► presolve ─► scale ─► ENGINE ─► undo scaling,
+ (MPS/LP/     (keeps     (one standard   (remove     (equilib-           presolve and
+  QPLIB)      what the    form, every     redundant   rate A)             canonical form
+              file said)  step recorded   rows and                        ─► answer in the
+                          so it can be    columns)                          model's own
+                          undone)                                           variables
 ```
 
-`modeldump` exists for debugging across the module boundary: when a downstream
-module misbehaves on an instance, its owner can dump exactly what the ingestion
-layer produced instead of running this whole pipeline to reproduce it.
+- **Two models, not one.** The parser keeps exactly what the file said. A
+  separate canonicalizer converts it to the solver's standard form and records
+  every transformation on a stack, so the final answer is reconstructed
+  exactly, including dual values and ranged rows.
+- **One canonical form for every engine:** equality rows first, inequality rows
+  with slacks, and variable bounds kept as bounds rather than turned into extra
+  rows (which would have grown some models by over 700%). The mathematics is
+  written down once, in [`docs/FORMULATION.md`](docs/FORMULATION.md).
+- **The GPU path keeps the whole iteration on the device.** For `pdlpx` the
+  iterate, the restart decision and the primal-weight update all live on the
+  GPU; each block of 40 iterations is issued as a single captured CUDA graph,
+  and the host reads results back only at termination checks.
+- **Deterministic.** GPU reductions use a fixed summation order (no atomics),
+  so a GPU run is reproducible bit for bit, and it takes the same number of
+  iterations as the CPU run of the same method.
 
 ---
 
-## Documentation
+## Results
 
-| Document | Contents |
+Measured on the development machine: a laptop with an NVIDIA **GeForce RTX
+3050 Laptop GPU (4 GB)**, CUDA builds under WSL2. Every number below is
+reproducible with the scripts in [Benchmarking it yourself](#benchmarking-it-yourself);
+the full measurement notes, including what did *not* work, are in
+[`module.txt`](module.txt).
+
+### Correctness on the Netlib LP library (99 models)
+
+| | |
 |---|---|
-| [`docs/FORMULATION.md`](docs/FORMULATION.md) | **The single source of mathematical truth.** Canonical form, sign conventions, residuals, the Newton system, step lengths, convergence, reduced systems. Do not restate these equations elsewhere — link here. |
-| [`docs/ARCHITECTURE-REVIEW.md`](docs/ARCHITECTURE-REVIEW.md) | Review of the team's handoff docs against PS 26119. Fifteen findings, ranked, with owners. |
-| [`docs/CANONICAL-FORM-ADDENDUM.md`](docs/CANONICAL-FORM-ADDENDUM.md) | The canonical-form decision, with row-growth measurements from our corpus. |
-| [`docs/MPS-FORMAT-NOTES.md`](docs/MPS-FORMAT-NOTES.md) | Format quirks and traps — RANGES, BOUNDS, the objective-constant sign, the `QUADOBJ` ½ factor. Every rule is a silent-wrong-answer trap in a real file. |
-| [`docs/LP-FORMAT-NOTES.md`](docs/LP-FORMAT-NOTES.md) | CPLEX LP dialect decisions and the three constructs that change a model rather than failing. |
-| [`docs/DATA-STRUCTURES.md`](docs/DATA-STRUCTURES.md) | Storage contracts and invariants. |
-| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Benchmark method, and **why parse-throughput numbers on this machine cannot support a small optimisation claim.** |
+| Pure-LP models in `tests/data/lp` | 94 |
+| Reached a correct verdict with the dual simplex | **94 / 94** — 93 `Optimal`, 1 `Unbounded` (`gas11`, which genuinely is) |
+| Limit | 240 s per model |
 
-The four `*.txt` files at the repository root are the team's shared specification
-(architecture, modules, datatypes, generation prompts), locked at v3.
+The remaining 5 of the 99 are mixed-integer models (`bell5`, `egout`,
+`flugpl`, `gt2`, `rgn`), for which the engines above solve the LP relaxation
+and branch-and-bound solves the integer problem.
 
----
+### The concurrent race
 
-## Design decisions worth knowing before you use this layer
+Over 17 Netlib models, racing the engines was **1.71× faster** than always
+running the single best engine (dual simplex: 3.015 s total → race: 1.760 s),
+because no single engine wins everywhere — on one model the spread between the
+fastest and slowest engine was over 3000×. *(Measured when PDLP held the
+first-order slot in the race; it is now cuPDLPx.)*
 
-**Two-layer model.** `Problem` stores what the file said — ranged rows, general
-bounds, maximization, objective constants, integrality flags. A separate
-`Canonicalizer` produces the solver's working form and records a reversible
-transform stack. A loader restricted to `Ax ≤ b, x ≥ 0` cannot usefully read a
-single Netlib or MIPLIB instance.
+Honest limit: on the very largest models the racing engines compete for memory
+bandwidth, and the race was measured about 2× slower than the dual simplex
+alone on `dfl001`, `fit2p` and `pilot87`.
 
-**The canonical form is bounded-variable**, not `Ax = b, x ≥ 0`:
+### First-order methods on the GPU
 
-```
-minimize    ½xᵀQx + cᵀx
-subject to  A_E x       = b_E        equality rows first, no slack
-            A_I x + s   = b_I,  s ≥ 0
-            l ≤ x ≤ u                bounds stay bounds
-```
+On `datt256` (262,000 columns, 95 MB):
 
-Finite variable bounds stay **native**. Turning each `x ≤ u` into a constraint row
-grew the reduced system by +750% rows on `rgn` and +648% on `gt2` — for a model
-that did not change. `A_E` and `A_I` are contiguous row blocks of one matrix, so
-`Ax` and `Aᵀy` stay single kernel calls.
-
-**The canonicalizer guarantees a startable model.** Its output is either usable by
-an interior-point method or a definite infeasibility verdict:
-
-- no column has `l == u` — a fixed column admits no strictly interior point, since
-  `(x−l) + (u−x) = u−l = 0`. 1067 such columns across the 19-instance corpus.
-- no row of `A` is all-zero — that is an exact zero pivot in `AΘAᵀ`, unreachable by
-  regularization. Consistent ones are dropped; `0 = 5` returns `PrimalInfeasible`.
-
-`CanonicalProblem::is_ipm_startable()` exposes the same `O(m+n+nnz)` check, because
-the canonicalizer is not the last stage to touch the model — presolve creates new
-empty rows.
-
-**Rows are `[row_lower, row_upper]`**, not sense + rhs. Collapses `L`/`G`/`E`/`N`
-and `RANGES` into one representation and removes a class of sign bugs.
-
-**`A` is stored in both CSR and CSC.** Every IPM iteration needs `Ax` *and* `Aᵀy`;
-computing the latter from CSR alone needs GPU atomics or a cache-hostile scatter.
-Measured cost: 24.5 bytes/nonzero for both orientations.
-
-**Storage orientation and memory space are types, not runtime fields.** A runtime
-`(format × location)` pair puts a four-way branch inside every kernel.
-
-**Dense matrices are column-major**, matching cuBLAS and LAPACK.
-
-**The inequality-slack dual is eliminated as `w_s = −y_I`**, not stored. It is not
-an independent quantity, and a stored copy can drift from `−y_I` under rounding.
-A `slack_dual(y) = −y` helper keeps sign tests reading positively. Verified against
-HiGHS that this convention already matches standard reporting signs, so no global
-normalization is applied. See `FORMULATION.md` §4.
-
----
-
-## Verification
-
-| Layer | What it catches |
+| Configuration | Engine time |
 |---|---|
-| Unit tests | Every documented format trap, against values computed from the spec |
-| Property tests | Canonicalize → check → invert, over random and hand-built points (2678 assertions) |
-| Round-trip | `parse → write → parse` — all 19 instances bit-exact |
-| Fuzzing | 300k mutated inputs, guard-paged, zero crashes |
-| **External oracle** | Both models solved by **HiGHS**, checked against Netlib's published optima |
+| PDLP on the CPU | 25.15 s |
+| PDLP on the GPU | 6.70 s |
+| cuPDLPx on the CPU | 5.84 s |
+| **cuPDLPx on the GPU** | **2.2 s** |
 
-11 suites, 3455 assertions. The oracle is the only layer that does not check this
-code against itself:
+What made the GPU path fast, each step measured separately:
 
-```sh
-python scripts/oracle_check.py ./build/tools/modeldump/modeldump.exe tests/data/netlib
-```
+- **cuPDLPx's algorithm** itself needed 4.8× fewer matrix passes than PDLP on
+  the 13 Netlib models both solved, and solved 3 that PDLP could not.
+- **Estimating ‖A‖₂ on the GPU** instead of through host copies removed about
+  0.5 s of start-up on `datt256`.
+- **CUDA graphs** — replaying each 40-iteration block as one launch — cut
+  kernel launches 40× and made the GPU **3.3–4.8× faster** on medium models
+  (e.g. `stair` 23.1 s → 5.4 s), with results **bit-identical** to launching
+  the kernels one by one.
 
-9 of 11 published optima match exactly; 13 of 13 canonical forms reach the same
-optimum as their parsed model. The two deviations are archive drift — Netlib's
-values come from MINOS 5.3 on a VAX in 1988 — and are recorded per-instance with
-the measured deviation rather than absorbed by a loosened tolerance.
+On small models (a few thousand variables) the CPU remains faster: a GPU run
+pays about 1.5 s of fixed start-up. That is why the GPU is opt-in and why
+`concurrent` is the recommendation for small and medium models.
 
-**Benchmark numbers need care.** Repeated runs of an identical binary over
-identical input measured 24, 41, 56, 82 and 85 MB/s on this machine. The benchmark
-reports that spread instead of hiding it behind a best-of-N; do not quote an
-improvement smaller than it. Stable figures — bytes/nonzero, peak RSS, cache hit
-rates — can be quoted directly. See `docs/BENCHMARKS.md`.
+*Note on these timings:* on 2026-09-27 the cuPDLPx defaults were changed to
+published constants (see below); the timings above were taken with the
+previous defaults. Re-run `scripts/benchmark.py --paper --gpu` for current
+numbers.
 
----
+### What a larger GPU should change
 
-## Architecture enforcement
-
-The module dependency graph is
-
-```
-core  ←  model  ←  io
-core  ←  analysis
-model ←  io
-```
-
-and it is **checked mechanically**, not by convention. `scripts/check_layering.py`
-scans the actual `#include` edges and runs as a ctest case, so a violation fails
-the build like a compile error. CMake targets alone cannot enforce this, since
-every module exposes the same `include/` root.
+Not measured here — a prediction, stated as one. PDLP-type methods spend
+their time streaming the matrix from memory, so they are limited by memory
+bandwidth: roughly 190 GB/s on the development GPU against 1.5–2 TB/s on an
+A100, which suggests a large speed-up per iteration on large models. An A100's
+40–80 GB of memory also fits models that do not fit in 4 GB. Small models and
+file loading, which run on the CPU, would not change.
 
 ---
 
-## Solver core (Modules 5-20, 23)
+## How the results are checked
 
-**There are three LP engines, from three different algorithm families.**
+- **Engines against each other.** PDLP and cuPDLPx are tested against the
+  exact answer of the simplex on the same models, and the concurrent race
+  against each engine run alone — racing may change how fast the answer
+  comes, never what it is.
+- **Against published answers.** `scripts/oracle_check.py` compares against
+  Netlib's published optimal values and against an independent solver used
+  purely as a reference (below).
+- **Against brute force.** Mixed-integer tests compare branch-and-bound with
+  exhaustive enumeration, for every branching rule.
+- **GPU against CPU.** Every GPU operation is tested against its CPU
+  counterpart, step by step, including across restarts; CUDA graph replay is
+  tested for bit-identical results.
+- **Mutation testing.** For key components, deliberately broken versions were
+  run against the tests to confirm the tests actually catch the breakage.
+- **Fuzzing.** The file readers survived 300,000 mutated inputs with no
+  crashes.
+- **Architecture.** A test fails the build if any module includes code from a
+  layer it should not depend on.
 
-| Engine | `--method=` | Family | Where |
-|---|---|---|---|
-| **Interior point** (Modules 5-20) | `ipm` (default) | Second-order, matrix-free Krylov | `src/solver/gpu/`, needs CUDA |
-| **Revised simplex** (Module 23) | `dual-simplex`, `primal-simplex` | Active-set, factorized basis | `src/solver/simplex/`, host-only |
-| **PDLP** (Module 24) | `pdlp` | First-order, no factorization at all | `src/solver/pdlp/`, host-only |
+Current state: **28/28** test suites pass on the CPU build and **31/31** on
+the CUDA build.
 
-They are not interchangeable and are not meant to be. The simplex terminates at
-an exact vertex and warm-starts across a bound change, which is the only reason
-a branch-and-bound node is cheap. The IPM converges in a near-constant
-iteration count and is the only path that handles QP. PDLP never factors
-anything -- its inner loop is one `K` and one `K'` product and nothing else --
-which is what lets it reach sizes the other two cannot, at lower accuracy per
-iteration.
+### Where the constants come from
 
-**Current standing on the 19 local Netlib instances** (measured 2026-09-14; the
-corpus contains one genuinely unbounded model, `gas11`, so 19 correct answers
-means 18 `Optimal` plus one `Unbounded`):
-
-| | correct verdicts | notes |
-|---|---|---|
-| Dual simplex | **19 / 19** | exact vertex; every objective matches the published table |
-| Primal simplex | **19 / 19** | same answers, different pivot counts |
-| PDLP | **18 / 19** | `greenbea` unsolved; all others match the simplex |
-| Interior point | 6-7 / 19 | plus no ability to report `Infeasible` or `Unbounded` at all -- see Module 25 |
-
-Three of the four engines have no CUDA dependency, so `cmake --preset release`
-on native Windows -- no WSL2, no CUDA toolkit -- produces a working `solve`
-binary and runs 22 of the 24 test suites. That was not true before Module 23:
-`tools/solve` was hard-gated on `if(TARGET sovsolve_solver_gpu)`.
-
-### Verdicts the solver could not produce at all before Module 23
-
-`SolverStatus::Infeasible` used to come only from the canonicalizer, and
-`SolverStatus::Unbounded` was an enum value nothing ever returned. Both are now
-reachable, by three independent routes, and the three catch different things:
-
-- **Presolve** -- structural, by inspection. Only sees what is visible in the
-  matrix; two rows that contradict each other *jointly* are invisible to it.
-- **Simplex** -- combinatorial. A failed ratio test *is* the proof, and the
-  certificate is a row of `B^-1` the test had already computed.
-- **PDLP** (Module 24) -- analytic and asymptotic, from the direction the
-  iterates diverge in. No event fires; it has to be asked, and can only ever
-  say "to within a tolerance".
-
-And once you have a certificate, **Module 26** turns it into an *irreducible
-infeasible subsystem* -- not "this model is infeasible" but "these rows
-contradict each other, and dropping any one makes the rest satisfiable".
-
-### Interior-point path
-
-The interior-point solver itself -- Scaler, Initializer, KKT builder, linear
-solver, predictor-corrector loop, and everything downstream of it -- lives
-under `include/sovsolve/solver/` and `src/solver/`. *(The paragraph below
-describes an early state of this module and is kept for history; the linear
-solver in particular has since been replaced -- see the correction after it.)*
-It was at that point a
-**skeleton**: types and module boundaries exist and compile, and a few
-modules have real algorithm code -- `Initializer` (Module 6, a bound-midpoint
-strictly-interior starting point), `gpu::compute_residuals` (Module 7, the
-six Newton-system residuals -- currently host-executed, see the header
-comment on `gpu/ResidualCalculator.hpp` for why), `gpu::build_kkt` (Module 9,
-the augmented/quasi-definite KKT system derived from `FORMULATION.md`
-sections 7 and 10.2 -- assembly only, no factorization yet), `gpu::solve`
-(Module 12, an actual GPU factorization via `cusolverDnDgetrf`/`Dgetrs` --
-the first code in this project that runs real work on the GPU rather than
-just compiling under `nvcc`), `gpu::recover_newton_direction` (Module 13,
-un-eliminating `ds`/`dz`/`dv` from the augmented solve's `[dx; dy]`),
-`Regularization` (escalate/decay bookkeeping), `Diagnostics` (CSV/JSON
-export) and `Logging`. Everything else -- step length, state update, mu
-control, the predictor-corrector loop itself -- still returns
-`ErrorCode::NotImplemented`.
-
-`recover_newton_direction`'s test (`solver_gpu_algorithms_test.cpp`) verifies
-the recovered directions against the *original* six-block Newton system
-(`FORMULATION.md` 7), not just by re-deriving the same formulas the
-implementation uses. That surfaced a real, exactly-quantifiable gap: since
-`build_kkt` regularizes the (1,1)/(2,2) diagonal blocks with `delta_p`/
-`delta_d`, the solved `(dx, dy)` satisfy the *regularized* system, not the
-true one, by precisely `-delta_p * dx_j` (row 1) and `-delta_d * y_I * dy_I`
-(row 6) -- exactly the gap `FORMULATION.md` 10.1's iterative-refinement
-requirement exists to correct. The test asserts that exact relationship
-rather than a loosened tolerance.
-
-`gpu::compute_step_lengths` (Module 14, `FORMULATION.md` 8) and
-`gpu::apply_step` (Module 15) are also real -- the separate primal/dual
-ratio tests, the `eta` safety factor, and the equality-row `y` exclusion
-from the dual ratio test (an unrestricted-sign quantity has no ratio to
-test).
-
-**A full Mehrotra predictor-corrector iteration now runs**:
-`gpu::update_mu`/`gpu::compute_mu_at_trial_point` (Module 16) and
-`gpu::run_iteration` (Module 8, `include/sovsolve/solver/gpu/
-PredictorCorrector.hpp`) orchestrate every module above into one real IPM
-step -- affine solve, affine step lengths at `eta=1`, `mu_aff`, `sigma =
-clamp((mu_aff/mu)^3, 0, 1)`, the corrector residuals with Mehrotra's
-second-order cross terms folded in by hand, corrector solve, final step
-lengths at the real `eta`, state update. `solver_gpu_algorithms_test.cpp`
-checks this isn't just plumbing: it runs one full iteration on a small LP and
-confirms the primal residual actually shrinks afterward -- a real Newton
-step toward feasibility, not just a function that returns `Status::Ok()`.
-
-Two things worth knowing:
-- `PredictorCorrector` lives under `gpu/`, not `src/solver/` directly --
-  it calls GPU-boundary functions, so (like every other module that does)
-  it belongs in `sovsolve_solver_gpu`. `RegularizationController`
-  (`Regularization.hpp`) became header-only so this doesn't create a link
-  cycle between the host and GPU solver libraries; see that header's
-  comment for the full reasoning.
-- Module 8's "reuse structure where valid" (module.txt) -- reusing the
-  affine solve's factorization for the corrector solve -- is **not**
-  implemented. The dense cuSOLVER stopgap (`LinearSolver.hpp`) factorizes
-  from scratch both times; real reuse needs the sparse solver this project
-  does not have yet.
-
-**A real `solve_problem()` entry point now exists and returns correct
-answers.** `gpu::solve_problem` (`include/sovsolve/solver/gpu/Solve.hpp`) is
-the whole pipeline: `canonicalize -> scale -> initialize -> [run_iteration +
-ConvergenceChecker] -> reconstruct_solution`. `ConvergenceChecker` (Module
-18, `FORMULATION.md` 9) is real now too -- the three relative infinity-norm
-criteria, explicit NaN guards (a poisoned residual reports `NumericalError`
-directly rather than silently running to `MaxIterations`), and stall
-detection. On stall or the iteration limit the returned `Solution` is the
-best iterate seen, not the last one, with `from_best_iterate` set.
-
-**Solution mapping itself was not rebuilt here** -- it already existed,
-correct and tested, as part of the ingestion layer:
-`model::recover_solution()` (`Canonicalizer.cpp`) handles primal/dual
-recovery, the sign flips for negated rows, reduced-cost reconstruction for
-substituted columns, and bound-violation checking against the *original*
-problem, and `solver::reconstruct_solution()` is a thin wrapper over it. The
-only new piece was packaging a `SolverState` into a canonical-space
-`Solution` for that existing function to consume.
-
-`solver_gpu_algorithms_test.cpp`'s capstone test calls `solve_problem()` on
-a small LP (`min x1+x2` s.t. `x1+x2=10`, `0<=x1,x2<=8`) and checks the
-result reaches `SolverStatus::Optimal` with the correct objective and a
-feasible point -- the first test in this project that exercises the entire
-pipeline through the public entry point rather than one module at a time.
-
-Two more architecture notes from this pass:
-- `gpu::Solve` needed both host-only functions (`canonicalize`,
-  `initialize`, `ConvergenceChecker`, `reconstruct_solution`) and
-  `gpu::run_iteration`, so `sovsolve_solver_gpu` now links `sovsolve_solver`
-  -- a one-way edge (`src/solver/CMakeLists.txt` explains why it's safe and
-  `sovsolve_solver` must not link back).
-- What's left before this is a *complete* solver: the normal-equations LP
-  path (Module 9's cheaper alternative), a sparse (not dense) linear solver,
-  iterative refinement, and `Unbounded`/`Nonconvex` detection -- none of
-  which block a correct answer on a well-behaved small problem, all of
-  which matter for real Netlib/MIPLIB-sized instances.
+The first-order methods have tuning constants, and the policy is that each
+default is **either taken from a published paper or measured here and
+documented as such** — never quietly guessed. For cuPDLPx: the step size,
+reflection and tolerances are from the cuPDLPx paper; the restart constants
+and the primal-weight rule are from HPR-LP, which has been proven to generate
+exactly the same iterates as cuPDLPx under the settings used here. Each
+choice, and the measurement behind it, is written next to it in
+[`include/sovsolve/model/Options.hpp`](include/sovsolve/model/Options.hpp).
 
 ---
 
-## Running against real benchmarks -- status
-
-The pipeline had never been run on an actual Netlib instance before this
-pass (every earlier test was a hand-built toy problem). It doesn't converge
-yet. `tools/solve` (below) exists specifically to make this checkable.
-
-**`Scaler` (Module 5) is now real** -- alternating geometric-mean row/column
-scaling (`Scaler.hpp`/`.cpp`), applied to `A`, `Q`, `b`, `c`, and both bound
-vectors, with the inversion (`x = col_scale*x'`, `y = row_scale*y'`,
-`z = z'/col_scale`, `v = v'/col_scale`) implemented in
-`model::recover_solution()` itself -- not in a wrapper, per the
-`TransformStack`'s own original design (scaling records push onto the same
-stack canonicalization does, keyed by *canonical* index since scaling runs
-after canonicalization). The objective computation is scale-invariant only
-for a matched scaled/unscaled pair, which caught a real mismatch risk while
-writing it -- documented in the code where it's easy to reintroduce.
-Confirmed correct: the existing full-pipeline test (`min x1+x2` s.t.
-`x1+x2=10`) still reaches the exact right answer with real scaling now
-active, not the identity no-op it exercised before.
-
-**Scaling alone did not fix `afiro`** (the smallest Netlib LP, 27 rows, 32
-columns, all lower-bounded columns, a mild 22.7x coefficient range --
-structurally simple). `mu` exploded geometrically (iteration 9 reached
-`1e10`) and step lengths stayed pinned near zero. A synthetic problem mixing
-equality and inequality rows (something no earlier test did) converges
-perfectly with the same code, which ruled out a row-type indexing bug.
-
-**Root-caused, not guessed**: dumped the actual KKT matrix at two points and
-checked both against an independent `numpy` solve. At iteration 0 (affine
-solve), `cond(A) = 17` -- well-conditioned, and the GPU solution matched
-`numpy` to `1e-13`, confirming `KktBuilder`/`LinearSolver`/`NewtonRecovery`
-are all correct. At iteration 8's corrector solve, `cond(A) = 1.65e15` --
-past double precision's ~1e16 noise floor. `cusolverDnDgetrf` reported
-`info=0` (no error) the entire time; the returned "solution" (magnitude
-~1e11) was pure rounding noise, not signal, and that's exactly where `mu`
-jumped from `6e6` to `1.46e10`. Mechanism: `Theta^-1_j = z_j/(x_j-l_j)` grows
-legitimately as a bound-hugging variable's dual rises, and nothing
-counteracted it -- `RegularizationController.escalate()`/`.decay()` were
-tested in isolation but had zero call sites in `PredictorCorrector.cu` or
-`Solve.cu`; `delta_p`/`delta_d` sat at the `1e-8` floor for the whole solve.
-
-**Fixed**: `solve()` (`LinearSolver.cu`) now reports the Dgetrf factor's pivot
-growth ratio (`max|U_ii| / min|U_ii|`, read off the factor for free via a
-strided `cudaMemcpy2D` -- no extra solve) as `LinearSolveResult::pivot_ratio`.
-`solve_newton_system` (`PredictorCorrector.cu`) checks it against
-`Options::IpmOptions::max_pivot_ratio` (default `1e10`): over that, it calls
-`regularization.escalate()` and refactors with the larger delta (looping
-until clean or `escalate()` reports `delta_max` reached, at which point it
-reports `NumericalError`); under that, it calls `regularization.decay()`.
-`IterationRecord::regularization_events` is now wired to the count. Verified:
-all 13 tests still pass (including the 117-check GPU algorithms suite,
-unchanged), and on `afiro`, `mu` no longer explodes -- it plateaus around
-`1e5` instead of reaching `1e10`.
-
-**`afiro` didn't converge with escalation alone**, and that turned out to be a
-genuinely different, now-isolated problem: instrumented `compute_step_lengths`
-to report which variable/slack binds the primal ratio test each iteration.
-One inequality-row slack's ratio geometrically collapsed every iteration it
-bound (`s=1.25 -> 6.3e-3 -> 3.1e-5 -> 1.6e-7 -> ...`) while its Newton
-direction (`ds`) stayed large-negative (~-40 to -400) at every single step --
-the corrector kept trying to overshoot past that slack's bound, the ratio
-test correctly clipped it, but the step never settled near the boundary.
-`sigma` was pinned at `1.000` (full centering -- Mehrotra's heuristic
-correctly detecting the affine step was making things worse) for most of the
-run, so this wasn't a missing-centering bug; centering was already maximally
-conservative and it still wasn't enough.
-
-**Root cause, confirmed by instrumenting the actual cross-term values**: the
-Mehrotra second-order correction (`rxz/ruv/rsy += dx_aff .* dz_aff` etc.,
-`PredictorCorrector.cu`) is a Taylor-expansion remainder -- theoretically
-`o(mu)`, a small refinement on top of the `sigma*mu` target. With nothing
-bounding it, on a degenerate pair (the affine step itself already extreme --
-exactly what a crude `x_j=1` start produces) it can be 1-2+ orders of
-magnitude larger than `mu` itself and completely override the target instead
-of refining it. Confirmed on afiro: cross terms of `-5.2e3` against `mu=1.0`,
-and `1.0e6` against `mu=5.9e4`, at precisely the pair whose step length
-collapsed. **Fixed**: each cross term is now clamped to `[-mu, mu]` before
-being added -- keeps it a refinement, matches its theoretical role, doesn't
-touch the base `sigma*mu` target at all. `afiro` now reaches `Optimal` in 15
-iterations, `obj=-464.75314223` against the published `-464.75314286`.
-
-**Two more real bugs found by running the full 19-instance local Netlib set**
-(not just afiro) after the fix above, rather than assuming one fix cures
-everything:
-
-1. `Solve.cu`'s `dual_obj` was just `b'y`. Derived from the same six-block
-   system (substituting stationarity + primal feasibility into `c'x`): at
-   convergence `c'x -> b'y + l'z - u'v - x'Qx`, not `b'y` alone. Any problem
-   with a finite, active bound (nearly all of them) has a permanent,
-   unclosable "gap" with the old formula even at a truly optimal point --
-   `avgas`/`egout`/`rgn` all hit residuals at `~1e-12` yet reported
-   `NotConverged` purely because of this. Fixed: `dual_objective()` now
-   includes `l'z - u'v` (finite-bound terms only) and `-x'Qx` for QP.
-2. `PredictorCorrector.cu` treated "pivot ratio still high at `delta_max`" as
-   fatal (`NumericalError`), discarding the whole solve. But architecture.txt's
-   "at delta_max with factorization still failing" means exact singularity
-   (already a separate, hard `Expected` failure from `solve()`) -- a merely
-   still-elevated pivot ratio at `delta_max` is the *expected*, harmless
-   terminal-phase signature of a converging point (`Theta^-1` naturally spikes
-   for a tightly-bound variable right at the solution) far more often than a
-   real breakdown. `avgas`/`egout`/`rgn` were one iteration from `Optimal` and
-   got hard-aborted by this. Fixed: accept the direction instead of erroring;
-   the outer loop's best-iterate tracking is what actually guards against a
-   bad step doing damage. (Also fixed, same investigation: `Solve.cu` used to
-   discard the whole solve -- including an already-excellent best iterate --
-   the instant `run_iteration` returned any error. It now falls back to the
-   best iterate found so far, same philosophy the code already used for a
-   stall.)
-
-**A third, separate crash** turned up on `shell.mps` after the above:
-`mu_aff`/`sigma` went `NaN` at iteration 56, right as `mu` reached `9.66e-12`
--- the edge of double precision for this problem's scale. Root cause: as a
-complementarity gap (`x-l`, `u-x`, or `-y_I`) shrinks toward that noise floor,
-`x + alpha*dx` can round to *exactly* the bound, turning `z/(x-l)` (or the
-analogous terms in `KktBuilder.cu`'s RHS and `NewtonRecovery.cu`'s `dz`/`dv`)
-into a genuine `0/0 = NaN` that silently poisons the whole KKT system --
-and NaN comparisons are false, so the step-length ratio test doesn't catch
-it either; it just poisons the state via the next `apply_step`. Fixed: a
-`safe_gap()` helper (`SolverState.hpp`, next to `slack_dual()`) floors these
-gaps at `1e-30` before they're used as a divisor -- far below any legitimate
-gap, so it only ever engages at the precision floor. `shell.mps` no longer
-crashes; it now reaches `Optimal` (with `--stall=40`) matching the published
-`1.2088253460e9`.
-
-**Current state, the full local 19-instance Netlib set.**
-
-**The corpus contains one genuinely unbounded model.** `gas11` has no
-published optimum and HiGHS also reports it unbounded, so a perfect score is
-**18 `Optimal` plus one `Unbounded`**, not 19 `Optimal`. Stated explicitly
-because an earlier revision of this table said "19/19 reach `Optimal`", which
-was shorthand for "19/19 correct" and read as something stronger than the truth.
-
-| | IPM | dual simplex | primal simplex | PDLP | HSD |
-|---|---|---|---|---|---|
-| `Optimal` | 6-7 | **18** | **18** | 17 | 17 |
-| `Unbounded` on `gas11` | never | yes | yes | yes | yes |
-| **correct verdicts** | 6-7 / 19 | **19 / 19** | **19 / 19** | **18 / 19** | **18 / 19** |
-| unsolved | 12-13 | none | none | `greenbea` | `greenbea` |
-
-**HSD** (`--method=hsd`, `module.txt` section 25) is the homogeneous self-dual
-embedding: the same interior-point *family* as the IPM column, and the reason
-that column is 6-7 rather than 18. It is a fourth engine rather than a flag on
-the IPM because the IPM is GPU-resident and the embedding is host-only.
-
-**`gas11` is the one row of this table to read carefully.** Every engine's
-`Unbounded` there is **presolve's** verdict, not the engine's -- all of them
-report it at iteration 0. HSD *can* detect unboundedness, which the IPM cannot,
-but no instance in this corpus is where that gets demonstrated; the unit tests
-in `homogeneous_solve_test` are.
-
-Every simplex objective was cross-checked against `scripts/oracle_check.py`'s
-published table, including its two documented archive-drift entries --
-`80bau3b` (8.1e-6) and `greenbea`, where our `-7.2555248130e+07` matches the LP
-DASA / HiGHS value rather than the 1988 archive's `-7.2462405908e+07`. PDLP's
-converged objectives match the simplex's to 6-8 significant digits.
-
-Neither simplex engine dominates the other: `stair` takes 569 primal pivots
-against 3357 dual, while `80bau3b` takes 5546 dual against 19201 primal. That
-is the ordinary reason production solvers keep both, and it is why
-`--primal-cleanup` (on by default) runs the dual and then hands its final basis
-to the primal.
-
-PDLP is a first-order method and behaves like one: it needs far more iterations
-than the simplex needs pivots (`afiro` ~640 KKT passes against a handful of
-pivots) and tails off near the optimum rather than terminating at a vertex.
-What it buys is that nothing is ever factored, which is the only reason it has
-any claim on this hardware at all -- and that claim is still **unmeasured**,
-because the cuSPARSE backend and the large-instance A/B have not been built.
-See `module.txt` section 24, "Not done".
-
-*IPM, for comparison* (default settings, `--max-iter=300`): **6 reach
-`Optimal`** (`afiro`, `avgas`, `chip`, `egout`,
-`flugpl`, `rgn`) -- `shell` makes 7 with a slightly relaxed `--stall`. Several
-more are essentially converged but plateau just above the `1e-8` tolerance
-even given 4x more iterations (`stair` gap `~7e-6`, `bell5` `~9e-5`,
-`etamacro`/`25fv47`/`standata` `~2-5e-4`) -- genuinely stuck, not just cut off
-early, so this is a different remaining gap, not yet root-caused.
-`adlittle`/`e226`/`gt2`/`israel` are still far from converged. `gas11`'s
-objective runs away to `-7.5e10` while staying nearly primal-feasible --
-looks like an undetected unbounded-dual direction (`SolverStatus::Unbounded`
-exists but `ConvergenceChecker` never returns it), an architectural gap, not
-a quick fix. `80bau3b`/`greenbea` time out -- almost certainly just the dense
-`O(dim^3)` stopgap being too slow for their size, not a correctness issue.
-
-### Tuning without rebuilding
-
-`tools/solve` now takes `--flag=value` overrides for every field on
-`Options` -- `--eta`, `--sigma`, `--predictor-corrector`, `--pfloor`/
-`--dfloor`, `--escalation`, `--decay`, `--delta-max`, `--max-pivot-ratio`,
-`--refine`, `--max-iter`, `--stall`, `--tol-primal`/`--tol-dual`/`--tol-gap`,
-`--time-limit`. Positional `max_iterations` still works for backward
-compatibility. `--help` prints the full list with defaults and the
-`Options.hpp` field each maps to. Output always ends with
-`solve_time_seconds=...`, meant to be the thing tuning is measured against.
-
-### `tools/solve` -- CLI entry point for testing against real files
+## Benchmarking it yourself
 
 ```sh
-# host-only build, no CUDA toolkit needed (simplex and PDLP)
-./build/tools/solve/solve tests/data/netlib/afiro.mps --method=dual-simplex
-./build/tools/solve/solve tests/data/netlib/afiro.mps --method=primal-simplex
-./build/tools/solve/solve tests/data/netlib/afiro.mps --method=pdlp
-
-# CUDA build (adds the interior-point default)
-./build-cuda/tools/solve/solve tests/data/netlib/afiro.mps [max_iterations]
+python scripts/benchmark.py                   # Netlib, default settings, one CSV
+python scripts/benchmark.py --compare         # every engine side by side
+python scripts/benchmark.py --gpu             # CPU vs GPU
+python scripts/benchmark.py --paper           # the cuPDLPx paper's own protocol
+python scripts/benchmark.py --corpus mip --node-limit 2000
 ```
 
-Loads a model file, solves it, and prints status/objective/iterations/quality
-in a form a benchmark script can parse.
-
-`--method=ipm|dual-simplex|primal-simplex|pdlp` selects the engine; `ipm` is
-the default and is **compiled out** when `SOVSOLVE_ENABLE_CUDA` is off, since
-`solve_problem()` needs the GPU library.
-
-- **Simplex:** `--simplex-max-iter`, `--pivot-tolerance`, `--pivot-floor`,
-  `--refactor-interval`, `--artificial-bound`, `--primal-cleanup`,
-  `--bound-flipping`, `--simplex-tol-primal`, `--simplex-tol-dual`.
-- **PDLP:** `--pdlp-tol`, `--pdlp-max-iter`, `--pdlp-check-interval`,
-  `--pdlp-cert-tol`, and one switch per enhancement so the paper's own ablation
-  is reproducible from the command line -- `--pdlp-adaptive`,
-  `--pdlp-restart`, `--pdlp-primal-weight`, `--pdlp-infeasibility`. Every
-  before/after figure in `module.txt` section 24 was produced with these.
-- **Scaling:** `--scaling=geometric|ruiz`. `ruiz` is implied by
-  `--method=pdlp` (its convergence depends on the preconditioning far more
-  directly than a factorization-based method's does); pass `--scaling=` *after*
-  `--method=` to override.
-
-On a PDLP run the tool additionally prints `matrix_products` and `kkt_passes`.
-That is the metric to compare against, not `iterations`: the adaptive step size
-spends several matrix products on a single iteration when it retries a rejected
-trial step, measured at ~1.53 passes per iteration against the fixed rule's
-~1.03, so iteration counts overstate every improvement by roughly 1.5x.
-
-The tool is no longer gated on the GPU library existing -- it builds against
-`sovsolve_solver` alone and only links `sovsolve_solver_gpu` when that target
-is present. Per-iteration
-diagnostics print by default (`LogOptions::Level::Iteration`, `Options`'s own
-default) -- `Logging.cpp`'s line now includes `mu`, `mu_aff`, `sigma`, and
-both residuals, which is what made the `afiro` trajectory above visible in
-the first place; `Level::Debug` additionally adds factor/solve/refine timing.
-
-`build_kkt` always selects the augmented path (`ReductionType::
-QpAugmentedKkt`); the normal-equations LP path (`FORMULATION.md` 10.1) needs
-a sparse `A * Theta * A^T` product this pass does not build, and is deferred.
-
-**Correction (2026-09-13):** the paragraph below describes the dense cuSOLVER
-stopgap, which is no longer the production path. `src/solver/gpu/LinearSolver.cu`
-now implements matrix-free Krylov solves -- `solve_spd_cg` (CG on the normal
-equations, IC(0)-preconditioned) and `solve_minres` (MINRES on the augmented
-KKT) -- and those are what a solve actually uses. `solve_dense`/`solve_spd_dense`
-survive as the reference implementations the Krylov solvers' algebra is tested
-against, which is why they are still in the file. `docs/HIGHS-COMPARISON.md`
-section 2 describes the current design; this paragraph is the stale one. Kept
-here rather than deleted so the history is legible:
-
-`gpu::solve` was a deliberate stopgap, documented in full in
-`gpu/LinearSolver.hpp`: it converts the sparse KKT matrix to **dense**
-(`O(dim^2)` memory, `O(dim^3)` time -- fine for small test problems, not for
-a real Netlib/MIPLIB instance) and factorizes with cuSOLVER's classic
-**general LU** rather than the symmetric-indefinite `LDL^T` the quasi-definite
-structure could exploit, because `getrf`/`getrs` are the most stable, longest-
-standing dense solve pair in cuSOLVER's API. No `cuDSS` is installed on the
-development machine, and a from-scratch sparse `LDL^T` factorization (fill-
-reducing ordering, elimination tree, numerical factorization) is separate,
-substantial work -- this stopgap exists so the rest of the pipeline has a
-real solve to build against in the meantime. Iterative refinement is not yet
-implemented (`refinement_passes` is always `0`): `FORMULATION.md` 10.3
-specifies refinement against the **unregularized** residual, which needs the
-true Newton system's residual, not just the factored (regularized) matrix's
-own residual -- deferred, not approximated.
-
-The GPU-boundary modules (`src/solver/gpu/*.cu` -- residuals, KKT assembly,
-ordering, linear solve, Newton recovery, step length, state update, mu
-control) are written directly as CUDA C++ from the start, per
-`architecture.txt`'s GPU-boundary text. They only build under
-`SOVSOLVE_ENABLE_CUDA=ON` (the `cuda` CMake preset, targeting WSL2 + the
-Linux CUDA toolkit -- `nvcc` on native Windows needs MSVC as its host
-compiler, which this project avoids). The host-only build
-(`release`/`debug`/`asan` presets) stays fully self-contained without the
-CUDA toolkit present.
-
-```sh
-cmake --preset cuda && cmake --build build-cuda   # WSL2, CUDA toolkit installed
-```
-
-**Deviation from the locked v3 spec, recorded here rather than silently
-absorbed:** `module.txt` Module 12 requires *both* a CPU reference
-implementation and a GPU implementation for the linear solver, specifically
-so results can be cross-checked against each other. This build is CUDA-only
--- there is no CPU reference path. That means a wrong answer from the linear
-solver has nothing independent to diff against except the external oracle
-(`scripts/oracle_check.py`, which validates the ingestion layer, not the IPM
-loop). Worth reconsidering if numerical bugs in the solver core turn out to
-be hard to isolate with only one implementation.
+The script finds the solver binary itself, records the machine, GPU and git
+commit in every row, and keeps every run in the CSV — including timeouts and
+failures — so a result cannot be quietly filtered. `--paper` follows the
+cuPDLPx paper's rules exactly: both of its tolerances (10⁻⁴ and 10⁻⁸),
+convergence checked on the original rather than the rescaled model, a time
+limit instead of an iteration cap, and its SGM10 summary metric. Details:
+[`docs/BENCHMARKING.md`](docs/BENCHMARKING.md).
 
 ---
 
 ## On the "from scratch" constraint
 
-PS 26119 requires that the solver "shall not be built upon any existing open
-source solver library". This layer takes that seriously:
+PS 26119 requires that the solver *"shall not be built upon any existing open
+source solver library."*
 
-- **No solver library is linked, vendored, or depended on.** `third_party/` is
-  empty. Every algorithm here — sparse assembly, the canonicalizer, the transform
-  stack, the matrix analyzer — is written from the mathematical definition.
-- **zlib is an optional system dependency**, not a bundled one, and is a
-  *compression* library needed because MIPLIB ships `.mps.gz`. The solver builds
-  and runs without it.
-- **The test harness is hand-written** (`tests/TestMain.hpp`, ~100 lines) rather
-  than GoogleTest or Catch2. A test framework is plainly not a solver library, but
-  keeping the dependency list empty means the question never has to be argued.
-- **`scripts/oracle_check.py` uses SciPy (HiGHS) as a test oracle.** This is
-  **development tooling only**: it is never linked, never shipped, not on any build
-  path that produces a solver binary, and the test skips cleanly when SciPy is
-  absent. Its role is to check *our* reader and canonicalizer against an
-  independent implementation — the opposite of building on one.
+- **No solver library is linked, vendored or called at solve time.** Every
+  engine — both simplex methods, PDLP, cuPDLPx, both interior-point methods,
+  branch-and-bound and presolve — is implemented here from the published
+  algorithm, with the paper cited in the code next to what it supports.
+- **GPU libraries are used as primitives, not as solvers.** On every solve
+  path, the GPU work is cuSPARSE sparse matrix-vector products plus kernels
+  written here; the GPU interior point is matrix-free (conjugate gradient and
+  MINRES), so it never factorizes a matrix.
+  - cuSOLVER's *dense* LU and Cholesky are compiled into the GPU library, but
+    only as **test oracles** — they check the matrix-free algebra in the test
+    suite, and no solve path calls them.
+  - cuDSS, a complete sparse direct solver, is **never called, and the build
+    does not look for or link it.**
+  - Why a complete sparse solver is out of bounds while cuSPARSE is in:
+    [`docs/ARCHITECTURE-REVIEW.md`](docs/ARCHITECTURE-REVIEW.md).
+- **A reference solver is used only to check answers.**
+  `scripts/oracle_check.py` compares our results with HiGHS through SciPy, as
+  a development-time test. It is never linked, not on any build path, and
+  skipped when SciPy is absent. [`docs/HIGHS-COMPARISON.md`](docs/HIGHS-COMPARISON.md)
+  explains how the designs differ. Reference copies of other solvers' sources
+  kept locally for comparison are git-ignored, never built, and were not read
+  when writing the engines.
+- **No test framework dependency either.** The test harness is about 100
+  hand-written lines ([`tests/TestMain.hpp`](tests/TestMain.hpp)).
+- **zlib is optional** and only decompresses `.mps.gz` files.
+
+---
+
+## Repository map
+
+```text
+include/sovsolve/   public headers, one folder per module
+  core/             storage: aligned vectors, sparse CSR/CSC matrices
+  model/            the model, canonical form, transform stack, all options
+  io/               MPS / LP / QPLIB readers, MPS writer
+  solver/           presolve, scaling, every engine, branch-and-bound
+    simplex/        dual and primal revised simplex
+    pdlp/           PDLP and cuPDLPx, and their CPU/GPU iteration backends
+    gpu/            GPU interior point and the GPU PDLP / cuPDLPx backend
+src/                implementations, same layout
+tools/solve/        the command-line solver
+tests/              unit, property, corpus and fuzz tests; test data
+scripts/            benchmark.py, oracle_check.py, fetch_netlib.py, layering check
+docs/               design documents (below)
+module.txt          module-by-module engineering log: what was built, how it
+                    was verified, and what was measured, including dead ends
+```
+
+### Documentation
+
+| Document | What it covers |
+|---|---|
+| [`docs/FORMULATION.md`](docs/FORMULATION.md) | The mathematics: canonical form, sign conventions, optimality conditions — the single source of truth |
+| [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) | How to run and read the benchmarks |
+| [`docs/ARCHITECTURE-REVIEW.md`](docs/ARCHITECTURE-REVIEW.md) | The design review done before the solver was written, including the compliance findings |
+| [`docs/HIGHS-COMPARISON.md`](docs/HIGHS-COMPARISON.md) | How this solver differs from HiGHS |
+| [`docs/SIH-VERSION-PROGRESS.md`](docs/SIH-VERSION-PROGRESS.md) | Version-by-version history: each problem found and how it was fixed |
+| [`docs/MPS-FORMAT-NOTES.md`](docs/MPS-FORMAT-NOTES.md), [`docs/LP-FORMAT-NOTES.md`](docs/LP-FORMAT-NOTES.md) | File-format traps that silently produce wrong models, and how each is handled |
+| [`docs/DATA-STRUCTURES.md`](docs/DATA-STRUCTURES.md), [`docs/CANONICAL-FORM-ADDENDUM.md`](docs/CANONICAL-FORM-ADDENDUM.md) | Storage contracts, and the measurements behind the canonical-form choice |
+| [`docs/ENGINEERING-NOTES.md`](docs/ENGINEERING-NOTES.md) | The previous README: detailed build notes (zlib, sanitizers) and the ingestion layer's design record |
+
+---
+
+## References
+
+The algorithms implemented here, as cited in the code:
+
+- D. Applegate et al., *Practical Large-Scale Linear Programming using
+  Primal-Dual Hybrid Gradient*, NeurIPS 2021 — PDLP.
+- D. Applegate et al., *Faster first-order primal-dual methods for linear
+  programming using restarts and sharpness*, arXiv 2105.12715 — the restart
+  criterion and trust region.
+- D. Applegate et al., *Infeasibility detection with primal-dual hybrid
+  gradient for large-scale linear programming*, arXiv 2102.04592.
+- H. Lu, Z. Peng, J. Yang, *cuPDLPx: A Further Enhanced GPU-Based First-Order
+  Solver for Linear Programming*, arXiv 2507.14051.
+- H. Lu, J. Yang, *Restarted Halpern PDHG for Linear Programming*,
+  arXiv 2407.16144.
+- K. Chen, D. Sun, Y. Yuan, G. Zhang, X. Zhao, *HPR-LP: An implementation of an
+  HPR method for solving linear programming*, arXiv 2408.12179.
+- K. Chen, D. Sun, Y. Yuan, G. Zhang, X. Zhao, *On the Relationships among
+  GPU-Accelerated First-Order Methods for Solving Linear Programming*,
+  arXiv 2509.23903.
+- A. Koberstein, *The Dual Simplex Method, Techniques for a Fast and Stable
+  Implementation*, PhD thesis, 2005.
+- E. D. Andersen, K. D. Andersen, *The MOSEK interior point optimizer for
+  linear programming: an implementation of the homogeneous algorithm*, 2000.
+- T. Achterberg, *Constraint Integer Programming*, PhD thesis, 2007 —
+  branch-and-bound, propagation, conflict analysis, presolve.
+- T. Achterberg, R. Bixby, Z. Gu, E. Rothberg, D. Weninger, *Presolve
+  Reductions in Mixed Integer Programming*, ZIB Report 16-44.
+- S. Mehrotra, *On the implementation of a primal-dual interior point
+  method*, SIAM J. Optimization, 1992.

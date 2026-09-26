@@ -95,6 +95,44 @@ MIP_CONFIGS = {
     "mip-no-conflicts":  ["--method=dual-simplex", "--mip-conflicts=0"],
 }
 
+# `--paper`: the protocol of the cuPDLPx paper (arXiv 2507.14051, section 4),
+# which the first-order engines are compared under. Each engine at BOTH of the
+# paper's tolerances -- 1e-4 "moderate" and 1e-8 "high" -- because a
+# first-order method's cost to go from one to the other is often most of its
+# run, and reporting only one hides that. Termination is measured on the
+# original LP (the solver's default, --pdlp-original-termination=1) and the
+# budget is a time limit alone: each row passes a huge --pdlp-max-iter to lift
+# the solver's default iteration cap, which stays on for every other caller.
+# The summary reports SGM10 as the paper does.
+PAPER_ENGINES = {
+    "pdlp":  ["--method=pdlp"],
+    "pdlpx": ["--method=pdlpx"],
+}
+PAPER_GPU_ENGINES = {
+    "pdlp-gpu":  ["--method=pdlp", "--gpu-resident=1"],
+    "pdlpx-gpu": ["--method=pdlpx", "--gpu-resident=1"],
+}
+PAPER_TOLERANCES = ["1e-4", "1e-8"]
+# Section 4, "Time limit": 3600 s for small and medium instances.
+PAPER_TIME_LIMIT = 3600
+
+
+def paper_configs(include_gpu):
+    """name -> flags, e.g. 'pdlpx@1e-8' -> [..., '--pdlp-tol=1e-8']."""
+    engines = dict(PAPER_ENGINES)
+    if include_gpu:
+        engines.update(PAPER_GPU_ENGINES)
+    out = {}
+    for name, flags in engines.items():
+        for tol in PAPER_TOLERANCES:
+            # No iteration cap: the paper budgets by time alone. Passed
+            # explicitly -- the solver's default cap stays on for every
+            # other caller (PdlpOptions::max_iterations says why).
+            out["%s@%s" % (name, tol)] = flags + ["--pdlp-tol=%s" % tol,
+                                                  "--pdlp-max-iter=1000000000"]
+    return out
+
+
 # Which configurations need a CUDA build.
 GPU_CONFIGS = {"ipm", "pdlp-gpu", "pdlp-gpu-spmv", "concurrent-gpu", "pdlpx-gpu",
                "pdlpx-gpu-nograph"}
@@ -420,6 +458,8 @@ def benchmark(args):
     # --- which configurations --------------------------------------------
     table = dict(LP_CONFIGS)
     table.update(MIP_CONFIGS)
+    paper = paper_configs(include_gpu=args.gpu) if args.paper else {}
+    table.update(paper)
     for spec in args.config or []:
         if "=" not in spec:
             sys.exit("--config needs name=flags, got: %s" % spec)
@@ -429,11 +469,21 @@ def benchmark(args):
     def configs_for(family):
         if args.configs:
             return [c.strip() for c in args.configs.split(",") if c.strip()]
+        if args.paper and family != "mip":
+            return list(paper)
         if args.gpu and family != "mip":
             return list(GPU_COMPARE_LP)
         if args.compare:
             return list(MIP_CONFIGS) if family == "mip" else list(LP_CONFIGS)
         return DEFAULT_MIP if family == "mip" else DEFAULT_LP
+
+    if args.paper and not args.time_limit:
+        args.time_limit = PAPER_TIME_LIMIT
+    if args.time_limit and args.timeout <= args.time_limit:
+        # The wall timeout kills the process; it must never pre-empt the
+        # solver's own limit, or a run the solver would have reported as
+        # TimeLimit is recorded as a crash-like TIMEOUT instead.
+        args.timeout = args.time_limit + 120
 
     extra = list(args.solver_flag or [])
     if args.node_limit:
@@ -466,7 +516,8 @@ def benchmark(args):
                          "config": config, "size_bytes": size,
                          "best_of": args.repeat})
 
-            if config in GPU_CONFIGS and not cuda:
+            if (config in GPU_CONFIGS or config.split("@")[0] in PAPER_GPU_ENGINES) \
+                    and not cuda:
                 base.update({"status": "SKIPPED", "timed_out": 0,
                              "skipped_reason": "build has no CUDA"})
                 rows.append(base)
@@ -498,7 +549,7 @@ def benchmark(args):
 
     write_csv(rows, args.out)
     print("\nwrote %d rows -> %s" % (len(rows), args.out))
-    summarize(rows)
+    summarize(rows, limit=args.time_limit)
     return rows
 
 
@@ -524,8 +575,29 @@ def write_csv(rows, path):
             writer.writerow(row)
 
 
-def summarize(rows):
-    """A short readable digest. The CSV remains the record."""
+def sgm10(times):
+    """Shifted geometric mean, shift 10 s: `(prod(t_i + 10))^(1/n) - 10`.
+
+    The cuPDLPx paper's metric (section 4). The shift stops the many
+    sub-second instances from dominating a plain geometric mean.
+    """
+    import math
+    if not times:
+        return None
+    return math.exp(sum(math.log(t + 10.0) for t in times) / len(times)) - 10.0
+
+
+SOLVED = ("Optimal", "Infeasible", "Unbounded")
+
+
+def summarize(rows, limit=None):
+    """A short readable digest. The CSV remains the record.
+
+    `limit` is the time charged to an UNSOLVED run in SGM10 -- the paper sets
+    "its solving time ... to the corresponding time limit". Without it, the
+    SGM column is left out rather than computed from the wrong number: a
+    failed run's elapsed time would reward failing fast.
+    """
     print("\n" + "=" * 68)
     print("SUMMARY")
     print("=" * 68)
@@ -534,8 +606,9 @@ def summarize(rows):
     for row in rows:
         by_config.setdefault(row.get("config", "?"), []).append(row)
 
-    print("\n%-18s %7s %8s %8s %9s %12s" %
-          ("config", "runs", "optimal", "failed", "skipped", "total_s"))
+    print("\n%-18s %7s %8s %8s %9s %12s %10s" %
+          ("config", "runs", "optimal", "failed", "skipped", "total_s",
+           "SGM10_s" if limit else ""))
     for config in sorted(by_config):
         group = by_config[config]
         optimal = sum(1 for r in group if r.get("status") == "Optimal")
@@ -544,8 +617,15 @@ def summarize(rows):
                      if r.get("status") in ("ERROR", "TIMEOUT", "NumericalError"))
         total = sum(seconds_of(r) or 0.0 for r in group
                     if r.get("status") not in ("SKIPPED",))
-        print("%-18s %7d %8d %8d %9d %12.3f"
-              % (config, len(group), optimal, failed, skipped, total))
+        sgm = ""
+        if limit:
+            charged = [(seconds_of(r) or float(limit)) if r.get("status") in SOLVED
+                       else float(limit)
+                       for r in group if r.get("status") != "SKIPPED"]
+            value = sgm10(charged)
+            sgm = "%10.3f" % value if value is not None else ""
+        print("%-18s %7d %8d %8d %9d %12.3f %s"
+              % (config, len(group), optimal, failed, skipped, total, sgm))
 
     # Per-instance best config, and how the default compares to it. This is
     # the number that says whether picking one engine up front would have
@@ -557,10 +637,15 @@ def summarize(rows):
         seconds = seconds_of(row)
         if seconds is None:
             continue
-        key = row.get("instance")
+        # Compare like with like: a `--paper` row named `engine@tol` only
+        # competes with rows at the SAME tolerance. Across tolerances the
+        # looser one always "wins", which says nothing about the engines.
+        config = row.get("config") or ""
+        tolerance = config.split("@", 1)[1] if "@" in config else ""
+        key = (row.get("instance"), tolerance)
         current = per_instance.get(key)
         if current is None or seconds < current[1]:
-            per_instance[key] = (row.get("config"), seconds)
+            per_instance[key] = (config, seconds)
 
     if len(by_config) > 1 and per_instance:
         print("\nbest configuration per instance:")
@@ -629,6 +714,9 @@ def main():
                         help="run every engine, not just the default one")
     parser.add_argument("--gpu", action="store_true",
                         help="CPU/GPU A/B on LP models; needs a CUDA build")
+    parser.add_argument("--paper", action="store_true",
+                        help="the cuPDLPx paper's protocol: pdlp and pdlpx at 1e-4 and "
+                             "1e-8, time limit only (default 3600 s), SGM10")
     parser.add_argument("--config", action="append", metavar="NAME=FLAGS",
                         help="define a configuration, repeatable")
     parser.add_argument("--solver-flag", action="append", metavar="FLAG",

@@ -54,16 +54,28 @@ using core::Real;
 struct HalpernParams {
   Real eta = 0.0;           ///< the constant step, `0.998 / ||A||_2`
   Real gamma = 1.0;         ///< reflection, already clamped to [0, 1]
-  Real sufficient = 0.2;    ///< condition (i)
-  Real necessary = 0.8;     ///< condition (ii)
-  Real artificial = 0.36;   ///< condition (iii)
+  Real sufficient = 0.2;    ///< condition (i),   HPR-LP alpha_1
+  Real necessary = 0.6;     ///< condition (ii),  HPR-LP alpha_2
+  Real artificial = 0.2;    ///< condition (iii), HPR-LP alpha_3
   Real kp = 0.3;
   Real ki = 0.01;
   Real kd = 0.05;
   Real integral_clamp = 10.0;
+  /// `||b||` and `||c||` of the problem the iteration runs on, for the
+  /// relative infeasibilities in HPR-LP's safeguard (18). Constants of the
+  /// run, so they travel in the parameters.
+  Real b_norm = 0.0;
+  Real c_norm = 0.0;
   std::uint64_t check_interval = 40;  ///< condition (iii)'s schedule
+  /// Conditions (i) and (ii) are tested every `restart_check_every`
+  /// iterations. 1 is cuPDLPx ("evaluates potential restart conditions at
+  /// each iteration"); HPR-LP checks "every 150 iterations", and its
+  /// published alpha constants were chosen under that schedule.
+  std::uint64_t restart_check_every = 1;
   std::int32_t restarts_enabled = 1;
   std::int32_t weight_update = 1;
+  /// 0: HPR-LP's rule (the default). 1: cuPDLPx's PID. See halpern_on_restart.
+  std::int32_t weight_rule = 0;
 };
 
 /// Everything the controller writes. Lives with the iterate -- on the device
@@ -92,6 +104,31 @@ struct HalpernState {
 /// Spelled out because `std::isfinite` is not callable from device code and
 /// the global `isfinite` is not reliably declared by <cmath> on every host.
 SOVSOLVE_HOST_DEVICE inline bool halpern_finite(Real v) { return v - v == 0.0; }
+
+/// One row's contribution to HPR-LP's primal infeasibility `Pi_D(b - A x)`:
+/// an equality row is violated either way, a `<=` row only upward.
+SOVSOLVE_HOST_DEVICE inline Real halpern_primal_violation(Real ax, Real b, bool equality) {
+  const Real slack = ax - b;
+  return equality ? slack : (slack > 0.0 ? slack : 0.0);
+}
+
+/// One column's contribution to HPR-LP's dual infeasibility `c - A'y - z`:
+/// the part of the reduced cost `raw = c - A'y` that no bound can absorb.
+/// The projection is Pdlp.cpp's `project_reduced_cost`, restated with plain
+/// comparisons against the `core::INF` sentinel so device code can run it.
+SOVSOLVE_HOST_DEVICE inline Real halpern_dual_leftover(Real raw, Real lower, Real upper) {
+  const bool has_lower = lower > -core::INF;
+  const bool has_upper = upper < core::INF;
+  Real absorbed = raw;
+  if (!has_lower && !has_upper) {
+    absorbed = 0.0;
+  } else if (!has_lower) {
+    absorbed = raw < 0.0 ? raw : 0.0;
+  } else if (!has_upper) {
+    absorbed = raw > 0.0 ? raw : 0.0;
+  }
+  return raw - absorbed;
+}
 
 /// `lambda_k = (k+1)/(k+2)`, with `k` counted within the epoch -- the reset
 /// at every restart is what re-weights a fresh anchor back up to 1/2.
@@ -133,6 +170,22 @@ SOVSOLVE_HOST_DEVICE inline bool halpern_observe(const HalpernParams& p, Halpern
   if (s.inner == 0) s.reference = r;
   ++s.inner;
   bool restart = false;
+  // On HPR-LP's schedule (i) and (ii) are only EVALUATED every
+  // `restart_check_every` iterations, and "no local progress" then compares
+  // against the previous evaluation, not the previous iteration -- so `last`
+  // only moves on a checked iteration too.
+  const bool checked = p.restart_check_every <= 1 || total % p.restart_check_every == 0;
+  if (!checked) {
+    s.restart_pending = 0;
+    // (iii) still runs on its own schedule below; fall through only for it.
+    if (p.restarts_enabled != 0 && p.check_interval != 0 &&
+        total % p.check_interval == 0 &&
+        static_cast<Real>(s.inner) >= p.artificial * static_cast<Real>(total)) {
+      s.restart_pending = 1;
+      return true;
+    }
+    return false;
+  }
   if (p.restarts_enabled != 0) {
     if (r <= p.sufficient * s.reference) {
       restart = true;
@@ -161,10 +214,33 @@ SOVSOLVE_HOST_DEVICE inline bool halpern_observe(const HalpernParams& p, Halpern
 /// windup and the weight to `e^{+-30}`, a guard far outside any real balance
 /// and far inside where either step size would denormalize.
 SOVSOLVE_HOST_DEVICE inline void halpern_on_restart(const HalpernParams& p,
-                                                    HalpernState& s, Real dx, Real dy) {
+                                                    HalpernState& s, Real dx, Real dy,
+                                                    Real primal_error, Real dual_error) {
+  if (p.weight_update != 0 && p.weight_rule == 0) {
+    // HPR-LP (arXiv 2408.12179) Algorithm 3, "SigmaUpdate", translated to
+    // this method's primal weight. arXiv 2509.23903 Proposition 3.1 shows
+    // cuPDLPx with gamma = 1 generates EXACTLY the HPR iterates when
+    // `sigma = eta / omega` and `lambda_A = 1 / eta^2`; HPR-LP's (22) is
+    // `sigma+ = (1/sqrt(lambda_A)) ||dx|| / ||dy|| = eta ||dx|| / ||dy||`,
+    // hence `omega+ = eta / sigma+ = ||dy|| / ||dx||` -- Algorithm 3 of the
+    // original PDLP paper with theta = 1, no smoothing, no free constant.
+    //
+    // Applied only under HPR-LP's two safeguards, else RESET:
+    //   (17) dx, dy in (1e-16, 1e12)            -- the estimates are usable
+    //   (18) dual_error / primal_error in (1e-8, 1e8)
+    //                                           -- neither side has run away
+    // HPR-LP resets `sigma` to 1, its own starting value. Its units include
+    // an extra normalization of b and c this solver does not do, so the
+    // reset here is to THIS method's starting value, cuPDLPx's `omega = 1`.
+    const bool usable = dx > 1e-16 && dx < 1e12 && dy > 1e-16 && dy < 1e12;
+    const Real ratio = dual_error / primal_error;  // NaN or inf fails the test
+    const bool balanced = ratio > 1e-8 && ratio < 1e8;
+    s.omega = (usable && balanced) ? dy / dx : 1.0;
+  }
+  // The PID below is cuPDLPx's rule, kept as the alternative (weight_rule 1).
   // An anchor that did not move in one block says nothing about the balance.
   constexpr Real kTiny = 1e-12;
-  if (p.weight_update != 0 && dx > kTiny && dy > kTiny) {
+  if (p.weight_update != 0 && p.weight_rule == 1 && dx > kTiny && dy > kTiny) {
     const Real error = ::log(s.omega * dx / dy);
     if (halpern_finite(error)) {
       const Real clamp = ::fabs(p.integral_clamp);

@@ -68,18 +68,23 @@ void print_usage(const char* argv0) {
       "  --scaling=geometric|ruiz  ScalingOptions::mode (ruiz is implied by\n"
       "                        --method=pdlp; pass this AFTER it to override)\n"
       "  --pdlp-tol=X          PdlpOptions::termination_tolerance (default 1e-8)\n"
-      "  --pdlp-max-iter=N     PdlpOptions::max_iterations   (0 = auto, 100000)\n"
+      "  --pdlp-max-iter=N     PdlpOptions::max_iterations   (0 = auto, 1000000)\n"
       "  --pdlp-check-interval=N  PdlpOptions::check_interval (default 40)\n"
       "  --pdlp-adaptive=0|1   PdlpOptions::adaptive_step_size (default 1)\n"
       "  --pdlp-restart=0|1    PdlpOptions::adaptive_restart   (default 1)\n"
       "  --pdlp-primal-weight=0|1  PdlpOptions::primal_weight_update (default 1)\n"
       "  Module 31 (--method=pdlpx), cuPDLPx arXiv 2507.14051:\n"
+      "  --pdlp-original-termination=0|1  check (6a)-(6c) on the ORIGINAL LP, not\n"
+      "                        the preconditioned one, as cuPDLPx does (default 1)\n"
       "  --pdlp-reflection=X   reflection gamma in [0,1]      (default 1)\n"
       "  --pdlp-step-fraction=X  eta = X/||A||_2              (default 0.998)\n"
-      "  --pdlp-restart-sufficient=X  fixed-point decay, hard (default 0.2)\n"
-      "  --pdlp-restart-necessary=X   fixed-point decay, weak (default 0.8)\n"
-      "  --pdlp-restart-artificial=X  epoch length cap        (default 0.36)\n"
-      "  --pdlp-pid=Kp,Ki,Kd   primal-weight PID coefficients (default .3,.01,.05)\n"
+      "  --pdlp-restart-sufficient=X  fixed-point decay, hard (default 0.2, HPR-LP)\n"
+      "  --pdlp-restart-necessary=X   fixed-point decay, weak (default 0.6, HPR-LP)\n"
+      "  --pdlp-restart-artificial=X  epoch length cap        (default 0.2, HPR-LP)\n"
+      "  --pdlp-restart-check-every=N test restarts every N iterations (default 1;\n"
+      "                        HPR-LP uses 150)\n"
+      "  --pdlp-weight-rule=hpr|pid  primal weight: HPR-LP Alg. 3 (default) or PID\n"
+      "  --pdlp-pid=Kp,Ki,Kd   PID coefficients, with --pdlp-weight-rule=pid\n"
       "  --gpu-resident=0|1    --method=pdlp with the WHOLE iterate on the GPU\n"
       "                        (CUDA builds only). The fast path: per trial only\n"
       "                        24 bytes cross the bus. Use this one.\n"
@@ -238,6 +243,10 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.pdlp.adaptive_step_size = (val != "0");
       return true;
     }
+    if (key == "pdlp-original-termination") {
+      options.pdlp.terminate_on_original = (val != "0");
+      return true;
+    }
     if (key == "pdlp-reflection") {
       options.pdlp.reflection = std::stod(val);
       return true;
@@ -256,6 +265,22 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
     }
     if (key == "pdlp-restart-artificial") {
       options.pdlp.halpern_restart_artificial = std::stod(val);
+      return true;
+    }
+    if (key == "pdlp-weight-rule") {
+      if (val == "hpr" || val == "hpr-lp") {
+        options.pdlp.weight_rule = sovsolve::model::PdlpOptions::WeightRule::HprLp;
+      } else if (val == "pid") {
+        options.pdlp.weight_rule = sovsolve::model::PdlpOptions::WeightRule::Pid;
+      } else {
+        std::fprintf(stderr, "--pdlp-weight-rule must be hpr or pid\n");
+        return false;
+      }
+      return true;
+    }
+    if (key == "pdlp-restart-check-every") {
+      options.pdlp.halpern_restart_check_every =
+          static_cast<std::size_t>(std::stoull(val));
       return true;
     }
     if (key == "pdlp-pid") {
