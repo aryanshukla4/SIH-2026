@@ -105,11 +105,6 @@ if(SOVSOLVE_ENABLE_CUDA)
   # sovsolve_solver_gpu -> sovsolve_solver -> a test executable. Revisit once
   # real kernels exist.
 
-  if(SOVSOLVE_CUDSS_LIBRARY)
-    target_link_libraries(sovsolve_solver_gpu PUBLIC ${SOVSOLVE_CUDSS_LIBRARY})
-    target_compile_definitions(sovsolve_solver_gpu PUBLIC SOVSOLVE_WITH_CUDSS)
-  endif()
-
   # Still no edge the OTHER way (sovsolve_solver -> sovsolve_solver_gpu):
   # nothing in the host library calls a GPU function. Both PredictorCorrector
   # and Solve (the top-level entry point) needed to, and both live in

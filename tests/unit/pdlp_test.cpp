@@ -24,6 +24,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <random>
 #include <string_view>
@@ -40,6 +41,7 @@
 #include "sovsolve/solver/pdlp/DualityGap.hpp"
 #include "sovsolve/solver/pdlp/Infeasibility.hpp"
 #include "sovsolve/solver/pdlp/MatVec.hpp"
+#include "sovsolve/solver/pdlp/HalpernControl.hpp"
 #include "sovsolve/solver/pdlp/Pdlp.hpp"
 #include "tests/TestMain.hpp"
 
@@ -933,14 +935,25 @@ void test_halpern_costs_two_products_per_iteration() {
 
   // Per iteration: 2 from the step, plus 2 per `check_interval` for the
   // termination evaluation. Everything else is start-up -- the power
-  // iteration for `||A||_2`, `begin_halpern`, the final re-evaluation --
-  // which is a constant, so a generous slack absorbs it without letting a
-  // third per-iteration product through.
+  // iteration for `||A||_2`, `begin_halpern`, the initial and final
+  // evaluations -- which is a CONSTANT, so it is subtracted as an upper
+  // bound rather than absorbed in a slack. A slack is fragile in exactly the
+  // wrong way: an earlier version divided the ~200-product power iteration
+  // by the iteration count, and when better restart constants cut afiro from
+  // 440 iterations to 320 the same correct code read as 2.67 per iteration.
+  //
+  // Upper bound on start-up: 2 per power step, 2 for `begin_halpern`, 2 for
+  // each of the initial and final evaluations. The power iteration may stop
+  // early, which only makes the bound looser, never wrong.
+  const Real startup = 2.0 * static_cast<Real>(o.pdlp.power_iterations) + 6.0;
   const Real per_iteration =
-      static_cast<Real>(solved->matrix_products) / static_cast<Real>(solved->iterations);
+      (static_cast<Real>(solved->matrix_products) - startup) /
+      static_cast<Real>(solved->iterations);
   const Real budget = 2.0 + 2.0 / static_cast<Real>(o.pdlp.check_interval);
   ++::sovsolve::test::checks_run();
-  if (!(per_iteration < budget + 0.5)) {
+  // A third product per iteration would read as ~3.05 here; 2.1 leaves room
+  // only for rounding in the check count, not for a hidden product.
+  if (!(per_iteration <= budget + 0.05)) {
     ::sovsolve::test::record(__FILE__, __LINE__,
                              "Halpern stays at two products per iteration",
                              std::to_string(per_iteration) + " products/iteration, " +
@@ -965,6 +978,7 @@ void test_pid_reduces_to_algorithm_three() {
   if (!loaded.has_value()) return;
 
   model::Options p_only = pdlpx_options();
+  p_only.pdlp.weight_rule = model::PdlpOptions::WeightRule::Pid;
   p_only.pdlp.pid_kp = 0.5;
   p_only.pdlp.pid_ki = 0.0;
   p_only.pdlp.pid_kd = 0.0;
@@ -992,6 +1006,100 @@ void test_pid_reduces_to_algorithm_three() {
                              std::to_string(with_p->iterations) + " vs " +
                                  std::to_string(without->iterations));
   }
+}
+
+/// HPR-LP's primal-weight rule, clause by clause, on the pure function.
+///
+/// Every number in the rule is published (arXiv 2408.12179 Algorithm 3), so
+/// each clause can be pinned exactly rather than judged by a solve:
+///
+///   * the TRANSLATION: HPR-LP's `sigma+ = eta ||dx|| / ||dy||` with
+///     `sigma = eta / omega` must give `omega+ = ||dy|| / ||dx||`. A wrong
+///     translation (the reciprocal, say) still converges on easy models, so
+///     only an exact check catches it;
+///   * safeguard (17) and safeguard (18), each able to force the RESET on
+///     its own, including the degenerate ratio (a primal error of exactly 0,
+///     which is common -- 80bau3b reaches 1e-23);
+///   * the PID alternative at `(0.5, 0, 0)` must still be Algorithm 3, the
+///     geometric mean of the old weight and the estimate.
+void test_hpr_weight_rule() {
+  using solver::pdlp::HalpernParams;
+  using solver::pdlp::HalpernState;
+  HalpernParams p;  // weight_rule 0 = HPR-LP, the default
+
+  auto after = [&](Real dx, Real dy, Real perr, Real derr, Real start) {
+    HalpernState s;
+    s.omega = start;
+    solver::pdlp::halpern_on_restart(p, s, dx, dy, perr, derr);
+    return s.omega;
+  };
+
+  // The translation: omega+ = dy / dx, whatever the previous weight.
+  CHECK_NEAR(after(2.0, 6.0, 1e-3, 1e-3, 0.7), 3.0, 1e-15);
+  CHECK_NEAR(after(8.0, 2.0, 1e-3, 1e-3, 5.0), 0.25, 1e-15);
+
+  // Safeguard (17): each distance must lie in (1e-16, 1e12), else reset to 1.
+  CHECK_EQ(after(1e-17, 1.0, 1e-3, 1e-3, 4.0), 1.0);
+  CHECK_EQ(after(1.0, 1e13, 1e-3, 1e-3, 4.0), 1.0);
+  CHECK_NEAR(after(1e-15, 1e-15, 1e-3, 1e-3, 4.0), 1.0, 1e-15);  // inside: 1e-15/1e-15
+
+  // Safeguard (18): dual/primal error ratio must lie in (1e-8, 1e8).
+  CHECK_EQ(after(2.0, 6.0, 1.0, 1e-9, 4.0), 1.0);   // ratio 1e-9
+  CHECK_EQ(after(2.0, 6.0, 1e-9, 1.0, 4.0), 1.0);   // ratio 1e9
+  CHECK_EQ(after(2.0, 6.0, 0.0, 1e-3, 4.0), 1.0);   // primal exactly 0: inf
+  CHECK_EQ(after(2.0, 6.0, 0.0, 0.0, 4.0), 1.0);    // both 0: NaN, also rejected
+  CHECK_NEAR(after(2.0, 6.0, 1e-7, 1.0, 4.0), 3.0, 1e-15);  // ratio 1e7: kept
+
+  // The PID alternative at (0.5, 0, 0) is Algorithm 3: log-space average of
+  // the old weight and dy/dx. From 4 with an estimate of 1: sqrt(4 * 1) = 2.
+  p.weight_rule = 1;
+  p.kp = 0.5;
+  p.ki = 0.0;
+  p.kd = 0.0;
+  CHECK_NEAR(after(3.0, 3.0, 1e-3, 1e-3, 4.0), 2.0, 1e-12);
+
+  // And a restart always opens a new epoch, whichever rule moved the weight.
+  HalpernState s;
+  s.inner = 17;
+  s.restarts = 2;
+  solver::pdlp::halpern_on_restart(p, s, 1.0, 1.0, 1e-3, 1e-3);
+  CHECK_EQ(s.inner, std::uint64_t{0});
+  CHECK_EQ(s.restarts, std::uint64_t{3});
+}
+
+/// HPR-LP's check schedule: with `restart_check_every = 150`, conditions (i)
+/// and (ii) are not even EVALUATED off the schedule -- a residual that
+/// satisfies (i) at iteration 7 must not restart -- while condition (iii)
+/// keeps its own `check_interval` schedule.
+void test_restart_check_schedule() {
+  using solver::pdlp::HalpernParams;
+  using solver::pdlp::HalpernState;
+  HalpernParams p;
+  p.restart_check_every = 150;
+  p.check_interval = 40;
+  p.artificial = 0.2;
+
+  HalpernState s;
+  CHECK(!solver::pdlp::halpern_observe(p, s, 1.0, 1));  // epoch reference
+  // A decisive decay (0.01 <= 0.2 * 1) off the schedule: no restart.
+  CHECK(!solver::pdlp::halpern_observe(p, s, 0.01, 7));
+  // The same decay ON the schedule: restart via condition (i).
+  CHECK(solver::pdlp::halpern_observe(p, s, 0.01, 150));
+
+  // Condition (iii) on its own schedule: epoch of 40 at total 80 is
+  // 40 >= 0.2 * 80, and 80 is a check_interval multiple but not a
+  // restart_check_every one.
+  HalpernState t;
+  t.inner = 39;
+  t.reference = 1.0;
+  CHECK(solver::pdlp::halpern_observe(p, t, 0.9, 80));
+
+  // With the cuPDLPx default (every iteration), the same off-schedule decay
+  // DOES restart -- the two schedules really are different.
+  p.restart_check_every = 1;
+  HalpernState u;
+  CHECK(!solver::pdlp::halpern_observe(p, u, 1.0, 1));
+  CHECK(solver::pdlp::halpern_observe(p, u, 0.01, 7));
 }
 
 /// A Halpern run on a backend that does not implement it must be REFUSED.
@@ -1073,5 +1181,7 @@ int main() {
   test_halpern_costs_two_products_per_iteration();
   test_pid_reduces_to_algorithm_three();
   test_halpern_refuses_an_unsupporting_backend();
+  test_hpr_weight_rule();
+  test_restart_check_schedule();
   return ::sovsolve::test::report("pdlp_test");
 }

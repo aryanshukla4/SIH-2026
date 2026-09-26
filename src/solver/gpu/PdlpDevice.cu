@@ -261,59 +261,93 @@ __global__ void set_total_kernel(pdlp::HalpernState* state, std::uint64_t total)
   state->total = total;
 }
 
-/// `||T(z)_x - x_0||^2` and `||T(z)_y - y_0||^2`, stage one -- ONLY when a
-/// restart is pending. Every other iteration each block reads one flag and
-/// leaves, so the full pass over `n + m` is paid once per restart, not once
-/// per step. Same slot layout as `metrics_partial_kernel`, so
-/// `metrics_final_kernel` completes it.
-__global__ void anchor_distance_partial_kernel(std::size_t n, std::size_t m,
-                                               const pdlp::HalpernState* state,
-                                               const Real* x_trial, const Real* x_anchor,
-                                               const Real* y_trial, const Real* y_anchor,
-                                               Real* partials) {
-  if (state->restart_pending == 0) return;
-  __shared__ Real s_dx[kBlock];
-  __shared__ Real s_dy[kBlock];
-  Real dx_sq = 0.0;
-  Real dy_sq = 0.0;
+/// Everything a restart needs to know about the restart point `T(z)`, in ONE
+/// pass, stage one:
+///
+///   [0] ||T(z)_x - x_0||^2        distance moved, primal   (PID and HPR-LP)
+///   [1] ||T(z)_y - y_0||^2        distance moved, dual
+///   [2] ||Pi_D(b - A T(z)_x)||^2  primal infeasibility     (HPR-LP (18))
+///   [3] ||c - A' T(z)_y - z||^2   dual infeasibility
+///
+/// The last two use the images `K T(z)_x` and `K' T(z)_y` already held from
+/// the step, so no product. With a non-null `state` it runs ONLY when a
+/// restart is pending -- every other iteration each block reads one flag and
+/// leaves; with a null `state` (the per-step `restart_at_pdhg_point`) it
+/// always runs. The per-element terms come from HalpernControl.hpp, the same
+/// functions the host backend uses.
+__global__ void restart_partial_kernel(std::size_t n, std::size_t m,
+                                       std::size_t num_equality,
+                                       const pdlp::HalpernState* state,
+                                       const Real* x_trial, const Real* x_anchor,
+                                       const Real* y_trial, const Real* y_anchor,
+                                       const Real* kx_trial, const Real* kty_trial,
+                                       const Real* b, const Real* c, const Real* lower,
+                                       const Real* upper, Real* partials) {
+  if (state != nullptr && state->restart_pending == 0) return;
+  __shared__ Real s[4][kBlock];
+  Real acc[4] = {0.0, 0.0, 0.0, 0.0};
   const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
   const std::size_t len = n > m ? n : m;
   for (std::size_t k = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        k < len; k += stride) {
     if (k < n) {
       const Real d = x_trial[k] - x_anchor[k];
-      dx_sq += d * d;
+      acc[0] += d * d;
+      const Real v = pdlp::halpern_dual_leftover(c[k] - kty_trial[k], lower[k], upper[k]);
+      acc[3] += v * v;
     }
     if (k < m) {
       const Real d = y_trial[k] - y_anchor[k];
-      dy_sq += d * d;
+      acc[1] += d * d;
+      const Real v = pdlp::halpern_primal_violation(kx_trial[k], b[k], k < num_equality);
+      acc[2] += v * v;
     }
   }
-  s_dx[threadIdx.x] = dx_sq;
-  s_dy[threadIdx.x] = dy_sq;
+  for (int q = 0; q < 4; ++q) s[q][threadIdx.x] = acc[q];
   __syncthreads();
   for (unsigned half = kBlock / 2; half > 0; half >>= 1) {
     if (threadIdx.x < half) {
-      s_dx[threadIdx.x] += s_dx[threadIdx.x + half];
-      s_dy[threadIdx.x] += s_dy[threadIdx.x + half];
+      for (int q = 0; q < 4; ++q) s[q][threadIdx.x] += s[q][threadIdx.x + half];
     }
     __syncthreads();
   }
   if (threadIdx.x == 0) {
-    partials[3 * blockIdx.x + 0] = 0.0;
-    partials[3 * blockIdx.x + 1] = s_dx[0];
-    partials[3 * blockIdx.x + 2] = s_dy[0];
+    for (int q = 0; q < 4; ++q) partials[4 * blockIdx.x + q] = s[q][0];
   }
 }
 
-/// ONE thread: the controller's half of a restart (the PID), when pending.
-/// `distance` is `metrics_final_kernel`'s output for this iteration -- stale
-/// when no restart is pending, and then never read.
+/// Stage two: one block sums the four partials in a FIXED order -- the same
+/// determinism argument as `metrics_final_kernel`. Guarded like stage one.
+__global__ void restart_final_kernel(unsigned blocks, const pdlp::HalpernState* state,
+                                     const Real* partials, Real* out) {
+  if (state != nullptr && state->restart_pending == 0) return;
+  __shared__ Real s[4][kBlock];
+  Real acc[4] = {0.0, 0.0, 0.0, 0.0};
+  for (unsigned k = threadIdx.x; k < blocks; k += kBlock) {
+    for (int q = 0; q < 4; ++q) acc[q] += partials[4 * k + q];
+  }
+  for (int q = 0; q < 4; ++q) s[q][threadIdx.x] = acc[q];
+  __syncthreads();
+  for (unsigned half = kBlock / 2; half > 0; half >>= 1) {
+    if (threadIdx.x < half) {
+      for (int q = 0; q < 4; ++q) s[q][threadIdx.x] += s[q][threadIdx.x + half];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    for (int q = 0; q < 4; ++q) out[q] = s[q][0];
+  }
+}
+
+/// ONE thread: the controller's half of a restart, when pending -- HPR-LP's
+/// rule or the PID, per `params.weight_rule`. `sums` is `restart_final_kernel`'s
+/// output for this iteration.
 __global__ void restart_controller_kernel(pdlp::HalpernParams params,
-                                          pdlp::HalpernState* state,
-                                          const Real* distance) {
+                                          pdlp::HalpernState* state, const Real* sums) {
   if (state->restart_pending == 0) return;
-  pdlp::halpern_on_restart(params, *state, sqrt(distance[1]), sqrt(distance[2]));
+  pdlp::halpern_on_restart(params, *state, sqrt(sums[0]), sqrt(sums[1]),
+                           sqrt(sums[2]) / (1.0 + params.b_norm),
+                           sqrt(sums[3]) / (1.0 + params.c_norm));
 }
 
 /// The iterate's half of a restart, when pending: `z <- z_0 <- T(z)`, and the
@@ -424,6 +458,8 @@ struct DevicePdlpBackend::Impl {
   /// The anchor-distance reduction's output, kept apart from `metrics` so a
   /// restart's reduction can never be mistaken for the step's.
   Real* restart_metrics = nullptr;
+  /// Four slots per reduction block for `restart_partial_kernel`.
+  Real* restart_partials = nullptr;
 
   // ---- CUDA graphs over the resident loop --------------------------------
   //
@@ -554,6 +590,7 @@ struct DevicePdlpBackend::Impl {
                     static_cast<void*>(x_anchor), static_cast<void*>(y_anchor),
                     static_cast<void*>(kty_anchor), static_cast<void*>(kx_anchor),
                     static_cast<void*>(control), static_cast<void*>(restart_metrics),
+                    static_cast<void*>(restart_partials),
                     static_cast<void*>(cold_in_n), static_cast<void*>(cold_out_m),
                     static_cast<void*>(cold_in_m), static_cast<void*>(cold_out_n),
                     buffer_a, buffer_at, static_cast<void*>(partials),
@@ -688,7 +725,11 @@ core::Expected<std::unique_ptr<DevicePdlpBackend>> DevicePdlpBackend::create(
       std::max(1u, std::min(kMaxReductionBlocks, blocks_for(std::max(n, m))));
   st = alloc(&d->partials, 3 * static_cast<std::size_t>(d->reduction_blocks), "partials");
   if (st.ok()) st = alloc(&d->metrics, 3, "metrics");
-  if (st.ok()) st = alloc(&d->restart_metrics, 3, "restart metrics");
+  if (st.ok()) st = alloc(&d->restart_metrics, 4, "restart metrics");
+  if (st.ok()) {
+    st = alloc(&d->restart_partials, 4 * static_cast<std::size_t>(d->reduction_blocks),
+               "restart partials");
+  }
   if (st.ok()) st = alloc(&d->control, 1, "halpern controller state");
   if (!st.ok()) return st.error();
   if (cudaMallocHost(reinterpret_cast<void**>(&d->host_metrics), 3 * sizeof(Real)) !=
@@ -1051,20 +1092,24 @@ pdlp::TrialMetrics DevicePdlpBackend::halpern_step(Real eta, Real omega, Real ga
 
 pdlp::AnchorDistance DevicePdlpBackend::restart_at_pdhg_point() {
   Impl& d = *impl_;
-  // `||T(z)_x - x_0||^2` and `||T(z)_y - y_0||^2` are the `dx_sq`/`dy_sq`
-  // slots of the existing reduction with the anchor in the "current" role.
-  // Its interaction slot is meaningless here and ignored.
-  metrics_partial_kernel<<<d.reduction_blocks, kBlock>>>(
-      d.n, d.m, d.x_anchor, d.x_trial, d.y_anchor, d.y_trial, d.kext, d.kx_current,
-      d.partials);
-  d.check_launch("metrics_partial_kernel(restart)");
-  metrics_final_kernel<<<1, kBlock>>>(d.reduction_blocks, d.partials, d.metrics);
-  d.check_launch("metrics_final_kernel(restart)");
-  d.record(cudaMemcpy(d.host_metrics, d.metrics, 3 * sizeof(Real), cudaMemcpyDeviceToHost),
-           "download anchor distance");
+  // The four restart quantities in one pass (restart_partial_kernel), with a
+  // null state so it runs unconditionally. Read back: this is the per-step
+  // API, whose caller makes the decision on the host.
+  restart_partial_kernel<<<d.reduction_blocks, kBlock>>>(
+      d.n, d.m, d.num_equality, nullptr, d.x_trial, d.x_anchor, d.y_trial, d.y_anchor,
+      d.kx_trial, d.kty_trial, d.b, d.c, d.lower, d.upper, d.restart_partials);
+  d.check_launch("restart_partial_kernel");
+  restart_final_kernel<<<1, kBlock>>>(d.reduction_blocks, nullptr, d.restart_partials,
+                                      d.restart_metrics);
+  d.check_launch("restart_final_kernel");
+  Real sums[4] = {0.0, 0.0, 0.0, 0.0};
+  d.record(cudaMemcpy(sums, d.restart_metrics, 4 * sizeof(Real), cudaMemcpyDeviceToHost),
+           "download restart sums");
   pdlp::AnchorDistance moved;
-  moved.dx = std::sqrt(d.host_metrics[1]);
-  moved.dy = std::sqrt(d.host_metrics[2]);
+  moved.dx = std::sqrt(sums[0]);
+  moved.dy = std::sqrt(sums[1]);
+  moved.primal_residual = std::sqrt(sums[2]);
+  moved.dual_residual = std::sqrt(sums[3]);
 
   // Algorithm 2 line 6: the new epoch starts at `T(z)`, and the anchor with
   // it. Device-to-device copies only; zero products.
@@ -1183,12 +1228,13 @@ void enqueue_halpern_iteration(DevicePdlpBackend::Impl& d,
   controller_kernel<<<1, 1, 0, st>>>(params, d.control, d.metrics);
   d.check_launch("controller_kernel");
 
-  anchor_distance_partial_kernel<<<d.reduction_blocks, kBlock, 0, st>>>(
-      d.n, d.m, d.control, d.x_trial, d.x_anchor, d.y_trial, d.y_anchor, d.partials);
-  d.check_launch("anchor_distance_partial_kernel");
-  metrics_final_kernel<<<1, kBlock, 0, st>>>(d.reduction_blocks, d.partials,
-                                             d.restart_metrics);
-  d.check_launch("metrics_final_kernel(restart)");
+  restart_partial_kernel<<<d.reduction_blocks, kBlock, 0, st>>>(
+      d.n, d.m, d.num_equality, d.control, d.x_trial, d.x_anchor, d.y_trial, d.y_anchor,
+      d.kx_trial, d.kty_trial, d.b, d.c, d.lower, d.upper, d.restart_partials);
+  d.check_launch("restart_partial_kernel");
+  restart_final_kernel<<<1, kBlock, 0, st>>>(d.reduction_blocks, d.control,
+                                             d.restart_partials, d.restart_metrics);
+  d.check_launch("restart_final_kernel");
   restart_controller_kernel<<<1, 1, 0, st>>>(params, d.control, d.restart_metrics);
   d.check_launch("restart_controller_kernel");
   restart_move_kernel<<<wide, kBlock, 0, st>>>(d.n, d.m, d.control, d.x_trial,

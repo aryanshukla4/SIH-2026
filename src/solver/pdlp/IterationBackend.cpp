@@ -238,6 +238,24 @@ AnchorDistance HostIterationBackend::restart_at_pdhg_point() {
   moved.dx = std::sqrt(moved.dx);
   moved.dy = std::sqrt(moved.dy);
 
+  // HPR-LP's safeguard (18) needs both infeasibilities at the restart point
+  // `T(z)`. Its images `K T(z)_x` and `K' T(z)_y` are in the trial slots, so
+  // this is two elementwise sweeps and no product.
+  Real primal_sq = 0.0;
+  for (std::size_t i = 0; i < m_; ++i) {
+    const Real v = halpern_primal_violation(k_x_trial_[i], problem_.b[i],
+                                            i < problem_.num_equality);
+    primal_sq += v * v;
+  }
+  Real dual_sq = 0.0;
+  for (std::size_t j = 0; j < n_; ++j) {
+    const Real v = halpern_dual_leftover(problem_.c[j] - kt_y_trial_[j],
+                                         problem_.col_lower[j], problem_.col_upper[j]);
+    dual_sq += v * v;
+  }
+  moved.primal_residual = std::sqrt(primal_sq);
+  moved.dual_residual = std::sqrt(dual_sq);
+
   for (std::size_t j = 0; j < n_; ++j) {
     x_[j] = x_trial_[j];
     kt_y_[j] = kt_y_trial_[j];
@@ -269,7 +287,9 @@ void HostIterationBackend::run_halpern(std::size_t count, std::uint64_t first_it
     control_.total = first_iteration + i + 1;
     if (halpern_observe(params, control_, r, control_.total)) {
       const AnchorDistance moved = restart_at_pdhg_point();
-      halpern_on_restart(params, control_, moved.dx, moved.dy);
+      halpern_on_restart(params, control_, moved.dx, moved.dy,
+                         moved.primal_residual / (1.0 + params.b_norm),
+                         moved.dual_residual / (1.0 + params.c_norm));
     }
   }
 }

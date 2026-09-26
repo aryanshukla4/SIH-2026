@@ -106,6 +106,28 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options,
   if (!status.ok()) return status.error();
   scale_seconds = lap();
 
+  // The preconditioner's composite factors, `R` and `S` in `A~ = R A S`, so
+  // PDLP can measure its termination criteria on the ORIGINAL problem
+  // (cuPDLPx section 4; PdlpOptions::terminate_on_original). Read back from
+  // the transform stack rather than returned by `scale()` so that nothing
+  // about scaling's interface changes for the engines that do not need it.
+  // Multiplied, not assigned, in case scaling was ever applied twice. Owned
+  // HERE, for the whole call; the options below only borrow them.
+  std::vector<Real> row_scale(canon->problem.num_rows(), 1.0);
+  std::vector<Real> col_scale(canon->problem.num_cols(), 1.0);
+  for (const auto& rec : canon->transforms.records()) {
+    if (rec.kind == model::TransformKind::RowScaling) {
+      const auto i = static_cast<std::size_t>(rec.primary);
+      if (i < row_scale.size()) row_scale[i] *= rec.value;
+    } else if (rec.kind == model::TransformKind::ColumnScaling) {
+      const auto j = static_cast<std::size_t>(rec.primary);
+      if (j < col_scale.size()) col_scale[j] *= rec.value;
+    }
+  }
+  model::Options scaled_options = options;
+  scaled_options.pdlp.original_row_scale = {row_scale.data(), row_scale.size()};
+  scaled_options.pdlp.original_col_scale = {col_scale.data(), col_scale.size()};
+
   // Four engines, one pipeline. Everything above and below this block is
   // shared; only the middle differs, and each engine is responsible for
   // producing the same five canonical-space vectors.
@@ -116,7 +138,7 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options,
     // three racing threads would serialize them on the same hardware, which
     // is the opposite of the point.
     ConcurrentReport report;
-    auto result = solve_concurrent(canon->problem, options, {}, &report);
+    auto result = solve_concurrent(canon->problem, scaled_options, {}, &report);
     log_concurrent_race(report, options.log);
     if (!result.has_value()) return result.error();
     canonical = std::move(*result);
@@ -135,7 +157,7 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options,
     // engine: a copy of the options here keeps the caller's `Options` a
     // `const&` all the way down and keeps the two schemes sharing every line
     // of setup, termination and postprocessing.
-    model::Options pdlp_options = options;
+    model::Options pdlp_options = scaled_options;
     pdlp_options.pdlp.halpern = options.simplex.method == model::Method::PdlpX;
     const model::Options& active = pdlp_options;
     auto result =

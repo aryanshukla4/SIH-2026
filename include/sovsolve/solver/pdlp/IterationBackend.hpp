@@ -79,6 +79,11 @@ struct TrialMetrics {
 struct AnchorDistance {
   Real dx = 0.0;
   Real dy = 0.0;
+  /// `||Pi_D(b - A x-bar)||` and `||c - A' y-bar - z-bar||` at the restart
+  /// point, unnormalized -- the inputs to HPR-LP's safeguard (18). Free: the
+  /// restart point's two matrix images are already held from the last step.
+  Real primal_residual = 0.0;
+  Real dual_residual = 0.0;
 };
 
 /// Vectors the cold path reads back.

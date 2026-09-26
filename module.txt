@@ -3041,3 +3041,76 @@ restart and the step after it, with exact product counts (2 per step, 0 per
 restart); device ||A||_2 vs the host routine to 1e-9; the resident controller
 loop vs the host's across restarts; pdlpx end to end on the device vs the
 host. pdlp_device_test 2459 checks. Host ctest 28/28, CUDA ctest 31/31.
+
+
+--------------------------------------------------------------------------------
+Module 31, 2026-09-27: published constants, the paper's protocol, compliance
+--------------------------------------------------------------------------------
+
+WHY. Run on all 99 Netlib models in tests/data/lp (not the 18 it was tuned
+on), pdlpx's self-tuned constants did not generalize, and 5 of its 8 tunables
+turned out to be this project's own guesses rather than any paper's. Rule
+adopted: paper values stay fixed; our own values are replaced by published
+ones wherever a paper for THIS method gives them.
+
+THE REFERENCE THAT MAKES IT LEGITIMATE. arXiv 2509.23903 Proposition 3.1:
+cuPDLPx with gamma = 1 generates EXACTLY the HPR iterates when sigma = eta /
+omega and lambda_A = 1 / eta^2. So HPR-LP's published settings (arXiv
+2408.12179) apply to pdlpx directly:
+
+  restart constants   0.2 / 0.8 / 0.36 (ours)  ->  0.2 / 0.6 / 0.2 (HPR-LP s4)
+  primal weight       PID 0.3/0.01/0.05 (ours) ->  HPR-LP Algorithm 3:
+                      omega = ||dy|| / ||dx||, under safeguards (17) distances
+                      in (1e-16, 1e12) and (18) dual/primal error ratio in
+                      (1e-8, 1e8), else reset to cuPDLPx's starting omega = 1.
+                      HPR-LP's (22), sigma+ = eta ||dx||/||dy||, maps to
+                      exactly this; its Remark 3 says the same.
+
+The PID stays (--pdlp-weight-rule=pid). The safeguard inputs are computed at
+the restart point from images the step already holds -- no products; on the
+GPU the restart reduction went from 2 sums to 4, same single pass, still
+flag-guarded inside the CUDA graph. A restart-check schedule option exists
+(--pdlp-restart-check-every; HPR-LP uses 150); every-iteration measured better
+and stays the default.
+
+Measured (41 of 99 models before the run was stopped; 300 s, no cap, 1e-8):
+published solved 39 vs old 38 (adds bandm), typical 8.5% fewer passes
+(geometric-mean ratio 0.915), cheaper on 22 of 37 -- but 225x worse on
+bore3d (39.2M vs 174k passes), plausibly because HPR-LP's weight update is
+unsmoothed. Not pursued: the decision was to stop tuning.
+
+TERMINATION ON THE ORIGINAL LP (cuPDLPx s4). The stopping test is now measured
+in the original problem's units, from the preconditioner's factors R, S
+(A~ = R A S): residuals divide elementwise, the gap is scale-invariant, no
+extra products. It mattered: etamacro was declared 1e-8 at 15,191 passes in
+scaled units and actually needs 40,096. --pdlp-original-termination=0 keeps
+the old behaviour for comparison.
+
+ITERATION CAP 100,000 -> 1,000,000, from measurement: of the models solved at
+1e-8 with no cap, 29 needed <= 100k, 36 <= 1M, 37 <= 10M. Proven not to change
+any run that already converged (identical iterations on 25fv47, e226,
+etamacro under both caps) -- the cap only ever decides when a run gives up.
+A first version lifted the cap whenever a time limit was set; since the time
+limit defaults to 3600 s, that lifted it on EVERY run and turned a 10 s
+give-up into an hour. Reverted: --paper lifts the cap explicitly.
+
+scripts/benchmark.py --paper: both of the paper's tolerances, original-LP
+termination, time limit only, SGM10 with unsolved runs charged the full limit,
+engines ranked only against the same tolerance.
+
+COMPLIANCE. The top-level CMakeLists.txt searched for cuDSS and linked it when
+the build machine happened to have it, announcing a "sparse-direct GPU path"
+that no code implemented. Removed. cuSOLVER's dense LU/Cholesky remain in the
+GPU library as test oracles only -- no solve path calls them; the README says
+exactly that rather than "not used".
+
+README rewritten for evaluators; the previous one, which source comments cite
+as "README.md", is preserved verbatim as docs/ENGINEERING-NOTES.md.
+
+Large LPs (tests/data/lp big) on the 4 GB RTX 3050: 16_n14 TimeLimit at 600 s
+(660,720 iterations, 44 MB on the GPU, 0.13 s load + presolve). The rest of
+that run was killed by the host for low system memory -- the remaining files
+are 47 MB to 1.8 GB -- so no numbers for them from this machine.
+
+Tests: pdlp_test 148 checks (+ each HPR-LP clause exactly, both schedules).
+Host ctest 28/28, CUDA ctest 31/31.
