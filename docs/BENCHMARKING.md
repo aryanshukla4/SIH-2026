@@ -82,8 +82,8 @@ python scripts/benchmark.py --gpu --corpus large     # the big instances
 python scripts/benchmark.py --configs pdlp,pdlp-gpu  # one pair only
 ```
 
-`--gpu` runs `concurrent, pdlp, pdlp-gpu, pdlp-gpu-spmv, ipm` on every LP
-instance. The host `pdlp` row is deliberately included: "the GPU took 0.4s" is
+`--gpu` runs `concurrent, pdlp, pdlpx, pdlp-gpu, pdlpx-gpu, pdlpx-gpu-nograph,
+pdlp-gpu-spmv, ipm` on every LP instance. The host `pdlp` row is deliberately included: "the GPU took 0.4s" is
 not a result, "the GPU took 0.4s where the same engine on the host took 0.9s"
 is.
 
@@ -91,6 +91,8 @@ is.
 |---|---|---|
 | `ipm` | `--method=ipm` | the whole interior-point path (CUDA-only engine) |
 | `pdlp-gpu` | `--method=pdlp --gpu-resident=1` | the entire PDLP iterate, device-resident |
+| `pdlpx-gpu` | `--method=pdlpx --gpu-resident=1` | cuPDLPx's reflected-Halpern scheme, iterate and restart logic on the device, each 40-iteration chunk replayed as one CUDA graph |
+| `pdlpx-gpu-nograph` | `... --gpu-graphs=0` | the same kernels launched one by one — pair it with `pdlpx-gpu` to isolate the graph gain |
 | `pdlp-gpu-spmv` | `--method=pdlp --gpu-spmv=1 --gpu-spmv-timing=1` | only `K` and `Kᵀ`; kernel and transfer time reported separately |
 | `concurrent-gpu` | `--method=concurrent --concurrent-gpu-ipm=1` | adds the GPU interior-point engine to the race |
 
@@ -98,6 +100,11 @@ is.
 default, because consumer Ampere runs FP64 at 1/64 rate — that penalty does
 not hold on A100 and later, so on a datacentre card it is worth adding:
 `--configs concurrent,concurrent-gpu`. See `docs/ARCHITECTURE-REVIEW.md` §3.5.
+
+Rows run on the device print `gpu_graphs=1|0` — whether graphs actually
+**engaged**, not whether they were requested. A capture that fails falls back
+to direct launches and says why in `gpu_graph_note`, so a CSV row can never
+credit graphs with a run that did not use one.
 
 Two things *are* automatic, and both are the safe direction:
 

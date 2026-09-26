@@ -151,6 +151,89 @@
 // are computed once at the end by the same path the simplex uses. Reporting a
 // scaled residual as if it were the real one is the failure this avoids.
 
+// --------------------------------------------------------------------------
+// Module 31: the cuPDLPx scheme (arXiv 2507.14051), `--method=pdlpx`
+// --------------------------------------------------------------------------
+//
+// Everything above describes averaged PDHG -- the NeurIPS 2021 algorithm, and
+// what `--method=pdlp` still runs. cuPDLPx replaces four of its parts, and
+// they replace each other's justifications too, so the switch is one flag and
+// not four:
+//
+//   averaged iterate      ->  reflected HALPERN iterate
+//   adaptive step (Alg 2) ->  CONSTANT step, eta = 0.998/||A||_2
+//   normalized gap restart->  FIXED-POINT ERROR restart, r(z) = ||z - T(z)||_P
+//   Algorithm 3 weight    ->  PID controller on the same quantity
+//
+// Sources. arXiv 2507.14051 (cuPDLPx) states all four but proves none and
+// publishes only one constant. The theory is arXiv 2407.16144, "Restarted
+// Halpern PDHG for Linear Programming", which this file cites as [rHPDHG] --
+// its Algorithm 2 is the reflected scheme, its equation (10) the restart
+// rule, its Corollary 1 the factor-of-2 improvement. Nothing is taken from
+// either project's source; see docs/HIGHS-COMPARISON.md.
+//
+// THE HALPERN ITERATION. Where averaging forms `z-bar_k = (1/k) sum z_i`,
+// Halpern pulls every iterate back toward a fixed ANCHOR `z^{n,0}`:
+//
+//     z^{k+1} = (k+1)/(k+2) * T(z^k)  +  1/(k+2) * z^{n,0}
+//
+// with `T` the PDHG operator (3). The anchor's weight decays as `1/(k+2)`, so
+// early iterates are pulled hard and late ones barely at all -- the same
+// "forget the bad early iterates" effect averaging gets from restarting, but
+// obtained continuously instead of in one jump. The reflected variant
+// substitutes `(1+gamma)T - gamma*id` for `T`:
+//
+//     z^{k+1} = (k+1)/(k+2) [ (1+gamma) T(z^k) - gamma z^k ] + 1/(k+2) z^{n,0}
+//
+// [rHPDHG] Proposition 7 is what makes that legal: `2T - I` is non-expansive
+// when `T` is firmly non-expansive, which PDHG is. It is NOT a projection, so
+// with `gamma > 0` the iterate can leave the box `X` -- see
+// `BackendVector::PdhgX` for what this implementation reports instead.
+//
+// WHY THE RESTART CRITERION CHANGED, which is the part worth understanding.
+// Section 3.2's normalized duality gap costs four matrix products to
+// evaluate, so it is tested once every 40 iterations. The fixed-point error
+//
+//     r(z) = ||z - PDHG(z)||_P,   P = [[omega/eta I, A'], [A, 1/(eta omega) I]]
+//
+// costs NOTHING: expanded, `r(z)^2 = (omega/eta)||dx||^2 + 2 dy'A dx +
+// ||dy||^2/(eta omega)`, and all three of those fall out of quantities one
+// PDHG step already formed. So it is tested every iteration. That is a
+// 40-fold increase in how promptly a restart fires, from a criterion that is
+// free rather than merely cheaper -- and it is the reason the whole scheme
+// suits a GPU, where the four products of the gap evaluation would each have
+// been a synchronization point.
+//
+// `P` is positive definite exactly when `eta < 1/||A||_2`, which is also
+// PDHG's own step-size condition -- so the norm the criterion is measured in
+// and the step that keeps the method convergent are the same requirement,
+// and `eta = 0.998/||A||_2` satisfies both with a margin.
+//
+// THE PID, AND WHERE ITS COEFFICIENTS COME FROM. cuPDLPx defines the error
+// between the primal and dual distances travelled since the anchor,
+//
+//     e_n = log( sqrt(w) ||dx||  /  (||dy|| / sqrt(w)) )  =  log( w ||dx||/||dy|| )
+//
+// and updates `log w_{n+1} = log w_n - [K_P e_n + K_I sum e_i + K_D (e_n - e_{n-1})]`
+// at each restart, from `w_0 = 1`. It publishes no K. One is recoverable: set
+// `K_I = K_D = 0` and the update collapses to
+//
+//     log w_{n+1} = (1 - K_P) log w_n + K_P log(||dy||/||dx||)
+//
+// which is cuPDLP's Algorithm 3 verbatim with `theta = K_P`. So `(0.5, 0, 0)`
+// reproduces a published rule exactly, and serves as the reference the
+// defaults were measured against. They are `(0.3, 0.01, 0.05)`: the sweep is
+// in model/Options.hpp, and the first guess `(0.5, 0.05, 0.1)` lost six
+// Netlib instances outright to integral windup.
+//
+// ON THE GPU. Both backends implement it: `--method=pdlpx --gpu-resident=1`
+// keeps the iterate, the anchor and all four matrix images on the device, and
+// a restart is device-to-device copies only. Per iteration the host sees 24
+// bytes -- the three scalars of `r(z)` -- because the restart DECISION is made
+// here. That is one synchronization per iteration, the same price Algorithm
+// 2's trial already paid. cuPDLPx keeps even that decision on the device; this
+// does not yet, and the measurement in module.txt says what it costs.
+
 #ifndef SOVSOLVE_SOLVER_PDLP_PDLP_HPP
 #define SOVSOLVE_SOLVER_PDLP_PDLP_HPP
 

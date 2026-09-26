@@ -72,6 +72,8 @@ LP_CONFIGS = {
     "dual-simplex":   ["--method=dual-simplex"],
     "primal-simplex": ["--method=primal-simplex"],
     "pdlp":           ["--method=pdlp"],
+    # Module 31: the same engine on cuPDLPx's reflected-Halpern scheme.
+    "pdlpx":          ["--method=pdlpx"],
     "hsd":            ["--method=hsd"],
     # CUDA builds only; skipped with a reason elsewhere. NOTHING here is
     # automatic: the solver never moves a run to the GPU on its own, so a GPU
@@ -79,6 +81,10 @@ LP_CONFIGS = {
     "ipm":            ["--method=ipm"],
     "pdlp-gpu":       ["--method=pdlp", "--gpu-resident=1"],
     "pdlp-gpu-spmv":  ["--method=pdlp", "--gpu-spmv=1", "--gpu-spmv-timing=1"],
+    # Module 31 on the device. CUDA graphs are on by default; the -nograph row
+    # is the same kernels launched one by one, so the pair isolates the gain.
+    "pdlpx-gpu":      ["--method=pdlpx", "--gpu-resident=1"],
+    "pdlpx-gpu-nograph": ["--method=pdlpx", "--gpu-resident=1", "--gpu-graphs=0"],
     "concurrent-gpu": ["--method=concurrent", "--concurrent-gpu-ipm=1"],
 }
 
@@ -90,7 +96,8 @@ MIP_CONFIGS = {
 }
 
 # Which configurations need a CUDA build.
-GPU_CONFIGS = {"ipm", "pdlp-gpu", "pdlp-gpu-spmv", "concurrent-gpu"}
+GPU_CONFIGS = {"ipm", "pdlp-gpu", "pdlp-gpu-spmv", "concurrent-gpu", "pdlpx-gpu",
+               "pdlpx-gpu-nograph"}
 
 # The solver's best LP setting and best MIP setting. This is what runs when
 # no --config/--compare is given: a benchmark should show a tool at its
@@ -102,7 +109,8 @@ DEFAULT_MIP = ["mip"]
 # configuration it should be compared against, because "the GPU took 0.4s" is
 # not a result -- "the GPU took 0.4s where the same engine on the host took
 # 0.9s" is. `concurrent` leads so the row is also comparable to a default run.
-GPU_COMPARE_LP = ["concurrent", "pdlp", "pdlp-gpu", "pdlp-gpu-spmv", "ipm"]
+GPU_COMPARE_LP = ["concurrent", "pdlp", "pdlpx", "pdlp-gpu", "pdlpx-gpu",
+                  "pdlpx-gpu-nograph", "pdlp-gpu-spmv", "ipm"]
 
 # Columns that lead the CSV, in this order. Everything the solver printed is
 # appended after them, so new statistics need no change here.

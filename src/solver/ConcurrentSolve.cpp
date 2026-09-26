@@ -30,6 +30,7 @@ constexpr std::size_t kNoWinner = std::numeric_limits<std::size_t>::max();
     case Method::DualSimplex: return "dual-simplex";
     case Method::PrimalSimplex: return "primal-simplex";
     case Method::Pdlp: return "pdlp";
+    case Method::PdlpX: return "pdlpx";
     case Method::Hsd: return "hsd";
     case Method::InteriorPoint: return "ipm";
     case Method::Concurrent: return "concurrent";
@@ -54,7 +55,8 @@ constexpr std::size_t kNoWinner = std::numeric_limits<std::size_t>::max();
   o.cancel = &token;
   o.simplex.method = method;
 
-  if (method == Method::Pdlp) {
+  if (method == Method::Pdlp || method == Method::PdlpX) {
+    o.pdlp.halpern = method == Method::PdlpX;
     auto r = pdlp::solve_pdlp(problem, o);
     if (!r.has_value()) return r.error();
     return pdlp::to_canonical_solution(problem, *r);
