@@ -54,7 +54,7 @@ void print_usage(const char* argv0) {
       "for the full doc comment on why each default is what it is):\n"
       "\n"
       "  --method=ipm|dual-simplex|primal-simplex|pdlp|pdlpx|hsd|concurrent\n"
-      "                        `concurrent` (Module 30) races dual simplex, PDLP,\n"
+      "                        `concurrent` (Module 30) races dual simplex, cuPDLPx,\n"
       "                        primal simplex and HSD on separate cores and keeps\n"
       "                        the first verdict. SimplexOptions::method\n"
       "  --concurrent-threads=N  ConcurrentOptions::max_threads (0 = use the\n"
@@ -302,7 +302,7 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
         options.simplex.method = sovsolve::model::Method::Hsd;
       } else if (val == "concurrent") {
         options.simplex.method = sovsolve::model::Method::Concurrent;
-        // The race includes PDLP, and PDLP wants its paper's preconditioning
+        // The race includes cuPDLPx, which wants its paper's preconditioning
         // (see above). The other entrants are indifferent to it.
         options.scaling.mode = sovsolve::model::ScalingMode::RuizPockChambolle;
       } else {

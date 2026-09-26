@@ -29,8 +29,7 @@ constexpr std::size_t kNoWinner = std::numeric_limits<std::size_t>::max();
   switch (m) {
     case Method::DualSimplex: return "dual-simplex";
     case Method::PrimalSimplex: return "primal-simplex";
-    // discarding pdlp for now
-   // case Method::Pdlp: return "pdlp"; 
+    case Method::Pdlp: return "pdlp";
     case Method::PdlpX: return "pdlpx";
     case Method::Hsd: return "hsd";
     case Method::InteriorPoint: return "ipm";
@@ -105,7 +104,8 @@ std::vector<Method> default_concurrent_methods() {
   //
   //   dual simplex    the usual winner on small and medium models
   //   primal simplex  wins where the dual stalls, e.g. after a bound change
-  //   PDLP            first-order, factors NOTHING -- the one that keeps
+  //   cuPDLPx         reflected-Halpern first-order method; factors NOTHING
+  //                   and is the one that keeps
   //                   going on the largest and sparsest models, and stands
   //                   in for the barrier slot in Gurobi's line-up
   //   HSD             homogeneous self-dual interior point. Earns its thread
@@ -122,7 +122,7 @@ std::vector<Method> default_concurrent_methods() {
   // of threads the machine actually has, so a two-core box races the first
   // two and a large workstation races them all. Nothing here assumes a
   // particular core count.
-  return {Method::DualSimplex, Method::Pdlp, Method::PrimalSimplex, Method::Hsd};
+  return {Method::DualSimplex, Method::PdlpX, Method::PrimalSimplex, Method::Hsd};
 }
 
 core::Expected<Solution> solve_concurrent(const model::CanonicalProblem& problem,
