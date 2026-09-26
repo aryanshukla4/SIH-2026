@@ -29,8 +29,18 @@ PORTABILITY. Pure standard library, Python 3.8+. Runs the same on a laptop
 and on an A100 box; GPU configurations are detected and skipped with a
 recorded reason rather than failing.
 
+CPU OR GPU? The solver does NOT choose for you, and neither does this script.
+Every default run is on the CPU. The GPU engines are separate `--method`s and
+separate flags, so they are separate configurations here (`ipm`, `pdlp-gpu`,
+`pdlp-gpu-spmv`, `concurrent-gpu`) and only run when you ask -- with `--gpu`,
+`--compare` or `--configs`. What IS automatic is the two things you cannot get
+wrong by accident: the script prefers a CUDA build when one exists and runs on
+this platform, and it records GPU configurations as SKIPPED with a reason on a
+build that has no CUDA instead of failing.
+
 USAGE
-    python scripts/benchmark.py                     # LP corpus, best config
+    python scripts/benchmark.py                     # LP corpus, best config, CPU
+    python scripts/benchmark.py --gpu               # CPU vs GPU A/B
     python scripts/benchmark.py --all --repeat 3    # everything, 3 repeats
     python scripts/benchmark.py --compare           # every engine, for A/B
     python scripts/benchmark.py --help              # all options
@@ -63,9 +73,13 @@ LP_CONFIGS = {
     "primal-simplex": ["--method=primal-simplex"],
     "pdlp":           ["--method=pdlp"],
     "hsd":            ["--method=hsd"],
-    # CUDA builds only; skipped with a reason elsewhere.
+    # CUDA builds only; skipped with a reason elsewhere. NOTHING here is
+    # automatic: the solver never moves a run to the GPU on its own, so a GPU
+    # measurement only happens when one of these names is selected.
     "ipm":            ["--method=ipm"],
     "pdlp-gpu":       ["--method=pdlp", "--gpu-resident=1"],
+    "pdlp-gpu-spmv":  ["--method=pdlp", "--gpu-spmv=1", "--gpu-spmv-timing=1"],
+    "concurrent-gpu": ["--method=concurrent", "--concurrent-gpu-ipm=1"],
 }
 
 MIP_CONFIGS = {
@@ -76,13 +90,19 @@ MIP_CONFIGS = {
 }
 
 # Which configurations need a CUDA build.
-GPU_CONFIGS = {"ipm", "pdlp-gpu"}
+GPU_CONFIGS = {"ipm", "pdlp-gpu", "pdlp-gpu-spmv", "concurrent-gpu"}
 
 # The solver's best LP setting and best MIP setting. This is what runs when
 # no --config/--compare is given: a benchmark should show a tool at its
 # intended settings, the same way every published solver comparison does.
 DEFAULT_LP = ["concurrent"]
 DEFAULT_MIP = ["mip"]
+
+# `--gpu`: the CPU/GPU A/B. Each GPU configuration is paired with the host
+# configuration it should be compared against, because "the GPU took 0.4s" is
+# not a result -- "the GPU took 0.4s where the same engine on the host took
+# 0.9s" is. `concurrent` leads so the row is also comparable to a default run.
+GPU_COMPARE_LP = ["concurrent", "pdlp", "pdlp-gpu", "pdlp-gpu-spmv", "ipm"]
 
 # Columns that lead the CSV, in this order. Everything the solver printed is
 # appended after them, so new statistics need no change here.
@@ -366,6 +386,11 @@ def benchmark(args):
     print("machine  : %s, %s cores" % (env["cpu"] or "unknown cpu", env["cores"]))
     print("gpu      : %s" % (env["gpu"] or "none detected"))
     print("cuda     : %s" % ("yes" if cuda else "no (GPU configs skipped)"))
+    if args.gpu and not cuda:
+        print()
+        print("  --gpu was asked for but this build has no CUDA engines. The GPU")
+        print("  rows will say SKIPPED. Build with: cmake --preset cuda &&")
+        print("  cmake --build build-cuda")
     print()
 
     # --- which models -----------------------------------------------------
@@ -395,6 +420,8 @@ def benchmark(args):
     def configs_for(family):
         if args.configs:
             return [c.strip() for c in args.configs.split(",") if c.strip()]
+        if args.gpu and family != "mip":
+            return list(GPU_COMPARE_LP)
         if args.compare:
             return list(MIP_CONFIGS) if family == "mip" else list(LP_CONFIGS)
         return DEFAULT_MIP if family == "mip" else DEFAULT_LP
@@ -563,6 +590,10 @@ def main():
       Every engine on every LP instance -- the A/B that shows no single
       engine wins everywhere.
 
+  python scripts/benchmark.py --gpu
+      CPU vs GPU on every LP instance. Nothing runs on the GPU without this
+      (or --compare / --configs): the default run is CPU-only.
+
   python scripts/benchmark.py --corpus mip --node-limit 2000
       MIPLIB at a fixed node budget, so runs are comparable.
 
@@ -587,6 +618,8 @@ def main():
                         help="comma-separated configuration names to run")
     parser.add_argument("--compare", action="store_true",
                         help="run every engine, not just the default one")
+    parser.add_argument("--gpu", action="store_true",
+                        help="CPU/GPU A/B on LP models; needs a CUDA build")
     parser.add_argument("--config", action="append", metavar="NAME=FLAGS",
                         help="define a configuration, repeatable")
     parser.add_argument("--solver-flag", action="append", metavar="FLAG",

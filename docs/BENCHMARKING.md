@@ -18,6 +18,7 @@ the current platform**. Override with `--solver PATH`.
 ```sh
 python scripts/benchmark.py                          # Netlib, best config
 python scripts/benchmark.py --compare                # every engine, A/B
+python scripts/benchmark.py --gpu                    # CPU vs GPU (see below)
 python scripts/benchmark.py --corpus mip --node-limit 2000
 python scripts/benchmark.py --all --repeat 3 --out results/full.csv
 ```
@@ -31,6 +32,7 @@ MIPLIB instances go in `tests/data/MILP/` by hand (they are not committed).
 | `--instances FILE/DIR ...` | explicit models instead of a corpus |
 | `--no-auto-family` | disable automatic LP/MILP classification (enabled by default) |
 | `--compare` | every engine, not just the default one |
+| `--gpu` | CPU/GPU A/B on LP models — **nothing uses the GPU without this** |
 | `--configs a,b,c` | named configurations to run |
 | `--config "name=--flags"` | define your own, repeatable |
 | `--repeat N` | N runs per cell, best kept, spread recorded |
@@ -67,16 +69,45 @@ continuous models use the normal LP default. The CSV's `family` column shows
 the choice. Pass `--no-auto-family` to retain the original `custom` family,
 or use `--configs` to choose configurations explicitly.
 
-## GPU
+## GPU: you have to ask
 
-GPU configurations (`ipm`, `pdlp-gpu`) are detected by running the solver,
-not by guessing from the build directory. On a CPU-only build they are
-recorded as `SKIPPED` with the reason, never silently dropped.
+**The solver does not pick CPU or GPU for you, and neither does this script.
+A default run is CPU-only.** The GPU engines are reached through their own
+`--method` and their own flags, so here they are their own configurations and
+run only when named — with `--gpu`, `--compare`, or `--configs`.
 
-On a datacentre card also try `--config "concurrent-gpu=--method=concurrent
---concurrent-gpu-ipm=1"`. That is off by default because consumer Ampere runs
-FP64 at 1/64 rate, which does not hold on A100 and later — see
-`docs/ARCHITECTURE-REVIEW.md` §3.5.
+```sh
+python scripts/benchmark.py --gpu                    # CPU vs GPU A/B on LP
+python scripts/benchmark.py --gpu --corpus large     # the big instances
+python scripts/benchmark.py --configs pdlp,pdlp-gpu  # one pair only
+```
+
+`--gpu` runs `concurrent, pdlp, pdlp-gpu, pdlp-gpu-spmv, ipm` on every LP
+instance. The host `pdlp` row is deliberately included: "the GPU took 0.4s" is
+not a result, "the GPU took 0.4s where the same engine on the host took 0.9s"
+is.
+
+| Config | Solver flags | What runs on the GPU |
+|---|---|---|
+| `ipm` | `--method=ipm` | the whole interior-point path (CUDA-only engine) |
+| `pdlp-gpu` | `--method=pdlp --gpu-resident=1` | the entire PDLP iterate, device-resident |
+| `pdlp-gpu-spmv` | `--method=pdlp --gpu-spmv=1 --gpu-spmv-timing=1` | only `K` and `Kᵀ`; kernel and transfer time reported separately |
+| `concurrent-gpu` | `--method=concurrent --concurrent-gpu-ipm=1` | adds the GPU interior-point engine to the race |
+
+`concurrent-gpu` is not in `--gpu`'s list and `--concurrent-gpu-ipm` is off by
+default, because consumer Ampere runs FP64 at 1/64 rate — that penalty does
+not hold on A100 and later, so on a datacentre card it is worth adding:
+`--configs concurrent,concurrent-gpu`. See `docs/ARCHITECTURE-REVIEW.md` §3.5.
+
+Two things *are* automatic, and both are the safe direction:
+
+* The script prefers a CUDA build (`build-cuda/`) over a CPU build when one
+  exists **and executes on this platform** — a repo built both on Windows and
+  under WSL has two binaries and only one of them runs.
+* Whether the build actually has CUDA is decided by running the solver, not by
+  the directory name. Without it, GPU configurations are recorded as `SKIPPED`
+  with the reason in the CSV — never silently dropped, never a crash. `--gpu`
+  also says so on the console before it starts.
 
 ## Cross-solver comparison
 
