@@ -14,6 +14,7 @@
 #include <cstdint>
 
 #include "sovsolve/core/Cancel.hpp"
+#include "sovsolve/core/Span.hpp"
 #include "sovsolve/core/Types.hpp"
 
 namespace sovsolve::model {
@@ -696,9 +697,43 @@ struct PdlpOptions {
   std::size_t power_iterations = 100;
   Real power_tolerance = 1e-6;
 
-  /// Iteration cap. `0` means automatic: `100000`, matching the paper's own
-  /// KKT-pass limit for its baseline comparisons.
+  /// Iteration cap. `0` means automatic: `1000000` (measured, see Pdlp.cpp).
+  ///
+  /// The cuPDLPx paper benchmarks with a time limit ALONE (section 4, "Time
+  /// limit": 3600 s for small and medium instances, no iteration cap), and a
+  /// cap on top of it reports as a failure a run the paper counts as solved.
+  /// But that protocol is requested EXPLICITLY -- `scripts/benchmark.py
+  /// --paper` passes a huge `--pdlp-max-iter` -- rather than inferred from
+  /// the time limit, because `Limits::time_limit_seconds` is never unset: it
+  /// defaults to 3600. An earlier version lifted the cap whenever a time
+  /// limit was present, and so lifted it on EVERY run, turning a stalled
+  /// model's ~10 s MaxIterations into an hour-long wait.
   std::size_t max_iterations = 0;
+
+  /// Evaluate the termination criteria on the ORIGINAL problem rather than
+  /// the preconditioned one the iteration runs on.
+  ///
+  /// cuPDLPx section 4: "The termination criteria are checked for the
+  /// original LP instance, not the preconditioned ones, so that the
+  /// preconditioning does not impact the termination." Without this, `1e-8`
+  /// means "1e-8 in whatever units Ruiz and Pock-Chambolle happened to
+  /// produce", which is not comparable across scalings, across engines, or to
+  /// the paper -- and a scaling that shrinks the residuals would make the
+  /// method look converged when it is not.
+  ///
+  /// It needs the preconditioner's factors, `R` and `S` in `A~ = R A S`, which
+  /// only the caller has (they live in the transform stack). They go in
+  /// `original_row_scale` / `original_col_scale` below; when those are empty
+  /// the criteria fall back to the problem as given, which is also what a
+  /// caller that did not scale should get.
+  bool terminate_on_original = true;
+
+  /// The preconditioner's composite row and column factors, `R` and `S`.
+  /// NON-OWNING, like `Options::cancel`: set by the caller for the duration of
+  /// one solve (LpSolve.cpp), empty otherwise. Only read when
+  /// `terminate_on_original` is set and the lengths match the problem.
+  core::HostSpan<const Real> original_row_scale;
+  core::HostSpan<const Real> original_col_scale;
 
   // ---- Module 31: the cuPDLPx scheme (arXiv 2507.14051) ------------------
   //
@@ -734,68 +769,69 @@ struct PdlpOptions {
   /// a non-fixed point.
   Real halpern_step_fraction = 0.998;
 
-  /// The three fixed-point restart constants.
+  /// The three fixed-point restart constants -- PUBLISHED, not tuned here.
   ///
-  /// `r(z_{n,k}) <= halpern_restart_sufficient * r(z_{n,0})` is a DECAY test,
-  /// so a small constant is the hard, decisive one and a larger constant the
-  /// weak one that needs the "no local progress" guard beside it. cuPDLPx
-  /// names the three but publishes no values; only the first is recoverable
-  /// from the theory, and the other two are this project's, documented as
-  /// such in Pdlp.hpp rather than presented as the paper's.
+  /// cuPDLPx names the three conditions but publishes no values. They come
+  /// instead from HPR-LP (Chen, Sun, Yuan, Zhang, Zhao, arXiv 2408.12179),
+  /// section 4, "Initialization and parameter setting": "the restart
+  /// criteria are based on conditions (10), (11), and (12), with parameters
+  /// alpha_1 = 0.2, alpha_2 = 0.6, and alpha_3 = 0.2."
   ///
-  /// The THEORY's constant is `1/e`: arXiv 2407.16144 equation (10), and
-  /// Theorem 2 is proved for exactly that. The default is 0.2 instead,
-  /// because it measured better and the theorem does not forbid it -- a
-  /// smaller constant demands a stronger decay per epoch, which only makes
-  /// the restart rarer, never unsound. Measured on the 18 feasible Netlib
-  /// instances, KKT passes to 1e-8, with the PID below:
+  /// Borrowing them is licensed, not merely convenient. arXiv 2509.23903
+  /// (same authors) Proposition 3.1 proves that cuPDLPx with `gamma = 1`
+  /// generates EXACTLY the iterates of the HPR method when `sigma = eta /
+  /// omega` and `lambda_A = 1 / eta^2` -- and HPR-LP's merit function
+  /// `||w - w-hat||_M` is the same fixed-point residual as cuPDLPx's
+  /// `||z - PDHG(z)||_P`. Same method, same quantity, same three conditions.
   ///
-  ///     sufficient = 1/e    16/18 solved   504,320 passes
-  ///     sufficient = 0.2    16/18 solved   464,068 passes   (-8%)
-  ///     sufficient = 0.5    15/18 solved   588,134 passes
-  ///
-  /// 18 instances is a small corpus to tune on, so `1/e` stays one flag
-  /// away (`--pdlp-restart-sufficient=0.3679`) for anyone who wants the
-  /// setting the theorem covers.
-  ///
-  /// `necessary` was swept too: 0.5 cost +19% against 0.8.
+  /// HISTORY, kept because it is the reason for the rule above: these were
+  /// once tuned on 18 Netlib instances (0.2 / 0.8 / 0.36), and on the full
+  /// 99 that tuning did not generalize. The one that survived, 0.2, happens
+  /// to be HPR-LP's alpha_1. The theory's own `1/e` (arXiv 2407.16144 eq.
+  /// 10) remains one flag away: `--pdlp-restart-sufficient=0.3679`.
   Real halpern_restart_sufficient = 0.2;
-  Real halpern_restart_necessary = 0.8;
-  Real halpern_restart_artificial = 0.36;
+  Real halpern_restart_necessary = 0.6;
+  Real halpern_restart_artificial = 0.2;
 
-  /// PID coefficients for the primal weight (cuPDLPx section 3).
+  /// How often conditions (i) and (ii) are EVALUATED, in iterations.
   ///
-  /// cuPDLPx publishes none of the three. What anchors them: with
-  /// `K_I = K_D = 0` the PID update collapses ALGEBRAICALLY onto cuPDLP's
-  /// Algorithm 3 with `theta = K_P` (derivation in Pdlp.hpp), so `K_P = 0.5`
-  /// reproduces that published rule exactly. That is the reference point the
-  /// sweep below starts from, not the default it ends at.
+  /// 1 is cuPDLPx ("evaluates potential restart conditions at each
+  /// iteration"), which the fixed-point residual makes free. HPR-LP checks
+  /// "termination and restart criteria every 150 iterations", and its alpha
+  /// constants above were published under that schedule. Default 1, the
+  /// cuPDLPx design this module implements; 150 is the configuration the
+  /// constants were chosen for, and the two are measured against each other
+  /// rather than assumed equivalent.
+  std::size_t halpern_restart_check_every = 1;
+
+  /// Which rule moves the primal weight at a restart.
+  enum class WeightRule : std::uint8_t {
+    /// HPR-LP Algorithm 3 ("SigmaUpdate"), translated through Proposition 3.1:
+    /// `omega = ||dy|| / ||dx||`, applied only under its safeguards (17) --
+    /// both distances in (1e-16, 1e12) -- and (18) -- the ratio of relative
+    /// dual to primal infeasibility at the restart point in (1e-8, 1e8) --
+    /// and otherwise reset to the starting weight. NO free constant: every
+    /// number in it is published.
+    HprLp,
+    /// cuPDLPx section 3's PID controller. Its three coefficients are NOT
+    /// published (see below), which is why it is not the default.
+    Pid,
+  };
+  WeightRule weight_rule = WeightRule::HprLp;
+
+  /// PID coefficients, used only with `WeightRule::Pid`.
   ///
-  /// MEASURED, and the first guess was badly wrong. 18 feasible Netlib
-  /// instances, KKT passes to 1e-8, `sufficient = 0.2`:
-  ///
-  ///     Kp / Ki / Kd       solved   passes
-  ///     .5 / .05 / .1      10/18    1,077,194   the first guess
-  ///     .5 / 0   / 0       16/18      515,788   = Algorithm 3 exactly
-  ///     .3 / .01 / .05     16/18      464,068   the default
-  ///
-  /// So the integral and derivative terms DO earn their place (-10% against
-  /// pure Algorithm 3), but only at small gains. At `K_I = 0.05` the
-  /// integral winds up across epochs and drags `omega` off balance for long
-  /// after the error changed sign; it cost six instances outright. The same
-  /// sweep over the older restart rule gave the same ranking, so this is not
-  /// an artefact of one setting of the others.
+  /// cuPDLPx publishes none of the three. With `K_I = K_D = 0` the update
+  /// collapses onto the original PDLP paper's Algorithm 3 with `theta = K_P`
+  /// (derivation in Pdlp.hpp), so `(0.5, 0, 0)` reproduces a published rule;
+  /// the values below were this project's own tuning on 18 Netlib instances,
+  /// kept for comparison, and are NOT a claim that they generalize -- on the
+  /// full 99-instance set they did not.
   Real pid_kp = 0.3;
   Real pid_ki = 0.01;
   Real pid_kd = 0.05;
 
-  /// Anti-windup clamp on the accumulated integral term, in log units.
-  ///
-  /// A textbook PID necessity, not a tuning knob: `sum e_i` is unbounded, and
-  /// one long epoch with a badly balanced weight would drive `omega` off by
-  /// `exp(K_I * sum)` and keep it there long after the error changed sign.
-  /// The bound is in log space, so +-10 is a factor of `e^0.1 = 1.11` of
-  /// authority for the integral term at `K_I = 0.01`.
+  /// Anti-windup clamp on the PID's accumulated integral term, in log units.
   Real pid_integral_clamp = 10.0;
 };
 

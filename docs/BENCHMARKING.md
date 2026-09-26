@@ -32,6 +32,7 @@ MIPLIB instances go in `tests/data/MILP/` by hand (they are not committed).
 | `--instances FILE/DIR ...` | explicit models instead of a corpus |
 | `--no-auto-family` | disable automatic LP/MILP classification (enabled by default) |
 | `--compare` | every engine, not just the default one |
+| `--paper` | the cuPDLPx paper's protocol for the first-order engines (below) |
 | `--gpu` | CPU/GPU A/B on LP models — **nothing uses the GPU without this** |
 | `--configs a,b,c` | named configurations to run |
 | `--config "name=--flags"` | define your own, repeatable |
@@ -68,6 +69,34 @@ code. A detected discrete model gets the `mip` configuration by default;
 continuous models use the normal LP default. The CSV's `family` column shows
 the choice. Pass `--no-auto-family` to retain the original `custom` family,
 or use `--configs` to choose configurations explicitly.
+
+## The paper protocol (`--paper`)
+
+```sh
+python scripts/benchmark.py --paper                  # pdlp, pdlpx
+python scripts/benchmark.py --paper --gpu            # + their GPU rows
+python scripts/benchmark.py --paper --time-limit 300 # shorter than the paper
+```
+
+Runs `pdlp` and `pdlpx` the way the cuPDLPx paper (arXiv 2507.14051,
+section 4) measures first-order LP solvers, so the numbers are comparable to
+its tables:
+
+* **Both tolerances**, `1e-4` and `1e-8` — rows are named `pdlpx@1e-4`,
+  `pdlpx@1e-8`. Engines are only ever ranked against the same tolerance.
+* **Termination on the original LP**, not the preconditioned one. This is the
+  solver's default; `--pdlp-original-termination=0` restores the old
+  behaviour for comparison.
+* **A time limit only**, no iteration cap. Default 3600 s, the paper's value
+  for small and medium instances. `--paper` lifts the solver's default
+  1,000,000-iteration cap explicitly; outside `--paper` the cap stays on.
+* **SGM10** in the summary: the shifted geometric mean of solve time, shift
+  10 s, with every unsolved run charged the full time limit as the paper
+  specifies.
+
+At 3600 s a stalled instance costs an hour, so a full Netlib run can take many
+hours. `--time-limit 300` is a reasonable laptop setting; say which one you
+used when you report the numbers.
 
 ## GPU: you have to ask
 

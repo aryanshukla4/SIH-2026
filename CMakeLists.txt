@@ -31,16 +31,15 @@ if(SOVSOLVE_ENABLE_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
 
-  # cuDSS is not part of the stock CUDA toolkit apt package -- degrade to a
-  # message rather than a hard configure failure, same spirit as the zlib
-  # message in src/io/CMakeLists.txt.
-  find_library(SOVSOLVE_CUDSS_LIBRARY NAMES cudss)
-  if(SOVSOLVE_CUDSS_LIBRARY)
-    message(STATUS "cuDSS found: sparse-direct GPU path enabled")
-  else()
-    message(STATUS "cuDSS NOT found: sparse-direct GPU path unavailable "
-                    "(install it separately -- it does not ship with the CUDA toolkit)")
-  endif()
+  # cuDSS is deliberately NOT looked for. It is a complete sparse direct
+  # solver, which PS 26119 rules out building on ("shall not be built upon
+  # any existing open source solver library"), and no code here ever called
+  # it. An earlier version of this file searched for it anyway and, when the
+  # build machine happened to have it installed, linked it automatically and
+  # announced a "sparse-direct GPU path" that did not exist -- the kind of
+  # thing a reviewer would rightly question. The GPU interior point is
+  # matrix-free (CG / MINRES over cuSPARSE products); see
+  # include/sovsolve/solver/gpu/LinearSolver.hpp.
 endif()
 
 # --------------------------------------------------------------------------

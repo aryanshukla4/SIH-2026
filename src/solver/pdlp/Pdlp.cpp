@@ -21,7 +21,24 @@ using core::SolverStatus;
 using model::CanonicalProblem;
 using model::Options;
 
-constexpr std::size_t kDefaultMaxIterations = 100000;
+/// The default iteration cap, chosen from measurement rather than inherited.
+///
+/// It was 100,000, the NeurIPS paper's KKT-pass budget for its baseline
+/// comparisons. On the full Netlib set, run with no cap and a 300 s limit,
+/// the instances pdlpx solves at 1e-8 needed:
+///
+///     cap          solved (of 39 solved with no cap, first 41 instances)
+///     100,000      29
+///     200,000      33
+///     1,000,000    36
+///     10,000,000   37
+///
+/// So 100,000 was stopping about one solvable run in four. 1,000,000 keeps
+/// all but a long tail, and what it costs -- a genuinely stalled model takes
+/// ~10x longer to give up -- is paid only by standalone runs: inside
+/// `--method=concurrent` PDLP is cancelled the moment another engine wins.
+/// On large models the time limit binds long before either cap would.
+constexpr std::size_t kDefaultMaxIterations = 1000000;
 
 [[nodiscard]] Real dot(const core::RealVector& a, const core::RealVector& b) {
   Real acc = 0.0;
@@ -191,6 +208,25 @@ class PdlpSolver {
   core::RealVector primal_residual_;
 
   Real omega_ = 1.0;  ///< primal weight; adapts in C3, fixed at 1 until then
+
+  // ---- termination in original units (cuPDLPx section 4) ----------------
+  //
+  // The preconditioner's factors, or empty when the criteria are to be
+  // measured on the problem as given. `||b||` and `||c||` are the
+  // normalizers of (6b) and (6c) in the SAME units as the residuals they
+  // divide -- original when the factors are present -- and they are fixed
+  // for the run, so they are computed once rather than at every check.
+  core::HostSpan<const Real> row_scale_;
+  core::HostSpan<const Real> col_scale_;
+  Real b_norm_ = 0.0;
+  Real c_norm_ = 0.0;
+
+  [[nodiscard]] Real inv_row_scale(std::size_t i) const {
+    return row_scale_.empty() ? 1.0 : 1.0 / row_scale_[i];
+  }
+  [[nodiscard]] Real inv_col_scale(std::size_t j) const {
+    return col_scale_.empty() ? 1.0 : 1.0 / col_scale_[j];
+  }
   std::size_t step_rejections_ = 0;
 
   // ---- adaptive restarts (paper section 3.2) ----------------------------
@@ -261,6 +297,15 @@ class PdlpSolver {
 
 void PdlpSolver::evaluate(Convergence& conv) {
   // `K'y` gives the reduced costs; `Kx` gives the primal residual.
+  //
+  // WHERE THE CRITERIA ARE MEASURED. With `terminate_on_original` (the
+  // default) and the preconditioner's factors supplied, the two residual
+  // norms and their normalizers are taken in the ORIGINAL problem's units,
+  // as cuPDLPx section 4 specifies. No extra products: with `A~ = R A S`,
+  // `b~ = R b`, `c~ = S c`, both residuals are the scaled ones divided
+  // elementwise by `R` or `S`, and the two objectives -- hence the gap -- are
+  // invariant under the scaling (`c~'x~ = c'x`, `b~'y~ = b'y`,
+  // `l~ lambda~ = l lambda`), so they need no change at all.
   matvec_.multiply_transpose(in(y_), out(kt_y_));
   matvec_.multiply(in(x_), out(k_x_));
 
@@ -272,7 +317,9 @@ void PdlpSolver::evaluate(Convergence& conv) {
     const Real lambda =
         project_reduced_cost(raw, problem_.col_lower[j], problem_.col_upper[j]);
     reduced_cost_[j] = lambda;
-    const Real leftover = raw - lambda;
+    // `S^-1` maps a scaled dual residual back to original units:
+    // `c~ - A~'y~ = S (c - A'y)`. A no-op (1) without the scale factors.
+    const Real leftover = (raw - lambda) * inv_col_scale(j);
     dual_residual_sq += leftover * leftover;
 
     // `l'lambda^+ - u'lambda^-`, skipping infinite bounds. The projection
@@ -291,7 +338,11 @@ void PdlpSolver::evaluate(Convergence& conv) {
     const Real slack = k_x_[i] - problem_.b[i];
     const Real violation = i < problem_.num_equality ? slack : std::max(slack, 0.0);
     primal_residual_[i] = violation;
-    primal_residual_sq += violation * violation;
+    // `R^-1` likewise: `A~x~ - b~ = R (A x - b)`. The stored vector stays in
+    // the scaled space the certificate tests work in; only the NORM that the
+    // stopping rule reads is taken in original units.
+    const Real original = violation * inv_row_scale(i);
+    primal_residual_sq += original * original;
   }
 
   const Real primal_objective = dot(problem_.c, x_);
@@ -300,8 +351,8 @@ void PdlpSolver::evaluate(Convergence& conv) {
   conv.primal_objective = primal_objective;
   conv.gap = std::fabs(dual_objective - primal_objective) /
              (1.0 + std::fabs(dual_objective) + std::fabs(primal_objective));
-  conv.primal = std::sqrt(primal_residual_sq) / (1.0 + euclidean_norm(problem_.b));
-  conv.dual = std::sqrt(dual_residual_sq) / (1.0 + euclidean_norm(problem_.c));
+  conv.primal = std::sqrt(primal_residual_sq) / (1.0 + b_norm_);
+  conv.dual = std::sqrt(dual_residual_sq) / (1.0 + c_norm_);
 }
 
 PdlpResult PdlpSolver::pack(SolverStatus status, const Convergence& conv) const {
@@ -662,6 +713,31 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   diff_y_.resize(m_);
   diff_y_.assign(0.0);
 
+  // Termination units. The factors are used only when they are there AND
+  // fit: a caller that did not scale, or passed the wrong problem's factors,
+  // gets the criteria on the problem as given rather than an out-of-range
+  // read.
+  if (opt_.pdlp.terminate_on_original &&
+      opt_.pdlp.original_row_scale.size() == m_ &&
+      opt_.pdlp.original_col_scale.size() == n_) {
+    row_scale_ = opt_.pdlp.original_row_scale;
+    col_scale_ = opt_.pdlp.original_col_scale;
+  }
+  {
+    Real b_sq = 0.0;
+    for (std::size_t i = 0; i < m_; ++i) {
+      const Real v = problem_.b[i] * inv_row_scale(i);
+      b_sq += v * v;
+    }
+    Real c_sq = 0.0;
+    for (std::size_t j = 0; j < n_; ++j) {
+      const Real v = problem_.c[j] * inv_col_scale(j);
+      c_sq += v * v;
+    }
+    b_norm_ = std::sqrt(b_sq);
+    c_norm_ = std::sqrt(c_sq);
+  }
+
   // Paper section 4.1: "All first-order methods use all-zero vectors as the
   // initial starting points." Zero is not interior and does not need to be --
   // PDHG projects, it does not follow a barrier.
@@ -733,6 +809,9 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   // whole convergence argument rests on (arXiv 2407.16144 Proposition 7).
   const Real gamma = std::clamp(opt_.pdlp.reflection, 0.0, 1.0);
 
+  // `0` = automatic, the default cap. The paper protocol's "time limit only"
+  // is asked for EXPLICITLY with a large `max_iterations` (Options.hpp says
+  // why it cannot be inferred from the time limit).
   const std::size_t budget =
       opt_.pdlp.max_iterations != 0 ? opt_.pdlp.max_iterations : kDefaultMaxIterations;
   const std::size_t interval = std::max<std::size_t>(opt_.pdlp.check_interval, 1);
@@ -772,6 +851,14 @@ core::Expected<PdlpResult> PdlpSolver::run() {
     params.check_interval = interval;
     params.restarts_enabled = restarts_enabled ? 1 : 0;
     params.weight_update = opt_.pdlp.primal_weight_update ? 1 : 0;
+    params.weight_rule =
+        opt_.pdlp.weight_rule == model::PdlpOptions::WeightRule::Pid ? 1 : 0;
+    params.restart_check_every =
+        std::max<std::size_t>(opt_.pdlp.halpern_restart_check_every, 1);
+    // HPR-LP's safeguard (18) is on RELATIVE infeasibilities, in the units
+    // the iteration runs in -- the preconditioned problem, as in HPR-LP.
+    params.b_norm = euclidean_norm(problem_.b);
+    params.c_norm = euclidean_norm(problem_.c);
     HalpernState initial;
     initial.omega = omega_;
     backend_.write_halpern_state(initial);
