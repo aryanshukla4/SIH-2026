@@ -53,7 +53,7 @@ void print_usage(const char* argv0) {
       "tuning flags (each is a field on model::Options -- see Options.hpp\n"
       "for the full doc comment on why each default is what it is):\n"
       "\n"
-      "  --method=ipm|dual-simplex|primal-simplex|pdlp|hsd|concurrent\n"
+      "  --method=ipm|dual-simplex|primal-simplex|pdlp|pdlpx|hsd|concurrent\n"
       "                        `concurrent` (Module 30) races dual simplex, PDLP,\n"
       "                        primal simplex and HSD on separate cores and keeps\n"
       "                        the first verdict. SimplexOptions::method\n"
@@ -73,9 +73,18 @@ void print_usage(const char* argv0) {
       "  --pdlp-adaptive=0|1   PdlpOptions::adaptive_step_size (default 1)\n"
       "  --pdlp-restart=0|1    PdlpOptions::adaptive_restart   (default 1)\n"
       "  --pdlp-primal-weight=0|1  PdlpOptions::primal_weight_update (default 1)\n"
+      "  Module 31 (--method=pdlpx), cuPDLPx arXiv 2507.14051:\n"
+      "  --pdlp-reflection=X   reflection gamma in [0,1]      (default 1)\n"
+      "  --pdlp-step-fraction=X  eta = X/||A||_2              (default 0.998)\n"
+      "  --pdlp-restart-sufficient=X  fixed-point decay, hard (default 0.2)\n"
+      "  --pdlp-restart-necessary=X   fixed-point decay, weak (default 0.8)\n"
+      "  --pdlp-restart-artificial=X  epoch length cap        (default 0.36)\n"
+      "  --pdlp-pid=Kp,Ki,Kd   primal-weight PID coefficients (default .3,.01,.05)\n"
       "  --gpu-resident=0|1    --method=pdlp with the WHOLE iterate on the GPU\n"
       "                        (CUDA builds only). The fast path: per trial only\n"
       "                        24 bytes cross the bus. Use this one.\n"
+      "  --gpu-graphs=0|1      with --gpu-resident and --method=pdlpx, replay each\n"
+      "                        check interval as ONE captured CUDA graph (default 1)\n"
       "  --gpu-spmv=0|1        --method=pdlp with only K and K' on the GPU (CUDA\n"
       "                        builds only). Kept for comparison -- it copies\n"
       "                        vectors across the bus on every product.\n"
@@ -179,6 +188,9 @@ bool gpu_spmv = false;
 bool gpu_spmv_timing = false;
 /// The whole PDLP iterate on the device (module.txt 24F), not just `K`.
 bool gpu_resident = false;
+/// Module 31: CUDA graphs over the resident Halpern loop. A flag so the gain
+/// is measured against the identical launch sequence issued directly.
+bool gpu_graphs = true;
 
 bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
   const auto eq = flag.find('=');
@@ -226,6 +238,44 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.pdlp.adaptive_step_size = (val != "0");
       return true;
     }
+    if (key == "pdlp-reflection") {
+      options.pdlp.reflection = std::stod(val);
+      return true;
+    }
+    if (key == "pdlp-step-fraction") {
+      options.pdlp.halpern_step_fraction = std::stod(val);
+      return true;
+    }
+    if (key == "pdlp-restart-sufficient") {
+      options.pdlp.halpern_restart_sufficient = std::stod(val);
+      return true;
+    }
+    if (key == "pdlp-restart-necessary") {
+      options.pdlp.halpern_restart_necessary = std::stod(val);
+      return true;
+    }
+    if (key == "pdlp-restart-artificial") {
+      options.pdlp.halpern_restart_artificial = std::stod(val);
+      return true;
+    }
+    if (key == "pdlp-pid") {
+      // Three coefficients in one flag because they are tuned together: the
+      // integral and derivative terms are corrections on the proportional
+      // one, and a sweep that moves one without the others is measuring the
+      // wrong thing.
+      const std::size_t first = val.find(',');
+      const std::size_t second = first == std::string::npos
+                                     ? std::string::npos
+                                     : val.find(',', first + 1);
+      if (second == std::string::npos) {
+        std::fprintf(stderr, "--pdlp-pid needs three values: Kp,Ki,Kd\n");
+        return false;
+      }
+      options.pdlp.pid_kp = std::stod(val.substr(0, first));
+      options.pdlp.pid_ki = std::stod(val.substr(first + 1, second - first - 1));
+      options.pdlp.pid_kd = std::stod(val.substr(second + 1));
+      return true;
+    }
     if (key == "pdlp-check-interval") {
       options.pdlp.check_interval = static_cast<std::size_t>(std::stoull(val));
       return true;
@@ -244,6 +294,10 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
         // preconditioning its paper specifies -- overridable with an explicit
         // later --scaling=.
         options.scaling.mode = sovsolve::model::ScalingMode::RuizPockChambolle;
+      } else if (val == "pdlpx" || val == "pdlp-x") {
+        // Module 31: the same engine, cuPDLPx's reflected-Halpern scheme.
+        options.simplex.method = sovsolve::model::Method::PdlpX;
+        options.scaling.mode = sovsolve::model::ScalingMode::RuizPockChambolle;
       } else if (val == "hsd" || val == "homogeneous") {
         options.simplex.method = sovsolve::model::Method::Hsd;
       } else if (val == "concurrent") {
@@ -254,8 +308,8 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       } else {
         std::fprintf(
             stderr,
-            "unknown --method: %s (ipm, dual-simplex, primal-simplex, pdlp, hsd, "
-            "concurrent)\n",
+            "unknown --method: %s (ipm, dual-simplex, primal-simplex, pdlp, "
+            "pdlpx, hsd, concurrent)\n",
             val.c_str());
         return false;
       }
@@ -263,6 +317,8 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       gpu_spmv = (val != "0");
     } else if (key == "gpu-resident") {
       gpu_resident = (val != "0");
+    } else if (key == "gpu-graphs") {
+      gpu_graphs = (val != "0");
     } else if (key == "gpu-spmv-timing") {
       gpu_spmv_timing = (val != "0");
     } else if (key == "dse") {
@@ -479,13 +535,15 @@ int main(int argc, char** argv) {
 #ifdef SOVSOLVE_ENABLE_CUDA
   std::unique_ptr<sovsolve::solver::gpu::CusparseMatVec> gpu_matvec;
   std::unique_ptr<sovsolve::solver::gpu::DevicePdlpBackend> gpu_backend;
-  const bool is_pdlp = options.simplex.method == sovsolve::model::Method::Pdlp;
+  const bool is_pdlp = options.simplex.method == sovsolve::model::Method::Pdlp ||
+                       options.simplex.method == sovsolve::model::Method::PdlpX;
   if (gpu_resident && is_pdlp) {
     provider = [&gpu_backend](const sovsolve::model::CanonicalProblem& canonical)
         -> sovsolve::core::Expected<sovsolve::solver::PdlpBackends> {
       auto created = sovsolve::solver::gpu::DevicePdlpBackend::create(canonical);
       if (!created.has_value()) return created.error();
       gpu_backend = std::move(created.value());
+      gpu_backend->set_use_graphs(gpu_graphs);
       return sovsolve::solver::PdlpBackends{&gpu_backend->cold_matvec(),
                                              gpu_backend.get()};
     };
@@ -559,6 +617,14 @@ int main(int argc, char** argv) {
   if (gpu_backend) {
     std::printf("gpu_resident=1\n");
     std::printf("gpu_device_bytes=%zu\n", gpu_backend->device_bytes());
+    // Whether graphs actually ENGAGED, not whether they were asked for: a
+    // capture that failed falls back silently to direct launches, and a
+    // benchmark row must not credit graphs with a run that never used one.
+    std::printf("gpu_graphs=%d\n", gpu_backend->graphs_active() ? 1 : 0);
+    std::printf("gpu_graph_launches=%zu\n", gpu_backend->graph_launches());
+    if (!gpu_backend->graph_note().empty()) {
+      std::printf("gpu_graph_note=%s\n", gpu_backend->graph_note().c_str());
+    }
   }
   if (gpu_matvec) {
     // Kernel and transfer are reported SEPARATELY on purpose. The roofline

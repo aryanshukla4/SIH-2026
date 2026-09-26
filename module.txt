@@ -157,6 +157,37 @@ Format order:
 4. QPLIB — named in the problem statement, has its own format. MPS-QP (QUADOBJ/QMATRIX)
    already works.
 
+FIXED-FORMAT FIELD PACKING -- 2026-09-26, found by benchmarking against HiGHS.
+forplan.mps failed to LOAD: "166 [COLUMNS] undefined name: row 'DEDO3 11' was
+never declared". A whole instance we could not read at all, on every engine,
+while HiGHS solves it in 0.03 s (ours now: 0.006 s, objective -6.6421896127e+02,
+matching HiGHS exactly).
+
+Cause. A name containing a space is the one thing fixed-format MPS can express
+and free format cannot, so `detect_fixed_format` switches to column windows when
+a ROWS line splits into more than two whitespace fields. forplan is the only
+instance in the 91-file corpus that trips that -- its rows are `DEDO3 1R`,
+`AZ 100`. Detection was correct; what followed was not. `split_fixed` returned
+each field at its SPEC index, but every section parser indexes fields PACKED,
+the way `split_free` returns them. Only ROWS and BOUNDS put anything in the
+first window (columns 2-3: the row type, the bound key); COLUMNS, RHS, RANGES
+and QUADOBJ leave it blank. So field 0 came back empty and everything shifted by
+one -- `count_column_entries` read the empty window as the column name and the
+column name `DEDO3 11` as a row name, hence the error naming a "row" that is
+actually a column.
+
+Fix: `split_fixed` packs from index 0, skipping empty windows, so the windows
+decide only where each field ENDS. It is then a drop-in for `split_free` and the
+section parsers need no format-dependent indexing at all. A file of space-free
+names parses identically either way, which is why the shift survived until an
+instance forced the fixed path on.
+
+Test: mps_reader_test's `test_fixed_format_names_with_spaces` -- row `R ONE`,
+column `X ONE`, two field pairs on one line, plus RHS and a BOUNDS key, every
+field placed at its spec column. It asserts the objective came from pair (2,3)
+and the matrix entry from pair (4,5) of the SAME line, which a shift by one
+would cross over, and that BOUNDS still finds its key at field 0.
+
 ## 2. Canonicalizer
 Input: Problem. Output: canonical Problem + TransformRecord.
 
@@ -1191,6 +1222,80 @@ an unpinned belt-and-braces guard, stated as such.
 
 The lesson is the same as the MOSEK paper's: the answer was in the reference
 the whole time, in a section I had not read closely.
+
+## 24H. The certificate tolerance, re-measured against dfl001 -- 2026-09-26
+
+FOUND BY BENCHMARKING AGAINST HiGHS, not by a test. Over 91 Netlib LPs, our
+answers matched HiGHS everywhere but two. One was a parser failure (forplan,
+see Module 1). The other was 24G's own failure mode again, one layer deeper:
+dfl001 -- FEASIBLE, optimum 1.1266396047e+07, which HiGHS solves in 7.06 s and
+our dual simplex solves exactly in 23530 iterations -- was reported UNBOUNDED
+at PDLP iteration 480, with primal infeasibility 1.9e-2 and a 53% duality gap.
+Nowhere near converged, and a confidently wrong verdict.
+
+WHY (50)/(51) LET IT THROUGH. Both divide a violation measured in VARIABLE
+units by an improvement measured in OBJECTIVE units, so their epsilon is
+dimensionless only while `c` is O(1). Instrumented, the accepted candidate was
+
+    ||v_x|| = 5.63   cone violation = 3.25   -c'x = 3.67e6   tol*(-c'x) = 3.67
+
+-- 58% of the candidate's own length pointing OUT of the box's recession cone,
+waved through because the objective rate was large. 24G fixed a test that
+normalized by the candidate's SIZE; what replaced it depends instead on the
+SCALE OF c, which no instance in the 19-instance corpus was extreme enough to
+expose.
+
+A FIX THAT WAS TRIED AND REJECTED, recorded because the reasoning is appealing
+and the measurement refutes it. Bound each violation a second time against the
+norm of the vector it was carved out of: cone against ||v_x||, rows against
+||A v_x||. Dimensionally exact, same units both sides. It was implemented, and
+it breaks gas11 -- which IS unbounded -- because gas11's genuine certificate
+measures cone/||v_x|| = 0.36 and row/||A v_x|| = 1.000. A full 100% of the row
+activity is violation, since the candidate is `z^{k+1} - z^k`, the direction of
+TRAVEL, which on an unbounded model is dominated by the ray but still carries
+the whole transient. A real ray is NOT near its own recession cone in a
+relative sense at PDLP accuracy. Removed, and the rejection is written into
+the header of pdlp/Infeasibility.cpp so it does not get re-proposed.
+
+WHAT ACTUALLY SEPARATES THEM is the margin inside (51), and it is wide:
+
+    instance   cone violation per unit of improvement
+    dfl001     8.8e-7     bogus
+    gas11      9.2e-11    real
+
+Nearly four orders of magnitude. So `certificate_tolerance` moves from 1e-6 to
+1e-8, which rejects dfl001 with 88x to spare and accepts gas11 with 108x.
+
+RE-SWEPT, all 19 tracked instances, gas11 with presolve off (the same procedure
+as 24G's table). The old note at the option -- "1e-8 MISSES gas11" -- was
+measured against the PRE-24G test and is stale; corrected in place:
+
+    tolerance   false verdicts   gas11
+    1e-4        4                detected
+    1e-6        0                detected
+    1e-8        0                detected
+    1e-9        0                detected
+
+TESTS. pdlp_test's `test_flat_rays_are_rejected` gains case (a'): the existing
+boxed model `min -x` over `0 <= x <= 1` with its cost scaled to -1e7, which is
+dfl001's mechanism in miniature -- same geometry, ratio driven to 1e-7, so it
+is accepted at 1e-6 and rejected at 1e-8. It also asserts the SHIPPED default
+rejects it, so lowering the default back would fail the test rather than
+silently reopen the bug.
+
+STILL OPEN, and it is the more general problem. ConcurrentSolve's
+`is_definitive` treats Optimal, Infeasible and Unbounded alike: the first
+engine to reach any of them cancels the rest. So ONE engine's false verdict
+ends the race with a wrong answer, and that is what happened here -- PDLP
+answered in 0.197 s and cancelled a dual simplex that needed 19 s to get it
+right. The race's own tests check that it agrees with every engine that can
+solve a model alone; nothing tests an engine returning a confident WRONG
+verdict faster than a correct engine finishes. Tightening the tolerance fixes
+this instance, not the class. The structural options are to rank an exact
+(simplex) verdict above an epsilon-approximate one, or to require corroboration
+before accepting Infeasible/Unbounded from a first-order engine. Neither is
+implemented; the tradeoff is real, since on a genuinely unbounded model PDLP is
+often the only entrant that finishes quickly.
 
 ## 25. Homogeneous self-dual embedding -- added 2026-09-14/15, `--method=hsd`
 
@@ -2730,3 +2835,209 @@ binkar10_1 57%, timtab1 52%, mas74 46%) and every probe is an independent LP.
 Amdahl on those shares puts it at 1.5-2.2x end-to-end. After that, parallel
 tree search, which has the highest ceiling and is the only one that is
 inherently non-deterministic.
+
+
+================================================================================
+Module 31: cuPDLPx -- reflected Halpern PDHG (`--method=pdlpx`)
+================================================================================
+
+SOURCES. arXiv 2507.14051 (cuPDLPx) states four changes to cuPDLP but proves
+none of them and publishes one constant. The theory is arXiv 2407.16144,
+"Restarted Halpern PDHG for Linear Programming" (Algorithm 2 is the reflected
+scheme, equation (10) the restart rule, Corollary 1 the factor-of-2). Nothing
+read from either project's source.
+
+WHAT CHANGED, as one switch (PdlpOptions::halpern, or Method::PdlpX):
+
+  averaged PDHG iterate      ->  reflected Halpern:
+                                 z+ = l[(1+g)T(z) - g z] + (1-l) z0, l=(k+1)/(k+2)
+  adaptive step (Alg 2)      ->  constant eta = 0.998/||A||_2 (power iteration)
+  normalized-gap restart     ->  fixed-point error r(z) = ||z - T(z)||_P
+  Algorithm 3 primal weight  ->  PID on log(w ||dx|| / ||dy||)
+
+One switch because they justify each other: the constant step is only safe
+because reflection already lengthens the effective step, and the restart
+criterion is only defined for the Halpern iteration.
+
+THE DESIGN POINT: TWO PRODUCTS PER ITERATION, SAME AS VANILLA PDHG. The
+Halpern blend is linear, so K and K' commute with it: IterationBackend carries
+K x and K' y through the same blend as the iterate instead of recomputing
+them. K T(z)_x comes free from K(2x'-x) = 2Kx' - Kx. The obvious
+implementation costs three products; a test pins it at two.
+
+THE RESTART CRITERION IS FREE. r(z)^2 = (w/eta)|dx|^2 + 2 dy'A dx +
+|dy|^2/(eta w) -- exactly the three scalars TrialMetrics already carried for
+Algorithm 2. So it is tested every iteration instead of every 40, and a
+restart costs zero products (restart_at_pdhg_point reuses the last step's
+T(z) and both its images). Restarts go to T(z_{n,k}), not z_{n,k}: Algorithm 2
+line 6.
+
+CORRECTNESS TRAP, REPORTED POINT. With reflection the iterate is an
+extrapolation and can leave the box X. Every reported number -- objective,
+residuals, returned x -- is read from T(z) (BackendVector::PdhgX), which is a
+projection. Tested: max_bound_violation <= 1e-9 on every pdlpx test model.
+
+BUG FOUND BY THE ABLATION TEST. The artificial restart (epoch >= 0.36 x total)
+was first tested every iteration like the other two. At iteration 1 that is
+1 >= 0.36, so the run opened with a restart on nearly every step, each feeding
+the PID a one-step "distance travelled". Plain Halpern (gamma=0) stalled on a
+3-variable LP. That condition reads only counters, so it went back on the
+check_interval schedule averaged PDLP always used. After the fix the ablation
+orders as the theory says: gamma=1 120 iters, 0.5 280, 0 440.
+
+CONSTANTS -- MEASURED, and the first guess was badly wrong. 18 feasible
+Netlib, KKT passes to 1e-8:
+
+  PID Kp/Ki/Kd   sufficient   solved   passes
+  .5/.05/.1      1/e          10/18    1,077,194   first guess
+  .5/0/0         1/e          16/18      526,969   = Algorithm 3 exactly
+  .3/.01/.05     1/e          16/18      504,320
+  .3/.01/.05     0.2          16/18      464,068   DEFAULT
+  .5/0/0         0.2          16/18      515,788
+  .3/.01/.05     0.2, nec .5  16/18      553,576
+
+K_I=K_D=0 collapses the PID onto Algorithm 3 with theta=K_P (derivation in
+Pdlp.hpp), which gives a published reference point. Integral/derivative terms
+help only at small gains; at K_I=0.05 windup cost six instances. 1/e is the
+theory's constant (Theorem 2); 0.2 measured 8% better. 18 instances is a small
+tuning corpus -- every constant is a flag.
+
+RESULT vs --method=pdlp (same engine, same scaling, same termination):
+
+  solved: pdlpx 16/18, pdlp 13/18. New: 25fv47, bell5, stair.
+  On the 13 both solve: 62,500 vs 297,488 KKT passes (4.8x), fewer on all 13,
+  up to 6.2x (adlittle). Regression: 80bau3b (the first-guess constants
+  solved it; the tuned ones hit the cap).
+
+ON THE GPU (--method=pdlpx --gpu-resident=1). DevicePdlpBackend implements
+the three Halpern operations as kernels: the existing PDHG kernels, the
+existing deterministic two-stage reduction (its (y'-y)(Kext-Kx)/2 term IS the
+fixed-point cross term), plus a fused blend kernel that updates a vector and
+its matrix image in one launch. Restarts are device-to-device copies. Per
+iteration the host reads 24 bytes -- r(z)'s three scalars -- because the
+restart decision is made on the host; cuPDLPx keeps even that on the device.
+
+The GPU and host take IDENTICAL KKT pass counts on every instance measured
+(afiro, e226, 25fv47, stair, israel, shell, maros-r7, datt256). Averaged pdlp
+never did -- israel 36k host vs 66k device -- because its adaptive step's
+accept/reject flips on rounding. A constant step removes that source of drift.
+
+A SECOND BOTTLENECK, FOUND BY MEASURING START-UP ALONE. On datt256 the first
+GPU run took 3.63 s, of which only 1.06 s was iterating (5.0x the host's
+loop). 1.53 s was CUDA context + 95 MB upload, unavoidable and paid by pdlp
+too. The other 1.04 s was the power iteration for ||A||_2 -- ~200 products
+through the COLD MatVec, each shipping a full vector across PCIe and back.
+Averaged pdlp never paid it (Algorithm 1 starts from ||K||_inf). Fix:
+IterationBackend::spectral_norm(), which a device backend computes with the
+vector resident and one scalar read back per power step; same seed, same
+update (a DIVISION, as on the host, not a multiply by the reciprocal), same
+stopping rule. Start-up 2.57 s -> 2.03 s, and the pass count stayed 1079.
+
+  datt256 (262k cols)   engine s   vs pdlp host
+  pdlp  host             25.15       1.0x
+  pdlp  GPU               6.70       3.8x     previous best
+  pdlpx host              5.84       4.3x
+  pdlpx GPU               3.01       8.4x     2.2x over previous best
+
+  maros-r7 (9.4k cols): pdlpx host 2.18 s, GPU 3.77 s. The GPU LOSES here, as
+  it did for averaged pdlp (ARCHITECTURE-REVIEW 3.5): ~10k iterations, each
+  paying launch latency and one sync, on a matrix too small to hide them.
+
+  Netlib (1-3k cols): GPU 13-65x slower than host throughout. Expected at this
+  size; the host is the right place for these and the concurrent race will
+  never pick the GPU for them.
+
+THE RESTART DECISION MOVED TO THE DEVICE (no per-iteration sync). The
+controller -- r(z), the three conditions, the PID -- was extracted into
+solver/pdlp/HalpernControl.hpp as __host__ __device__ functions over two POD
+structs, so the host backend and a one-thread device kernel run the SAME
+source rather than two copies. IterationBackend::run_halpern(count, ...) now
+runs whole chunks up to the next termination check; the solver calls it once
+per check_interval. The device version enqueues every iteration's kernels
+with no host wait; tau, sigma and lambda are read from controller state in
+device memory, and the three restart kernels (anchor distance, PID, move to
+T(z)) are guarded by a device-side flag and exit after one read when it is
+clear. halpern_on_restart deliberately leaves that flag set: the move kernel
+runs after the PID kernel, and clearing it there would count restarts while
+silently skipping their moves.
+
+Checked: host pass counts bit-identical to before the refactor on all 18
+Netlib instances; device vs host over two 80-iteration chunks with loosened
+constants so >= 3 restarts occur, agreeing on restart count, epoch position,
+omega (1e-8), T(z) and the infeasibility sequences.
+
+MEASURED, AND IT DID NOT BUY WHAT WAS EXPECTED:
+
+  GPU engine s   with sync   no sync
+  datt256          3.01        2.90
+  maros-r7         3.77        3.40
+  israel           3.53        2.50
+  25fv47          14.29       15.17
+  stair           18.37       19.16
+
+All inside this machine's noise -- the same host datt256 run gave 5.84 s and
+7.25 s on two runs -- so no speedup is claimed. What the numbers DO show is
+the reason: the GPU path is LAUNCH-bound, not sync-bound. stair is 0.26 ms
+per iteration over 13 launches, ~20 us per launch, which is WSL2's launch
+latency. Removing one sync while adding ~4 launches is roughly a wash here.
+On native Linux (~4 us per launch) the sync would be a larger share of the
+iteration, so the change should matter more on the target A100 box -- but
+that is a prediction, not a measurement.
+
+CUDA GRAPHS -- the lever the no-sync step exposed. With the controller
+resident, one iteration's launch sequence is invariant: the only per-iteration
+argument, the iteration number, moved into HalpernState::total and is
+advanced by controller_kernel itself. So a whole check interval (40
+iterations, ~520 nodes) is captured once and replayed as ONE launch; chunks of
+any other length replay a captured single iteration. Mechanics that matter:
+
+  * The legacy default stream cannot be captured, so the backend owns a
+    stream and points cuSPARSE at it (cusparseSetStream). It is BLOCKING, so
+    every cold-path cudaMemcpy on the legacy stream still waits for it --
+    no new synchronization points, and the build has no per-thread default
+    stream to break that (checked).
+  * A captured launch replays its arguments verbatim, so the cache is keyed
+    on the parameters, the tracking choice and every buffer address;
+    accept_trial swaps x/x_trial on the averaged path, which is exactly how
+    an address could change under a cached graph.
+  * A failed capture (a cuSPARSE that refuses capture, say) restores the
+    sticky status, falls back to direct launches, and says why; the CLI
+    prints gpu_graphs=1 only when a graph actually ENGAGED, so a benchmark row
+    cannot credit graphs with a run that never used one.
+
+Checked: graph replay is BIT-identical to direct launches of the same
+sequence (mixed 40- and 7-iteration chunks, >= 3 restarts inside the graph,
+state, T(z), iterate and infeasibility sequences all compared with ==).
+Launch count on that test: 17 graph launches against 134 direct.
+
+MEASURED, graphs off vs on, two runs each, same binary, back to back:
+
+  GPU engine s     graphs off      graphs on       speedup   launches
+  e226             6.27 - 7.22     1.82 - 1.87     3.4-3.9x   20240 -> 506
+  25fv47          16.57 - 17.05    4.63 - 5.16     3.3-3.6x   55880 -> 1397
+  stair           23.07 - 26.13    5.41 - 5.42     4.3-4.8x   69560 -> 1739
+  maros-r7         4.02 - 4.69     2.58 - 3.10     1.5x        9560 -> 239
+  datt256          2.42 - 3.29     2.20 - 2.23     1.1-1.5x     920 -> 23
+
+KKT passes identical in every row -- pure launch-overhead removal. The gain is
+largest where launches dominated (medium models) and smallest on datt256,
+where the GPU is doing real arithmetic. stair went from ~330 us to ~78 us per
+iteration.
+
+NOT CLAIMED: GPU vs host from this run. The machine was loaded during it --
+host datt256 took 12.8 s against 5.8 s earlier, host maros-r7 5.3 s against
+2.2 s -- so the host column is inflated ~2x. The on/off comparison is fair
+(each pair ran back to back under the same load); the cross-device one is
+not. The host still wins outright on small Netlib models (e226 0.09 s host vs
+1.8 s GPU): 1.5 s of context + upload is a fixed cost that only amortizes on
+large models, which belongs in the concurrent line-up's selection rule.
+
+TESTS. pdlp_test +5 (125 checks): pdlpx vs dual simplex on equality / <= /
+free-column / maximization models plus bound violation; reflection ablation at
+gamma 0/0.5/1; two products per iteration; P-only PID does not fight the
+method; Halpern refused on a backend without support. pdlp_device_test +3
+(2391 checks): every Halpern operation host-vs-device over six steps, a
+restart and the step after it, with exact product counts (2 per step, 0 per
+restart); device ||A||_2 vs the host routine to 1e-9; the resident controller
+loop vs the host's across restarts; pdlpx end to end on the device vs the
+host. pdlp_device_test 2459 checks. Host ctest 28/28, CUDA ctest 31/31.

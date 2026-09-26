@@ -124,20 +124,29 @@ inline constexpr std::array<std::pair<std::size_t, std::size_t>, kMaxFields>
 ///
 /// Only fixed format can represent a name containing a space, which is the
 /// sole reason this path exists -- see `MPS-FORMAT-NOTES.md` §1.
+///
+/// The windows decide where each field ENDS; the result is then PACKED from
+/// index 0, so an empty window is skipped rather than left as a hole. That is
+/// what makes this a drop-in alternative to `split_free`, and it is required,
+/// not cosmetic: only ROWS and BOUNDS put anything in the first window (the
+/// row type, the bound key), while COLUMNS, RHS, RANGES and QUADOBJ leave
+/// columns 2-3 blank and start at the name. Returning those at their spec
+/// index shifted every section parser by one -- `count_column_entries` read
+/// `f[0]` as the column name and got the empty window, then read the column
+/// name as a row name. `forplan.mps` is the instance that exposes it, because
+/// its names contain spaces and so it is the one that reaches this path at
+/// all; a file of space-free names parses identically either way, which is
+/// why the shift survived until a name like `DEDO3 11` forced fixed format on.
 [[nodiscard]] inline std::size_t split_fixed(std::string_view line,
                                              FieldArray& out) noexcept {
+  out.fill({});
   std::size_t count = 0;
   for (std::size_t f = 0; f < kMaxFields; ++f) {
     const auto [b, e] = kFixedWindows[f];
     if (b >= line.size()) break;
     const std::size_t end = e < line.size() ? e : line.size();
     const std::string_view field = trim(line.substr(b, end - b));
-    if (!field.empty()) {
-      out[f] = field;
-      count = f + 1;
-    } else {
-      out[f] = {};
-    }
+    if (!field.empty()) out[count++] = field;
   }
   return count;
 }

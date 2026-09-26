@@ -57,6 +57,40 @@ InfeasibilityDetector::InfeasibilityDetector(const model::CanonicalProblem& prob
 // normalized average can be passed as they are.
 //
 // Norm: Euclidean, as in the reference (its section 1.4).
+//
+// WHAT THIS TEST CANNOT DO, and a rejected fix, because the reasoning looks
+// right and is wrong. (50)/(51) divide a violation measured in VARIABLE units
+// by an improvement measured in OBJECTIVE units, so epsilon is dimensionless
+// only while `c` (respectively `b`) is O(1). Scale the objective up and
+// `epsilon * improvement` becomes a large absolute allowance. dfl001 (feasible,
+// optimum 1.1266396047e+07) was reported Unbounded at iteration 480 on exactly
+// that: a candidate with `||v_x|| = 5.63` carrying a cone violation of 3.25 --
+// 58% of its own length pointing OUT of the box's recession cone -- passed at
+// `tol = 1e-6` because `-c'x` was 3.67e6, making the allowance 3.67.
+//
+// The obvious repair is to bound each violation a SECOND time against the norm
+// of the vector it was carved out of: the cone violation against `||v_x||`, the
+// row violation against `||A v_x||`. Dimensionally exact, same units on both
+// sides. It was implemented, and it is wrong, and gas11 is why. gas11 IS
+// unbounded, and the candidate that certifies it measures
+//
+//     cone/||v_x|| = 0.36        row/||A v_x|| = 1.000
+//
+// -- a full 100% of its row activity is violation, because the candidate is
+// `z^{k+1} - z^k`, the direction of TRAVEL, which on an unbounded model is
+// dominated by the ray but still carries the whole transient. A real ray is not
+// close to its own recession cone in a relative sense at PDLP accuracy, so that
+// test rejects the true certificates along with the false one. It was removed.
+//
+// What actually separates them is the MARGIN inside (51), and the separation is
+// nearly four orders of magnitude wide:
+//
+//     dfl001   cone/improvement = 8.8e-7    bogus
+//     gas11    cone/improvement = 9.2e-11   real
+//
+// So the discrimination lives in `certificate_tolerance`, whose default moved
+// from 1e-6 to 1e-8 for this reason -- see the measurement table at that option
+// in Options.hpp. This file's tests are the reference's, unmodified.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -67,6 +101,13 @@ namespace {
 /// and every row an equality, say) passes (50) for any positive objective, and
 /// a positive objective of 1e-18 built from terms of size 1 is rounding.
 constexpr Real kSignificance = 1e-12;
+
+/// `violation <= tolerance * scale`, named so the direction of every one of
+/// these comparisons reads the same way. `scale` is always the objective rate,
+/// which `kSignificance` has already established is strictly positive.
+[[nodiscard]] bool within(Real violation, Real tolerance, Real scale) noexcept {
+  return violation <= tolerance * scale;
+}
 
 }  // namespace
 
@@ -134,7 +175,7 @@ bool InfeasibilityDetector::is_dual_ray(const core::RealVector& v_y, Real tolera
   // (50): a positive objective, and violation at most epsilon PER UNIT of it.
   if (!(rate > kSignificance * magnitude) || !std::isfinite(rate)) return false;
   const Real residual = std::sqrt(cone_violation_sq + sign_violation_sq);
-  return residual <= tolerance * rate;
+  return within(residual, tolerance, rate);
 }
 
 bool InfeasibilityDetector::is_primal_ray(const core::RealVector& v_x, Real tolerance) {
@@ -174,7 +215,8 @@ bool InfeasibilityDetector::is_primal_ray(const core::RealVector& v_x, Real tole
   if (!(improvement > kSignificance * magnitude) || !std::isfinite(improvement)) {
     return false;
   }
-  if (std::sqrt(cone_violation_sq) > tolerance * improvement) return false;
+  const Real cone_violation = std::sqrt(cone_violation_sq);
+  if (!within(cone_violation, tolerance, improvement)) return false;
 
   matvec_->multiply(in(v_x), out(k_v_));
 
@@ -185,7 +227,7 @@ bool InfeasibilityDetector::is_primal_ray(const core::RealVector& v_x, Real tole
     const Real violation = i < problem_->num_equality ? a : std::fmax(a, 0.0);
     row_violation_sq += violation * violation;
   }
-  return std::sqrt(row_violation_sq) <= tolerance * improvement;
+  return within(std::sqrt(row_violation_sq), tolerance, improvement);
 }
 
 CertificateKind InfeasibilityDetector::classify(const core::RealVector& v_x,
