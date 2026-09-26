@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <vector>
 
 #include "sovsolve/solver/pdlp/DualityGap.hpp"
@@ -255,6 +256,7 @@ class PdlpSolver {
   [[nodiscard]] CertificateKind check_certificates(std::size_t total_iterations);
   /// Section 3.2. Returns true when the outer loop restarted.
   [[nodiscard]] bool maybe_restart(std::size_t total_iterations);
+
 };
 
 void PdlpSolver::evaluate(Convergence& conv) {
@@ -436,9 +438,19 @@ void PdlpSolver::accumulate_average(Real eta) {
 /// kept in sync per iteration -- keeping them in sync per iteration is exactly
 /// the transfer cost this refactor exists to remove.
 void PdlpSolver::sync_from_backend() {
-  backend_.download(BackendVector::X, out(x_));
-  backend_.download(BackendVector::Y, out(y_));
-  if (opt_.pdlp.adaptive_restart) {
+  if (opt_.pdlp.halpern) {
+    // NOT `X`/`Y`. With reflection the blended iterate is an extrapolation
+    // and can sit outside the box; `T(z)` is a projection and cannot. Every
+    // number this solver reports -- objective, residuals, the returned point
+    // -- is read from there, so a Halpern run never hands back a primal
+    // point violating its own bounds. See BackendVector::PdhgX.
+    backend_.download(BackendVector::PdhgX, out(x_));
+    backend_.download(BackendVector::PdhgY, out(y_));
+  } else {
+    backend_.download(BackendVector::X, out(x_));
+    backend_.download(BackendVector::Y, out(y_));
+  }
+  if (opt_.pdlp.adaptive_restart && !opt_.pdlp.halpern) {
     backend_.download(BackendVector::AverageX, out(avg_x_));
     backend_.download(BackendVector::AverageY, out(avg_y_));
   }
@@ -659,15 +671,46 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   }
   backend_.set_iterate(in(x_), in(y_));
 
-  omega_ = opt_.pdlp.primal_weight_update ? initialize_primal_weight(problem_) : 1.0;
+  const bool halpern = opt_.pdlp.halpern;
+  if (halpern && !backend_.supports_halpern()) {
+    return core::make_error(
+        core::ErrorCode::UnsupportedFeature,
+        "this PDLP iteration backend does not implement the Halpern scheme; "
+        "use --method=pdlp, or run --method=pdlpx on the host backend");
+  }
 
-  const bool adaptive = opt_.pdlp.adaptive_step_size;
+  // cuPDLPx section 3: "the initial primal weight is set to 1.0". Stated, so
+  // it overrides `initialize_primal_weight`'s `||c||_2/||q||_2` -- the PID
+  // controller is what corrects the balance here, and starting it away from
+  // 1 would put an offset into an integral term that has to work it back off.
+  omega_ = halpern                          ? 1.0
+           : opt_.pdlp.primal_weight_update ? initialize_primal_weight(problem_)
+                                            : 1.0;
+
+  // The Halpern scheme has no trial loop: a constant step size is half of why
+  // it suits a GPU (cuPDLPx section 3, "eliminates the need for the
+  // sequential stepsize search").
+  const bool adaptive = opt_.pdlp.adaptive_step_size && !halpern;
 
   // Algorithm 1 line 2 starts the adaptive rule from `1/||K||_inf`, one sweep.
   // The fixed rule needs the far more expensive `0.9/||K||_2` because nothing
-  // downstream will correct a bad guess.
-  const Real scale = adaptive ? infinity_norm(problem_)
-                              : estimate_spectral_norm(matvec_, opt_);
+  // downstream will correct a bad guess. Halpern needs `||A||_2` for the same
+  // reason and one more: `P` is positive definite only for `eta < 1/||A||_2`,
+  // and `r(z)` is measured in that norm.
+  //
+  // The backend is asked first: where the matrix lives on a device, the host
+  // routine would pay a PCIe round trip per product (IterationBackend.hpp).
+  // Written out rather than `value_or(estimate...)`, which would evaluate the
+  // expensive fallback unconditionally.
+  Real scale = 0.0;
+  if (adaptive) {
+    scale = infinity_norm(problem_);
+  } else if (const std::optional<Real> resident = backend_.spectral_norm(
+                 opt_.pdlp.power_iterations, opt_.pdlp.power_tolerance)) {
+    scale = *resident;
+  } else {
+    scale = estimate_spectral_norm(matvec_, opt_);
+  }
   if (!(scale > 0.0) || !std::isfinite(scale)) {
     // A zero matrix has no coupling between primal and dual; there is nothing
     // for PDHG to iterate on and the caller should not be told it converged.
@@ -679,9 +722,16 @@ core::Expected<PdlpResult> PdlpSolver::run() {
                 conv);
   }
 
-  Real eta = adaptive ? 1.0 / scale : opt_.pdlp.step_size_fraction / scale;
+  Real eta = adaptive          ? 1.0 / scale
+             : halpern         ? opt_.pdlp.halpern_step_fraction / scale
+                               : opt_.pdlp.step_size_fraction / scale;
   const Real fixed_tau = eta / omega_;
   const Real fixed_sigma = eta * omega_;
+  // `gamma = 1` is full reflection, `2 PDHG - id`. Clamped rather than
+  // trusted: cuPDLPx states `gamma in [0, 1]`, and outside it the reflected
+  // operator stops being non-expansive, which is the single property the
+  // whole convergence argument rests on (arXiv 2407.16144 Proposition 7).
+  const Real gamma = std::clamp(opt_.pdlp.reflection, 0.0, 1.0);
 
   const std::size_t budget =
       opt_.pdlp.max_iterations != 0 ? opt_.pdlp.max_iterations : kDefaultMaxIterations;
@@ -699,28 +749,66 @@ core::Expected<PdlpResult> PdlpSolver::run() {
     return pack(SolverStatus::Optimal, conv);
   }
 
+  // Primes `K x` and `K' y` and plants the first anchor. Two products, once.
+  if (halpern) backend_.begin_halpern();
+
   std::size_t iteration = 0;
   SolverStatus outcome = SolverStatus::MaxIterations;
 
+  // The controller's parameters and state (HalpernControl.hpp). The state
+  // lives in the BACKEND -- on the device for a device backend -- and is read
+  // back only at a termination check.
+  HalpernParams params;
+  if (halpern) {
+    params.eta = eta;
+    params.gamma = gamma;
+    params.sufficient = opt_.pdlp.halpern_restart_sufficient;
+    params.necessary = opt_.pdlp.halpern_restart_necessary;
+    params.artificial = opt_.pdlp.halpern_restart_artificial;
+    params.kp = opt_.pdlp.pid_kp;
+    params.ki = opt_.pdlp.pid_ki;
+    params.kd = opt_.pdlp.pid_kd;
+    params.integral_clamp = opt_.pdlp.pid_integral_clamp;
+    params.check_interval = interval;
+    params.restarts_enabled = restarts_enabled ? 1 : 0;
+    params.weight_update = opt_.pdlp.primal_weight_update ? 1 : 0;
+    HalpernState initial;
+    initial.omega = omega_;
+    backend_.write_halpern_state(initial);
+  }
+
   while (iteration < budget) {
     const Real step_taken = eta;
-    if (detect_infeasibility) backend_.snapshot_iterate();
-    if (adaptive) {
-      adaptive_step(iteration, eta);
+    if (halpern) {
+      // Up to the next termination check in ONE call, with every restart
+      // decision made on the backend's side. On the device this is the whole
+      // point: the host enqueues `interval` iterations of kernels and waits
+      // once, instead of reading `r(z)` back after every step. The chunk ends
+      // exactly on the check schedule, so the cold path below fires at the
+      // same iterations it always did.
+      const std::size_t to_check = interval - iteration % interval;
+      const std::size_t chunk = std::min(to_check, budget - iteration);
+      backend_.run_halpern(chunk, iteration, params, detect_infeasibility);
+      iteration += chunk;
     } else {
-      backend_.fixed_step(fixed_tau, fixed_sigma);
-    }
-    if (detect_infeasibility) backend_.finish_difference();
-    if (restarts_enabled) {
-      // Algorithm 1 line 7 weights each iterate by the step size that
-      // produced it, so a long step counts for more in the average than a
-      // short one -- which is what makes the average meaningful when the
-      // adaptive rule is varying the step by an order of magnitude.
-      accumulate_average(adaptive ? step_taken : fixed_tau);
-      ++inner_iterations_;
-    }
+      if (detect_infeasibility) backend_.snapshot_iterate();
+      if (adaptive) {
+        adaptive_step(iteration, eta);
+      } else {
+        backend_.fixed_step(fixed_tau, fixed_sigma);
+      }
+      if (detect_infeasibility) backend_.finish_difference();
+      if (restarts_enabled) {
+        // Algorithm 1 line 7 weights each iterate by the step size that
+        // produced it, so a long step counts for more in the average than a
+        // short one -- which is what makes the average meaningful when the
+        // adaptive rule is varying the step by an order of magnitude.
+        accumulate_average(adaptive ? step_taken : fixed_tau);
+        ++inner_iterations_;
+      }
 
-    ++iteration;
+      ++iteration;
+    }
 
     if (iteration % interval == 0) {
       sync_from_backend();
@@ -773,8 +861,10 @@ core::Expected<PdlpResult> PdlpSolver::run() {
       // Same schedule as the termination check, and for the same reason: the
       // gap evaluations cost matrix products that do not advance the iterate
       // (paper section 3, "we only evaluate the restart or termination
-      // criteria every 40 iterations").
-      if (restarts_enabled) {
+      // criteria every 40 iterations"). The Halpern scheme does NOT come
+      // through here: its criterion is free, so it ran on every iteration
+      // above.
+      if (restarts_enabled && !halpern) {
         (void)maybe_restart(iteration);
       }
     }
@@ -792,6 +882,12 @@ core::Expected<PdlpResult> PdlpSolver::run() {
     outcome = SolverStatus::Optimal;
   }
 
+  if (halpern) {
+    // The controller's state lived in the backend the whole run; one read.
+    const HalpernState final_state = backend_.read_halpern_state();
+    restarts_ = static_cast<std::size_t>(final_state.restarts);
+    omega_ = final_state.omega;
+  }
   PdlpResult result = pack(outcome, conv);
   result.iterations = iteration;
   return result;

@@ -479,6 +479,64 @@ ENDATA
   }
 }
 
+void test_fixed_format_names_with_spaces() {
+  // A name containing a space is the only thing fixed format can express and
+  // free format cannot, so a ROWS line splitting into more than two whitespace
+  // fields switches the reader to column windows. Every field below sits at its
+  // spec column: the type at 2-3, then names/values at 5-12, 15-22, 25-36,
+  // 40-47, 50-61.
+  //
+  // The trap this pins: only ROWS and BOUNDS put anything in the FIRST window.
+  // COLUMNS, RHS and QUADOBJ leave columns 2-3 blank, so a splitter that
+  // returns fields at their spec index hands back an empty field 0 and shifts
+  // every section parser by one -- the column name gets read as a row name.
+  // `forplan.mps` (row `DEDO3 1R`, column `DEDO3 11`) is the Netlib instance
+  // that hits it, and it failed to load at all with
+  // "row 'DEDO3 11' was never declared".
+  const auto p = must_parse(R"(NAME          SPACED
+ROWS
+ N  C OST
+ L  R ONE
+ G  R TWO
+COLUMNS
+    X ONE     C OST     2.0            R ONE     1.0
+    X ONE     R TWO     3.0
+    Y TWO     C OST     4.0            R TWO     5.0
+RHS
+    RHS       R ONE     6.0            R TWO     7.0
+BOUNDS
+ UP BND       X ONE     8.0
+ENDATA
+)");
+  // Names kept whole, spaces and all.
+  CHECK_EQ(p.num_rows(), std::size_t{2});
+  CHECK_EQ(p.num_cols(), std::size_t{2});
+  CHECK(p.objective_row_name == "C OST");
+  CHECK(p.row_names[0] == "R ONE");
+  CHECK(p.row_names[1] == "R TWO");
+  CHECK(p.col_names[0] == "X ONE");
+  CHECK(p.col_names[1] == "Y TWO");
+
+  // The objective came from field pair (2,3) and the matrix entry from (4,5) of
+  // the same line -- a shift by one would have crossed these over.
+  CHECK_NEAR(p.c[0], 2.0, 1e-15);
+  CHECK_NEAR(p.c[1], 4.0, 1e-15);
+  CHECK_NEAR(at(p, 0, 0), 1.0, 1e-15);   // R ONE / X ONE
+  CHECK_NEAR(at(p, 1, 0), 3.0, 1e-15);   // R TWO / X ONE
+  CHECK_NEAR(at(p, 1, 1), 5.0, 1e-15);   // R TWO / Y TWO
+  CHECK_NEAR(at(p, 0, 1), 0.0, 1e-15);
+
+  // RHS reached the rows it names, not the set name.
+  CHECK_NEAR(p.row_upper[0], 6.0, 1e-15);   // L
+  CHECK_NEAR(p.row_lower[1], 7.0, 1e-15);   // G
+
+  // BOUNDS is the other section that uses field 0, so it must NOT shift: the
+  // key stays at 0 and the optional set name is still skipped by name lookup.
+  CHECK_NEAR(p.col_upper[0], 8.0, 1e-15);
+  CHECK(core::is_pos_infinite(p.col_upper[1]));
+  CHECK(p.validate());
+}
+
 void test_empty_and_comment_lines() {
   const auto p = must_parse(R"(* a comment in column 1
 NAME          CMT
@@ -515,6 +573,7 @@ int main() {
   test_fortran_d_exponent();
   test_errors_are_located();
   test_sos_is_refused_not_ignored();
+  test_fixed_format_names_with_spaces();
   test_empty_and_comment_lines();
   return sovsolve::test::report("mps_reader");
 }

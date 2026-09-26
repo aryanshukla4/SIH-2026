@@ -120,7 +120,8 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options,
     log_concurrent_race(report, options.log);
     if (!result.has_value()) return result.error();
     canonical = std::move(*result);
-  } else if (options.simplex.method == model::Method::Pdlp) {
+  } else if (options.simplex.method == model::Method::Pdlp ||
+             options.simplex.method == model::Method::PdlpX) {
     // The injected backend, when there is one. PDLP's only contact with the
     // matrix is through this, so the GPU path differs from the host path in
     // exactly one object and nothing else.
@@ -130,12 +131,19 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options,
       if (!supplied.has_value()) return supplied.error();
       backends = *supplied;
     }
+    // Module 31. `PdlpX` is one engine with one flag set, not a second
+    // engine: a copy of the options here keeps the caller's `Options` a
+    // `const&` all the way down and keeps the two schemes sharing every line
+    // of setup, termination and postprocessing.
+    model::Options pdlp_options = options;
+    pdlp_options.pdlp.halpern = options.simplex.method == model::Method::PdlpX;
+    const model::Options& active = pdlp_options;
     auto result =
         backends.matvec && backends.iteration
-            ? pdlp::solve_pdlp(canon->problem, options, *backends.matvec,
+            ? pdlp::solve_pdlp(canon->problem, active, *backends.matvec,
                                *backends.iteration)
-        : backends.matvec ? pdlp::solve_pdlp(canon->problem, options, *backends.matvec)
-                          : pdlp::solve_pdlp(canon->problem, options);
+        : backends.matvec ? pdlp::solve_pdlp(canon->problem, active, *backends.matvec)
+                          : pdlp::solve_pdlp(canon->problem, active);
     if (!result.has_value()) return result.error();
     canonical = pdlp::to_canonical_solution(canon->problem, *result);
   } else if (options.simplex.method == model::Method::Hsd) {

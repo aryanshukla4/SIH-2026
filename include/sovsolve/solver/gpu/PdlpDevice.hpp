@@ -43,6 +43,8 @@
 
 #include <cstddef>
 #include <memory>
+#include <string>
+#include <optional>
 
 #include "sovsolve/core/Status.hpp"
 #include "sovsolve/core/Types.hpp"
@@ -72,12 +74,34 @@ class DevicePdlpBackend final : public pdlp::IterationBackend {
   [[nodiscard]] pdlp::TrialMetrics trial(Real tau, Real sigma) override;
   void accept_trial() override;
   void fixed_step(Real tau, Real sigma) override;
+  [[nodiscard]] std::optional<Real> spectral_norm(std::size_t iterations,
+                                                  Real tolerance) override;
+  [[nodiscard]] bool supports_halpern() const override { return true; }
+  void begin_halpern() override;
+  [[nodiscard]] pdlp::TrialMetrics halpern_step(Real eta, Real omega, Real gamma,
+                                                Real lambda) override;
+  [[nodiscard]] pdlp::AnchorDistance restart_at_pdhg_point() override;
+  void write_halpern_state(const pdlp::HalpernState& state) override;
+  [[nodiscard]] pdlp::HalpernState read_halpern_state() override;
+  void run_halpern(std::size_t count, std::uint64_t first_iteration,
+                   const pdlp::HalpernParams& params, bool track_differences) override;
   void snapshot_iterate() override;
   void finish_difference() override;
   void accumulate_average(Real weight) override;
   void reset_average() override;
   [[nodiscard]] core::Status status() const override;
   [[nodiscard]] std::size_t own_products() const override;
+
+  /// CUDA graphs over the resident Halpern loop (`run_halpern`). On by
+  /// default; off launches the identical kernel sequence directly, which is
+  /// what makes the two comparable.
+  void set_use_graphs(bool enabled);
+  /// True once a graph has actually been captured and is in use.
+  [[nodiscard]] bool graphs_active() const;
+  /// Why capture was abandoned, if it was. Empty otherwise.
+  [[nodiscard]] const std::string& graph_note() const;
+  /// Graph launches issued (or, without graphs, iterations issued).
+  [[nodiscard]] std::size_t graph_launches() const;
 
   /// The cold path's `K x` / `K' y`, over the same device matrix. Pass this as
   /// the `MatVec` argument of `solve_pdlp` alongside the backend itself.

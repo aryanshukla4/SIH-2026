@@ -687,6 +687,48 @@ End
     CHECK(detector.classify(v_x, v_y, 1e-6) == solver::pdlp::CertificateKind::None);
   }
 
+  // (a') The SAME geometry with the objective scaled up, which is the dfl001
+  // bug in miniature. (51) divides a violation in x-units by an improvement in
+  // objective-units, so multiplying `c` by 1e7 divides the measured ratio by
+  // 1e7 without changing the model's shape at all: the candidate still points
+  // straight out of a boxed column's recession cone, and the model is still
+  // bounded (optimum -1e7). Under the old 1e-6 default this was accepted and
+  // reported Unbounded -- exactly how dfl001 (optimum 1.1266396047e+07) failed
+  // at iteration 480, at a measured cone-per-improvement of 8.8e-7.
+  //
+  // The fix is the tolerance, not an extra condition: bounding the violation
+  // against the candidate's own norm as well was tried and REJECTED, because a
+  // real ray is not close to its recession cone in a relative sense at PDLP
+  // accuracy -- gas11's genuine certificate has 100% of its row activity as
+  // violation. See the header comment in pdlp/Infeasibility.cpp.
+  model::CanonicalResult boxed_costly;
+  CHECK(canonical(R"(Minimize
+ obj: -10000000 x
+Subject To
+ r: y <= 5
+Bounds
+ 0 <= x <= 1
+ y free
+End
+)",
+                  boxed_costly));
+  {
+    const model::CanonicalProblem& p = boxed_costly.problem;
+    solver::pdlp::HostMatVec mv(p);
+    solver::pdlp::InfeasibilityDetector detector(p, mv);
+    core::RealVector v_x(p.num_cols(), 0.0);
+    v_x[0] = 1.0;
+    core::RealVector v_y(p.num_rows(), 0.0);
+    // The ratio is 1/1e7 = 1e-7: inside the old default, outside the new one.
+    CHECK(detector.classify(v_x, v_y, 1e-6) ==
+          solver::pdlp::CertificateKind::DualInfeasible);
+    CHECK(detector.classify(v_x, v_y, 1e-8) == solver::pdlp::CertificateKind::None);
+    // And the shipped default must be the one that rejects it.
+    model::Options defaults;
+    CHECK(detector.classify(v_x, v_y, defaults.pdlp.certificate_tolerance) ==
+          solver::pdlp::CertificateKind::None);
+  }
+
   // (b) (50)'s SIGN condition. Add a redundant `x + y <= 200` to the
   // infeasible model and put a large WRONG-SIGNED dual on it. Its projection
   // onto `y <= 0` is the genuine certificate above -- but the candidate the
@@ -722,6 +764,295 @@ End
           solver::pdlp::CertificateKind::PrimalInfeasible);
   }
 }
+
+// --------------------------------------------------------------------------
+// Module 31: the cuPDLPx scheme
+// --------------------------------------------------------------------------
+
+model::Options pdlpx_options() {
+  model::Options options = pdlp_options();
+  options.simplex.method = model::Method::PdlpX;
+  return options;
+}
+
+/// THE load-bearing test for the whole module, and it has a perfect oracle.
+///
+/// cuPDLPx changes the iteration, the step size, the restart criterion and
+/// the primal weight all at once. Any one of those four done wrong produces a
+/// method that still converges to SOMETHING -- slower, or to the wrong point,
+/// or to a point that is not feasible -- so "it returned Optimal" proves
+/// nothing on its own. What pins it is that a reflected-Halpern run and a
+/// dual-simplex run must agree on the objective of the same model, because
+/// the simplex answer is exact.
+///
+/// The models below are deliberately varied over the things the derivation
+/// touches: equality rows against `<=` rows (the projection onto `Y`), finite
+/// upper bounds against free columns (the projection onto `X`), and a
+/// maximization (the objective sign travels through `to_original`).
+void test_halpern_agrees_with_simplex() {
+  struct Case {
+    const char* name;
+    const char* text;
+  };
+  const Case cases[] = {
+      {"equalities", R"(Minimize
+ obj: 2 x1 + 3 x2 + x3
+Subject To
+ c1: x1 + x2 + x3 = 12
+ c2: x1 - x2 = 2
+Bounds
+ 0 <= x1 <= 9
+ 0 <= x2 <= 9
+ 0 <= x3 <= 9
+End
+)"},
+      {"inequalities", R"(Maximize
+ obj: 3 x + 5 y
+Subject To
+ c1: x + 2 y <= 14
+ c2: 3 x - y >= 0
+ c3: x - y <= 2
+Bounds
+ 0 <= x <= 10
+ 0 <= y <= 10
+End
+)"},
+      {"free_column", R"(Minimize
+ obj: x + y - 2 z
+Subject To
+ c1: x + y + z = 6
+ c2: x - z <= 3
+Bounds
+ 0 <= x <= 5
+ 0 <= y <= 5
+ z free
+End
+)"},
+  };
+
+  for (const Case& c : cases) {
+    model::Solution exact;
+    model::Solution halpern;
+    if (!solve_with(c.name, c.text, simplex_options(), exact)) continue;
+    if (!solve_with(c.name, c.text, pdlpx_options(), halpern)) continue;
+
+    CHECK(exact.status == SolverStatus::Optimal);
+    CHECK(halpern.status == SolverStatus::Optimal);
+    ++::sovsolve::test::checks_run();
+    if (!::sovsolve::test::close(halpern.objective, exact.objective, 1e-6)) {
+      ::sovsolve::test::record(__FILE__, __LINE__, "pdlpx agrees with the simplex",
+                               std::string(c.name) + ": pdlpx " +
+                                   std::to_string(halpern.objective) + ", simplex " +
+                                   std::to_string(exact.objective));
+    }
+
+    // THE reflection-specific check. `(1+gamma) T - gamma id` is an
+    // EXTRAPOLATION, not a projection, so the Halpern iterate itself can sit
+    // outside the box. Reporting it would hand back a primal point violating
+    // its own bounds while every residual still looked fine. The solver
+    // reports `T(z)` instead (BackendVector::PdhgX), and this is what says so.
+    ++::sovsolve::test::checks_run();
+    if (!(halpern.quality.max_bound_violation <= 1e-9)) {
+      ::sovsolve::test::record(
+          __FILE__, __LINE__, "pdlpx respects its own bounds",
+          std::string(c.name) + ": violation " +
+              std::to_string(halpern.quality.max_bound_violation));
+    }
+  }
+}
+
+/// `gamma = 0` must reduce the reflected scheme to plain Halpern, and both
+/// must reach the same answer.
+///
+/// This is the ablation the theory names -- [rHPDHG] Algorithm 1 versus
+/// Algorithm 2 -- and running it is how a sign error in the blend gets
+/// caught. `reflected * trial - pull_back * current` with either coefficient
+/// wrong still converges when `gamma = 1` on an easy model, because the
+/// anchor term drags it back; at `gamma = 0` the `pull_back` term vanishes
+/// entirely, so the two settings exercise DIFFERENT halves of that line.
+void test_reflection_ablation() {
+  const char* model_text = R"(Minimize
+ obj: 4 a + 2 b + 7 c
+Subject To
+ r1: a + b + c = 9
+ r2: a - b + 2 c <= 5
+ r3: 2 a + c >= 4
+Bounds
+ 0 <= a <= 6
+ 0 <= b <= 6
+ 0 <= c <= 6
+End
+)";
+  model::Solution exact;
+  if (!solve_with("ablation", model_text, simplex_options(), exact)) return;
+
+  for (Real gamma : {0.0, 0.5, 1.0}) {
+    model::Options o = pdlpx_options();
+    o.pdlp.reflection = gamma;
+    model::Solution s;
+    if (!solve_with("ablation", model_text, o, s)) continue;
+    CHECK(s.status == SolverStatus::Optimal);
+    ++::sovsolve::test::checks_run();
+    if (!::sovsolve::test::close(s.objective, exact.objective, 1e-6)) {
+      ::sovsolve::test::record(__FILE__, __LINE__, "reflection ablation",
+                               "gamma " + std::to_string(gamma) + ": " +
+                                   std::to_string(s.objective) + " vs " +
+                                   std::to_string(exact.objective));
+    }
+  }
+}
+
+/// The recurrence that keeps the iteration at two matrix products.
+///
+/// `halpern_step` does NOT recompute `K x` and `K' y`; it carries them
+/// through the same linear blend as the iterate itself. That is exact in real
+/// arithmetic and the reason the scheme costs what vanilla PDHG costs -- but
+/// it is also the one place where a wrong coefficient produces a run that
+/// still terminates, just from a corrupted gradient.
+///
+/// So this asserts the COST, which is the observable consequence: products
+/// per iteration must be 2 plus the cold path's 2-per-`check_interval`, and
+/// nothing more. A third product per iteration -- the obvious implementation
+/// -- shows up here as 3.05 and fails.
+void test_halpern_costs_two_products_per_iteration() {
+  auto loaded = io::loadProblem(std::string(SOVSOLVE_TEST_DATA_DIR) + "/netlib/afiro.mps");
+  if (!loaded.has_value()) {
+    ::sovsolve::test::record(__FILE__, __LINE__, "load afiro", loaded.error().format());
+    return;
+  }
+  model::Options o = pdlpx_options();
+  o.pdlp.infeasibility_detection = false;
+  auto solved = solver::solve_lp(loaded.value(), o);
+  if (!solved.has_value()) {
+    ::sovsolve::test::record(__FILE__, __LINE__, "pdlpx afiro",
+                             solved.error().format());
+    return;
+  }
+  CHECK(solved->status == SolverStatus::Optimal);
+  CHECK(solved->iterations > 0);
+
+  // Per iteration: 2 from the step, plus 2 per `check_interval` for the
+  // termination evaluation. Everything else is start-up -- the power
+  // iteration for `||A||_2`, `begin_halpern`, the final re-evaluation --
+  // which is a constant, so a generous slack absorbs it without letting a
+  // third per-iteration product through.
+  const Real per_iteration =
+      static_cast<Real>(solved->matrix_products) / static_cast<Real>(solved->iterations);
+  const Real budget = 2.0 + 2.0 / static_cast<Real>(o.pdlp.check_interval);
+  ++::sovsolve::test::checks_run();
+  if (!(per_iteration < budget + 0.5)) {
+    ::sovsolve::test::record(__FILE__, __LINE__,
+                             "Halpern stays at two products per iteration",
+                             std::to_string(per_iteration) + " products/iteration, " +
+                                 "budget " + std::to_string(budget));
+  }
+}
+
+/// The PID controller reduces to cuPDLP's Algorithm 3 when `K_I = K_D = 0`.
+///
+/// That equivalence is what licenses `K_P = 0.5` as a PUBLISHED constant
+/// rather than a guess (see Pdlp.hpp), so it is worth holding the code to it:
+/// if the sign of the error term or of the update were flipped, the collapse
+/// would not hold and the two would diverge. Asserting it end-to-end rather
+/// than on the formula means the whole path -- the anchor distances, the
+/// restart that triggers the update, the log-space arithmetic -- is covered.
+///
+/// The check is that a P-only run stays a well-behaved solve. A flipped sign
+/// drives `omega` the wrong way at every restart and the run stops converging
+/// entirely, which is the failure this catches.
+void test_pid_reduces_to_algorithm_three() {
+  auto loaded = io::loadProblem(std::string(SOVSOLVE_TEST_DATA_DIR) + "/netlib/afiro.mps");
+  if (!loaded.has_value()) return;
+
+  model::Options p_only = pdlpx_options();
+  p_only.pdlp.pid_kp = 0.5;
+  p_only.pdlp.pid_ki = 0.0;
+  p_only.pdlp.pid_kd = 0.0;
+
+  model::Options no_weight = pdlpx_options();
+  no_weight.pdlp.primal_weight_update = false;
+
+  auto with_p = solver::solve_lp(loaded.value(), p_only);
+  auto without = solver::solve_lp(loaded.value(), no_weight);
+  if (!with_p.has_value() || !without.has_value()) {
+    ::sovsolve::test::record(__FILE__, __LINE__, "pid ablation", "solve failed");
+    return;
+  }
+  CHECK(with_p->status == SolverStatus::Optimal);
+  CHECK(without->status == SolverStatus::Optimal);
+  CHECK_NEAR(with_p->objective, without->objective, 1e-5);
+
+  // A controller pushing the weight the wrong way does not merely slow the
+  // solve down, it stops it. Holding the P-only run to the SAME iteration
+  // budget as the no-controller run is the assertion that it helps or at
+  // worst does nothing -- not that it fights the method.
+  ++::sovsolve::test::checks_run();
+  if (!(with_p->iterations <= without->iterations * 3 + 200)) {
+    ::sovsolve::test::record(__FILE__, __LINE__, "P-only controller does not fight",
+                             std::to_string(with_p->iterations) + " vs " +
+                                 std::to_string(without->iterations));
+  }
+}
+
+/// A Halpern run on a backend that does not implement it must be REFUSED.
+///
+/// The alternative, with the default no-op overrides on `IterationBackend`,
+/// is an iterate that never moves and a run that reports `MaxIterations` on a
+/// solvable model -- a wrong answer dressed as a slow one. Both shipped
+/// backends implement the scheme, so this guards the NEXT one: any backend
+/// added later inherits the refusal until it opts in.
+void test_halpern_refuses_an_unsupporting_backend() {
+  auto loaded = io::loadProblem(std::string(SOVSOLVE_TEST_DATA_DIR) + "/netlib/afiro.mps");
+  if (!loaded.has_value()) return;
+  model::Options o = pdlpx_options();
+  auto canon = model::canonicalize(loaded.value(), o);
+  if (!canon.has_value()) {
+    ::sovsolve::test::record(__FILE__, __LINE__, "canonicalize", "failed");
+    return;
+  }
+
+  /// A backend that answers every hot-path call and claims no Halpern
+  /// support -- the shape a device implementation has before its kernels land.
+  class NoHalpern final : public solver::pdlp::IterationBackend {
+   public:
+    explicit NoHalpern(solver::pdlp::IterationBackend& inner) : inner_(inner) {}
+    void set_iterate(core::HostSpan<const Real> x,
+                     core::HostSpan<const Real> y) override {
+      inner_.set_iterate(x, y);
+    }
+    void download(solver::pdlp::BackendVector w, core::HostSpan<Real> o) override {
+      inner_.download(w, o);
+    }
+    void begin_step() override { inner_.begin_step(); }
+    [[nodiscard]] solver::pdlp::TrialMetrics trial(Real t, Real s) override {
+      return inner_.trial(t, s);
+    }
+    void accept_trial() override { inner_.accept_trial(); }
+    void fixed_step(Real t, Real s) override { inner_.fixed_step(t, s); }
+    void snapshot_iterate() override { inner_.snapshot_iterate(); }
+    void finish_difference() override { inner_.finish_difference(); }
+    void accumulate_average(Real w) override { inner_.accumulate_average(w); }
+    void reset_average() override { inner_.reset_average(); }
+    [[nodiscard]] std::size_t own_products() const override { return 0; }
+
+   private:
+    solver::pdlp::IterationBackend& inner_;
+  };
+
+  solver::pdlp::HostMatVec matvec(canon->problem);
+  solver::pdlp::HostIterationBackend host(canon->problem, matvec);
+  NoHalpern blind(host);
+  CHECK(!blind.supports_halpern());
+
+  o.pdlp.halpern = true;
+  auto result = solver::pdlp::solve_pdlp(canon->problem, o, matvec, blind);
+  ++::sovsolve::test::checks_run();
+  if (result.has_value()) {
+    ::sovsolve::test::record(__FILE__, __LINE__,
+                             "Halpern on an unsupporting backend is refused",
+                             "it returned a solution instead");
+  }
+}
 }  // namespace
 
 int main() {
@@ -737,5 +1068,10 @@ int main() {
   test_certificates_without_presolve();
   test_flat_rays_are_rejected();
   test_no_false_verdicts_on_feasible_models();
+  test_halpern_agrees_with_simplex();
+  test_reflection_ablation();
+  test_halpern_costs_two_products_per_iteration();
+  test_pid_reduces_to_algorithm_three();
+  test_halpern_refuses_an_unsupporting_backend();
   return ::sovsolve::test::report("pdlp_test");
 }

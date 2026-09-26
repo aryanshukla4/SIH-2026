@@ -1,6 +1,7 @@
 #include "sovsolve/solver/pdlp/IterationBackend.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 namespace sovsolve::solver::pdlp {
 
@@ -27,11 +28,11 @@ HostIterationBackend::HostIterationBackend(const model::CanonicalProblem& proble
       n_(problem.num_cols()),
       m_(problem.num_rows()) {
   for (auto* v : {&x_, &x_trial_, &extrapolated_, &kt_y_, &x_prev_, &diff_x_, &sum_x_,
-                  &avg_x_}) {
+                  &avg_x_, &kt_y_trial_, &x_anchor_, &kt_y_anchor_}) {
     zeroed(*v, n_);
   }
   for (auto* v : {&y_, &y_trial_, &k_x_current_, &k_extrapolated_, &k_x_, &diff_y_,
-                  &sum_y_, &avg_y_}) {
+                  &sum_y_, &avg_y_, &k_x_trial_, &y_anchor_, &k_x_anchor_}) {
     zeroed(*v, m_);
   }
 }
@@ -52,6 +53,8 @@ void HostIterationBackend::download(BackendVector which, core::HostSpan<Real> ds
     case BackendVector::IterateSumY: copy_into(sum_y_, dst); break;
     case BackendVector::DifferenceX: copy_into(diff_x_, dst); break;
     case BackendVector::DifferenceY: copy_into(diff_y_, dst); break;
+    case BackendVector::PdhgX: copy_into(x_trial_, dst); break;
+    case BackendVector::PdhgY: copy_into(y_trial_, dst); break;
   }
 }
 
@@ -117,6 +120,157 @@ void HostIterationBackend::fixed_step(Real tau, Real sigma) {
   for (std::size_t i = 0; i < m_; ++i) {
     const Real step = y_[i] + sigma * (problem_.b[i] - k_x_[i]);
     y_[i] = i < problem_.num_equality ? step : std::min(step, 0.0);
+  }
+}
+
+// --------------------------------------------------------------------------
+// Module 31: reflected Halpern (cuPDLPx, arXiv 2507.14051)
+// --------------------------------------------------------------------------
+
+void HostIterationBackend::begin_halpern() {
+  matvec_.multiply_transpose(in(y_), out(kt_y_));
+  matvec_.multiply(in(x_), out(k_x_current_));
+  for (std::size_t j = 0; j < n_; ++j) {
+    x_anchor_[j] = x_[j];
+    kt_y_anchor_[j] = kt_y_[j];
+  }
+  for (std::size_t i = 0; i < m_; ++i) {
+    y_anchor_[i] = y_[i];
+    k_x_anchor_[i] = k_x_current_[i];
+  }
+  // `T(z)` is not defined yet, and the cold path reads the solution from
+  // there. Seed it with the anchor so a run that terminates before its first
+  // step reports the starting point rather than a zero vector.
+  for (std::size_t j = 0; j < n_; ++j) x_trial_[j] = x_[j];
+  for (std::size_t i = 0; i < m_; ++i) y_trial_[i] = y_[i];
+  for (std::size_t j = 0; j < n_; ++j) kt_y_trial_[j] = kt_y_[j];
+  for (std::size_t i = 0; i < m_; ++i) k_x_trial_[i] = k_x_current_[i];
+}
+
+TrialMetrics HostIterationBackend::halpern_step(Real eta, Real omega, Real gamma,
+                                                Real lambda) {
+  const Real tau = eta / omega;
+  const Real sigma = eta * omega;
+
+  // --- T(z): one PDHG step, equation (3). `K' y` is already cached. -------
+  for (std::size_t j = 0; j < n_; ++j) {
+    const Real step = x_[j] - tau * (problem_.c[j] - kt_y_[j]);
+    x_trial_[j] = std::clamp(step, problem_.col_lower[j], problem_.col_upper[j]);
+    extrapolated_[j] = 2.0 * x_trial_[j] - x_[j];
+  }
+  matvec_.multiply(in(extrapolated_), out(k_extrapolated_));  // product 1
+  for (std::size_t i = 0; i < m_; ++i) {
+    const Real step = y_[i] + sigma * (problem_.b[i] - k_extrapolated_[i]);
+    y_trial_[i] = i < problem_.num_equality ? step : std::min(step, 0.0);
+  }
+
+  // --- the fixed-point error at `z`, in the pieces the caller combines ----
+  //
+  // `dx = x - T(z)_x`, so `K dx = K x - K T(z)_x`, and since
+  // `K(2x' - x) = 2 K x' - K x` the image of the trial point comes out of the
+  // product already taken: `K x' = (K(2x' - x) + K x) / 2`. Hence
+  // `K dx = (K x - K(2x' - x)) / 2`, no second product.
+  //
+  // Note the SIGN convention: this is `x - T(z)`, the opposite of `trial()`'s
+  // `x' - x`. `||.||` and the product of two differences are both invariant
+  // under flipping both, so `TrialMetrics` means the same thing either way --
+  // but only because BOTH are flipped together.
+  TrialMetrics metrics;
+  for (std::size_t i = 0; i < m_; ++i) {
+    k_x_trial_[i] = 0.5 * (k_extrapolated_[i] + k_x_current_[i]);
+  }
+  for (std::size_t i = 0; i < m_; ++i) {
+    metrics.interaction += (y_[i] - y_trial_[i]) * (k_x_current_[i] - k_x_trial_[i]);
+  }
+  for (std::size_t j = 0; j < n_; ++j) {
+    const Real d = x_[j] - x_trial_[j];
+    metrics.dx_sq += d * d;
+  }
+  for (std::size_t i = 0; i < m_; ++i) {
+    const Real d = y_[i] - y_trial_[i];
+    metrics.dy_sq += d * d;
+  }
+
+  // `K' T(z)_y`, needed for the next iteration's cached `K' y`.
+  matvec_.multiply_transpose(in(y_trial_), out(kt_y_trial_));  // product 2
+
+  // --- the blend, applied identically to the iterate and to its images ----
+  //
+  //     z^{k+1} = lambda [ (1+gamma) T(z) - gamma z ] + (1-lambda) z^{n,0}
+  //
+  // Linear in `z`, so `K` and `K'` commute with it exactly. `blend` below is
+  // that one line; running it on `K x` and `K' y` too is what keeps the
+  // iteration at two products.
+  const Real reflected = lambda * (1.0 + gamma);
+  const Real pull_back = lambda * gamma;
+  const Real anchor = 1.0 - lambda;
+  const auto blend = [&](Real trial, Real current, Real base) {
+    return reflected * trial - pull_back * current + anchor * base;
+  };
+  for (std::size_t j = 0; j < n_; ++j) {
+    const Real next = blend(x_trial_[j], x_[j], x_anchor_[j]);
+    kt_y_[j] = blend(kt_y_trial_[j], kt_y_[j], kt_y_anchor_[j]);
+    x_[j] = next;
+  }
+  for (std::size_t i = 0; i < m_; ++i) {
+    const Real next = blend(y_trial_[i], y_[i], y_anchor_[i]);
+    k_x_current_[i] = blend(k_x_trial_[i], k_x_current_[i], k_x_anchor_[i]);
+    y_[i] = next;
+  }
+  return metrics;
+}
+
+AnchorDistance HostIterationBackend::restart_at_pdhg_point() {
+  // arXiv 2407.16144 Algorithm 2 line 6: the next epoch starts at `T(z^{n,k})`,
+  // NOT at `z^{n,k}`. Both the point and its two matrix images are already
+  // sitting in the trial slots from the last `halpern_step`, so this costs no
+  // product -- and it is also the only point in the epoch guaranteed to lie
+  // inside the box, since reflection extrapolates out of it.
+  AnchorDistance moved;
+  for (std::size_t j = 0; j < n_; ++j) {
+    const Real d = x_trial_[j] - x_anchor_[j];
+    moved.dx += d * d;
+  }
+  for (std::size_t i = 0; i < m_; ++i) {
+    const Real d = y_trial_[i] - y_anchor_[i];
+    moved.dy += d * d;
+  }
+  moved.dx = std::sqrt(moved.dx);
+  moved.dy = std::sqrt(moved.dy);
+
+  for (std::size_t j = 0; j < n_; ++j) {
+    x_[j] = x_trial_[j];
+    kt_y_[j] = kt_y_trial_[j];
+    x_anchor_[j] = x_trial_[j];
+    kt_y_anchor_[j] = kt_y_trial_[j];
+  }
+  for (std::size_t i = 0; i < m_; ++i) {
+    y_[i] = y_trial_[i];
+    k_x_current_[i] = k_x_trial_[i];
+    y_anchor_[i] = y_trial_[i];
+    k_x_anchor_[i] = k_x_trial_[i];
+  }
+  return moved;
+}
+
+void HostIterationBackend::run_halpern(std::size_t count, std::uint64_t first_iteration,
+                                       const HalpernParams& params,
+                                       bool track_differences) {
+  // The reference implementation of the controller loop. A device backend
+  // fuses all of this into kernels, but the decisions it makes are these ones,
+  // from the same header.
+  for (std::size_t i = 0; i < count; ++i) {
+    if (track_differences) snapshot_iterate();
+    const TrialMetrics fp = halpern_step(params.eta, control_.omega, params.gamma,
+                                         halpern_lambda(control_));
+    if (track_differences) finish_difference();
+    const Real r = halpern_fixed_point_error(params.eta, control_.omega, fp.interaction,
+                                             fp.dx_sq, fp.dy_sq);
+    control_.total = first_iteration + i + 1;
+    if (halpern_observe(params, control_, r, control_.total)) {
+      const AnchorDistance moved = restart_at_pdhg_point();
+      halpern_on_restart(params, control_, moved.dx, moved.dy);
+    }
   }
 }
 

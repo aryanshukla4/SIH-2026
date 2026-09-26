@@ -519,6 +519,11 @@ enum class Method : std::uint8_t {
   DualSimplex,
   PrimalSimplex,
   Pdlp,
+  /// Module 31: the same engine running cuPDLPx's reflected-Halpern scheme
+  /// (arXiv 2507.14051) instead of averaged PDHG. A separate `Method` rather
+  /// than only a flag on `Pdlp` because the two are worth racing against each
+  /// other in `Concurrent`, and because a benchmark row needs a name.
+  PdlpX,
   /// Module 25: the homogeneous self-dual embedding, host-side.
   ///
   /// A separate engine rather than a flag on `InteriorPoint` because that path
@@ -644,16 +649,29 @@ struct PdlpOptions {
   /// So it was measured rather than chosen. Across the 18 feasible, bounded
   /// Netlib instances, plus `gas11` which is genuinely unbounded:
   ///
-  ///     1e-8   no false verdicts, but MISSES gas11 (459 of its 459 rows are
-  ///            equalities, each needing |K v_x|_i <= tol, and the residual
-  ///            sits between 1e-8 and 1e-6)
-  ///     1e-6   no false verdicts, and catches gas11 at iteration 40
   ///     1e-4   FOUR false verdicts -- 25fv47, israel and stair reported
   ///            Infeasible and 80bau3b Unbounded, all of them actually Optimal
+  ///     1e-6 .. 1e-9   no false verdicts, gas11 detected at every one
   ///
-  /// The cliff between 1e-6 and 1e-4 is sharp, so the default sits two orders
-  /// below it.
-  Real certificate_tolerance = 1e-6;
+  /// (An earlier version of this comment recorded "1e-8 MISSES gas11". That was
+  /// measured against the PRE-Module-24G test, which normalized by the
+  /// candidate's own size; once the reference's (50)/(51) replaced it, gas11 is
+  /// detected across that whole range. Re-swept and corrected.)
+  ///
+  /// The default is 1e-8 rather than 1e-6 because of `dfl001` -- feasible,
+  /// optimum 1.1266396047e+07, and reported Unbounded at iteration 480 under
+  /// 1e-6. Its bogus certificate and gas11's real one are separated by nearly
+  /// four orders of magnitude in the very quantity (51) tests, so this is a
+  /// measured gap and not a threshold nudged until a symptom disappeared:
+  ///
+  ///     instance   cone violation per unit of improvement
+  ///     dfl001     8.8e-7    bogus   -- rejected at 1e-8 with 88x to spare
+  ///     gas11      9.2e-11   real    -- accepted at 1e-8 with 108x to spare
+  ///
+  /// The asymmetry above still applies and still points this way: tightening
+  /// costs at worst a missed detection reported honestly as `MaxIterations`,
+  /// and buys the elimination of a confidently wrong answer.
+  Real certificate_tolerance = 1e-8;
 
   /// Iterations between termination checks. Each check costs a `K'y` product
   /// and, once restarts land, a normalized duality gap evaluation -- real work
@@ -681,6 +699,104 @@ struct PdlpOptions {
   /// Iteration cap. `0` means automatic: `100000`, matching the paper's own
   /// KKT-pass limit for its baseline comparisons.
   std::size_t max_iterations = 0;
+
+  // ---- Module 31: the cuPDLPx scheme (arXiv 2507.14051) ------------------
+  //
+  // Four changes, all driven by the restarted-Halpern theory of arXiv
+  // 2407.16144. They are one switch rather than four because they are not
+  // independent: constant step size is only safe because reflection already
+  // takes a longer effective step, and the fixed-point restart criterion is
+  // only defined for the Halpern scheme. See solver/pdlp/Pdlp.hpp.
+
+  /// Run the reflected-Halpern iteration instead of averaged PDHG.
+  ///
+  /// Off by default, so `--method=pdlp` keeps measuring the engine the corpus
+  /// numbers in docs/ were taken with. `--method=pdlpx` turns it on.
+  bool halpern = false;
+
+  /// Reflection `gamma` in `(1 + gamma) PDHG - gamma * id`.
+  ///
+  /// cuPDLPx allows `gamma` in [0, 1] and does not say which it uses. 1 is
+  /// the value the theory is stated for -- arXiv 2407.16144 equation (26) is
+  /// `2T(z) - z`, i.e. exactly `gamma = 1` -- and it is the setting that earns
+  /// the factor-of-2 complexity improvement its Corollary 1 proves. 0
+  /// recovers plain Halpern, which is the useful ablation.
+  Real reflection = 1.0;
+
+  /// `eta = halpern_step_fraction / ||A||_2`, cuPDLPx's constant step size.
+  ///
+  /// The paper's own 0.998. It replaces the adaptive trial loop entirely:
+  /// PDHG needs `eta <= 1/||A||_2`, and 0.998 of it is the largest step that
+  /// still leaves the canonical norm `P` positive definite by a margin. That
+  /// margin is load-bearing here in a way it is not for baseline PDHG,
+  /// because `r(z) = ||z - PDHG(z)||_P` is measured in that norm and a `P`
+  /// that is merely semidefinite would let the restart criterion read zero at
+  /// a non-fixed point.
+  Real halpern_step_fraction = 0.998;
+
+  /// The three fixed-point restart constants.
+  ///
+  /// `r(z_{n,k}) <= halpern_restart_sufficient * r(z_{n,0})` is a DECAY test,
+  /// so a small constant is the hard, decisive one and a larger constant the
+  /// weak one that needs the "no local progress" guard beside it. cuPDLPx
+  /// names the three but publishes no values; only the first is recoverable
+  /// from the theory, and the other two are this project's, documented as
+  /// such in Pdlp.hpp rather than presented as the paper's.
+  ///
+  /// The THEORY's constant is `1/e`: arXiv 2407.16144 equation (10), and
+  /// Theorem 2 is proved for exactly that. The default is 0.2 instead,
+  /// because it measured better and the theorem does not forbid it -- a
+  /// smaller constant demands a stronger decay per epoch, which only makes
+  /// the restart rarer, never unsound. Measured on the 18 feasible Netlib
+  /// instances, KKT passes to 1e-8, with the PID below:
+  ///
+  ///     sufficient = 1/e    16/18 solved   504,320 passes
+  ///     sufficient = 0.2    16/18 solved   464,068 passes   (-8%)
+  ///     sufficient = 0.5    15/18 solved   588,134 passes
+  ///
+  /// 18 instances is a small corpus to tune on, so `1/e` stays one flag
+  /// away (`--pdlp-restart-sufficient=0.3679`) for anyone who wants the
+  /// setting the theorem covers.
+  ///
+  /// `necessary` was swept too: 0.5 cost +19% against 0.8.
+  Real halpern_restart_sufficient = 0.2;
+  Real halpern_restart_necessary = 0.8;
+  Real halpern_restart_artificial = 0.36;
+
+  /// PID coefficients for the primal weight (cuPDLPx section 3).
+  ///
+  /// cuPDLPx publishes none of the three. What anchors them: with
+  /// `K_I = K_D = 0` the PID update collapses ALGEBRAICALLY onto cuPDLP's
+  /// Algorithm 3 with `theta = K_P` (derivation in Pdlp.hpp), so `K_P = 0.5`
+  /// reproduces that published rule exactly. That is the reference point the
+  /// sweep below starts from, not the default it ends at.
+  ///
+  /// MEASURED, and the first guess was badly wrong. 18 feasible Netlib
+  /// instances, KKT passes to 1e-8, `sufficient = 0.2`:
+  ///
+  ///     Kp / Ki / Kd       solved   passes
+  ///     .5 / .05 / .1      10/18    1,077,194   the first guess
+  ///     .5 / 0   / 0       16/18      515,788   = Algorithm 3 exactly
+  ///     .3 / .01 / .05     16/18      464,068   the default
+  ///
+  /// So the integral and derivative terms DO earn their place (-10% against
+  /// pure Algorithm 3), but only at small gains. At `K_I = 0.05` the
+  /// integral winds up across epochs and drags `omega` off balance for long
+  /// after the error changed sign; it cost six instances outright. The same
+  /// sweep over the older restart rule gave the same ranking, so this is not
+  /// an artefact of one setting of the others.
+  Real pid_kp = 0.3;
+  Real pid_ki = 0.01;
+  Real pid_kd = 0.05;
+
+  /// Anti-windup clamp on the accumulated integral term, in log units.
+  ///
+  /// A textbook PID necessity, not a tuning knob: `sum e_i` is unbounded, and
+  /// one long epoch with a badly balanced weight would drive `omega` off by
+  /// `exp(K_I * sum)` and keep it there long after the error changed sign.
+  /// The bound is in log space, so +-10 is a factor of `e^0.1 = 1.11` of
+  /// authority for the integral term at `K_I = 0.01`.
+  Real pid_integral_clamp = 10.0;
 };
 
 /// How Module 5 equilibrates `A` before anything downstream sees it.
