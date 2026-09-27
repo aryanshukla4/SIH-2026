@@ -53,6 +53,7 @@ class DualSolver : public SimplexEngine {
   void escalate_artificial_bounds(Real bound);
   void collect_artificial_offenders();
   [[nodiscard]] bool any_artificial_installed() const;
+  [[nodiscard]] bool certificate_holds_for_true_bounds() const;
 
   [[nodiscard]] Step iterate();
   /// The Farkas certificate, captured at the pivot that proved infeasibility.
@@ -195,6 +196,65 @@ bool DualSolver::any_artificial_installed() const {
     if (artificial_[w] != 0) return true;
   }
   return false;
+}
+
+bool DualSolver::certificate_holds_for_true_bounds() const {
+  // An infeasibility found while artificial boxes are installed is a proof
+  // about the BOXED problem -- unless the certificate never leans on a box.
+  // Checked directly, by Farkas: every point with `Ahat v = b` satisfies
+  // `y'b = sum_w g_w v_w` with `g = Ahat' y`, so if `y'b` lies outside the
+  // range that sum can take over the TRUE bounds, no such point exists. A
+  // column with `g_w != 0` toward an infinite true bound makes the range
+  // unbounded on that side, and the proof does not transfer.
+  //
+  // Both sides are tested, so the sign convention of `certificate_` does not
+  // matter. Without this, a model like Netlib BGPRTR -- infeasible, with
+  // columns the phase 1 had to box -- widened its boxes until the round limit
+  // and ended NotConverged, which left `compute_iis` with nothing to explain.
+  if (certificate_.size() != m_ || m_ == 0) return false;
+  Real y_scale = 0.0;
+  Real yb = 0.0;
+  for (std::size_t i = 0; i < m_; ++i) {
+    y_scale = std::fmax(y_scale, std::fabs(certificate_[i]));
+    yb += certificate_[i] * matrix_.problem().b[i];
+  }
+  if (!(y_scale > 0.0)) return false;
+
+  // `g_w` below this is rounding in `B^-T e_r`, not a column the proof uses.
+  const Real zero = 1e-9 * y_scale;
+  Real low = 0.0;
+  Real high = 0.0;
+  bool low_finite = true;
+  bool high_finite = true;
+  Real magnitude = std::fabs(yb);
+  for (std::size_t w = 0; w < total_; ++w) {
+    Real g = 0.0;
+    matrix_.for_each_in_column(w, [&](std::size_t i, Real a) { g += a * certificate_[i]; });
+    if (std::fabs(g) <= zero) continue;
+    const Real lo = true_lower_[w];
+    const Real up = true_upper_[w];
+    // g * v over [lo, up]: the minimum sits at lo when g > 0, at up when g < 0.
+    const Real at_min = g > 0.0 ? lo : up;
+    const Real at_max = g > 0.0 ? up : lo;
+    if (is_finite_bound(at_min)) {
+      low += g * at_min;
+      magnitude += std::fabs(g * at_min);
+    } else {
+      low_finite = false;
+    }
+    if (is_finite_bound(at_max)) {
+      high += g * at_max;
+      magnitude += std::fabs(g * at_max);
+    } else {
+      high_finite = false;
+    }
+  }
+
+  // The violation must be material, not rounding: the same primal tolerance
+  // that decides whether a row is violated at all, scaled to the certificate,
+  // plus a relative guard for the sums' own cancellation.
+  const Real tol = opt_.primal_feasibility_tolerance * y_scale + 1e-9 * magnitude;
+  return (high_finite && yb > high + tol) || (low_finite && yb < low - tol);
 }
 
 void DualSolver::collect_artificial_offenders() {
@@ -737,6 +797,13 @@ core::Expected<SimplexResult> DualSolver::run(const Basis* warm_start) {
     // So the box is widened and the question asked again. Only an
     // infeasibility found with NO artificial bound in play is a verdict about
     // the model.
+    //
+    // Unless the certificate itself never uses a box: then it proves the
+    // MODEL infeasible, and widening further would only throw the proof away.
+    if (outcome == core::SolverStatus::Infeasible && any_artificial_installed() &&
+        certificate_holds_for_true_bounds()) {
+      break;
+    }
     if (outcome == core::SolverStatus::Infeasible && any_artificial_installed()) {
       if (round >= opt_.max_artificial_rounds) {
         outcome = core::SolverStatus::NotConverged;
