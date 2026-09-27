@@ -21,6 +21,7 @@
 
 #include "sovsolve/io/Load.hpp"
 #include "sovsolve/model/Options.hpp"
+#include "sovsolve/solver/Iis.hpp"
 #include "sovsolve/solver/LpSolve.hpp"
 #include "sovsolve/solver/MilpSolve.hpp"
 #ifdef SOVSOLVE_ENABLE_CUDA
@@ -96,6 +97,9 @@ void print_usage(const char* argv0) {
       "  --gpu-spmv-timing=0|1 with --gpu-spmv, attribute time to kernel vs\n"
       "                        transfer. Adds two syncs per product, so it\n"
       "                        INFLATES the wall time it reports on.\n"
+      "  --iis[=0|1]           on an Infeasible verdict, print an irreducible\n"
+      "                        infeasible subsystem: the rows and bounds that\n"
+      "                        conflict (Gleeson & Ryan 1990)\n"
       "  --hsd-max-iter=N      HsdOptions::max_iterations    (default 200)\n"
       "  --hsd-cg-max-iter=N   HsdOptions::cg_max_iterations (default 5000)\n"
       "  --hsd-cg-tol=X        HsdOptions::cg_tolerance      (default 1e-10)\n"
@@ -196,6 +200,9 @@ bool gpu_resident = false;
 /// Module 31: CUDA graphs over the resident Halpern loop. A flag so the gain
 /// is measured against the identical launch sequence issued directly.
 bool gpu_graphs = true;
+/// On an Infeasible verdict, also compute and print an IIS (solver/Iis.hpp):
+/// WHICH rows and bounds contradict each other, not just that some do.
+bool want_iis = false;
 
 bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
   const auto eq = flag.find('=');
@@ -338,6 +345,8 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
             val.c_str());
         return false;
       }
+    } else if (key == "iis") {
+      want_iis = (val != "0");
     } else if (key == "gpu-spmv") {
       gpu_spmv = (val != "0");
     } else if (key == "gpu-resident") {
@@ -530,6 +539,10 @@ int main(int argc, char** argv) {
       print_usage(argv[0]);
       return 0;
     }
+    if (std::string(argv[next_arg]) == "--iis") {
+      want_iis = true;
+      continue;
+    }
     if (!apply_flag(argv[next_arg], options)) {
       print_usage(argv[0]);
       return 2;
@@ -622,7 +635,17 @@ int main(int argc, char** argv) {
   }
 
   std::printf("status=%s\n", status_name(solution->status));
-  std::printf("objective=%.10e\n", solution->objective);
+  // An Infeasible or Unbounded verdict has no objective value: whatever the
+  // engine left in `objective` is the last iterate's, which is meaningless.
+  // A TimeLimit/MaxIterations run keeps its number -- a real best-so-far.
+  const bool no_objective =
+      solution->status == sovsolve::core::SolverStatus::Infeasible ||
+      solution->status == sovsolve::core::SolverStatus::Unbounded;
+  if (no_objective) {
+    std::printf("objective=nan\n");
+  } else {
+    std::printf("objective=%.10e\n", solution->objective);
+  }
   std::printf("iterations=%zu\n", solution->iterations);
   if (solution->matrix_products != 0) {
     // The cost model for a matrix-free method. One "KKT pass" in PDLP's sense
@@ -721,6 +744,39 @@ int main(int argc, char** argv) {
       std::printf("conflict_deductions=%zu\n", milp_stats.conflict_deductions);
       std::printf("conflict_cutoffs=%zu\n", milp_stats.conflict_cutoffs);
       std::printf("conflict_checks=%zu\n", milp_stats.conflict_checks);
+    }
+  }
+
+  if (want_iis && solution->status == sovsolve::core::SolverStatus::Infeasible) {
+    // Recomputed from the ORIGINAL problem, whatever engine gave the verdict:
+    // compute_iis re-solves for its own certificate, so indices below are
+    // rows and columns of the model file as written.
+    auto iis = sovsolve::solver::compute_iis(*problem, options);
+    if (!iis.has_value()) {
+      std::fprintf(stderr, "iis failed: %s\n", iis.error().format().c_str());
+    } else {
+      const auto row_name = [&](std::size_t i) {
+        return i < problem->row_names.size() ? std::string(problem->row_names[i])
+                                             : "R" + std::to_string(i);
+      };
+      const auto col_name = [&](std::size_t j) {
+        return j < problem->col_names.size() ? std::string(problem->col_names[j])
+                                             : "C" + std::to_string(j);
+      };
+      std::printf("iis_quality=%s\n",
+                  iis->quality == sovsolve::solver::IisQuality::Irreducible
+                      ? "Irreducible"
+                      : "InfeasibleSubsystem");
+      std::printf("iis_size=%zu\n", iis->size());
+      for (const std::size_t i : iis->rows) {
+        std::printf("iis_row=%s\n", row_name(i).c_str());
+      }
+      for (const std::size_t j : iis->lower_bound_columns) {
+        std::printf("iis_lower_bound=%s\n", col_name(j).c_str());
+      }
+      for (const std::size_t j : iis->upper_bound_columns) {
+        std::printf("iis_upper_bound=%s\n", col_name(j).c_str());
+      }
     }
   }
 
