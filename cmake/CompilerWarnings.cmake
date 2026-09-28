@@ -10,6 +10,14 @@ function(sovsolve_set_warnings target)
       -Wshadow -Wnon-virtual-dtor -Wold-style-cast
       -Wcast-align -Wunused -Woverloaded-virtual
       -Wnull-dereference -Wdouble-promotion -Wformat=2)
+    # GCC 12 reports a false -Wrestrict inside libstdc++'s own
+    # std::string operator+ at -O3 (GCC PR 105329), so Debian 12's stock
+    # g++ 12.2 cannot build this tree under -Werror. Off for GCC 12 only.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+       CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12 AND
+       CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13)
+      target_compile_options(${target} PRIVATE -Wno-restrict)
+    endif()
   endif()
 endfunction()
 
