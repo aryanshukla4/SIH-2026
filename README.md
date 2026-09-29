@@ -234,7 +234,9 @@ answers in the same form.
   misread bound or sign shows up as a wrong number.
 - **Engines against each other.** First-order and interior-point engines are
   tested against the simplex's exact answer, and the race against each engine
-  run alone — racing may change how fast the answer comes, never what it is.
+  run alone — racing may change how fast the answer comes and which engine
+  gives it, never the verdict; objectives agree to within the engines'
+  stopping tolerance (1e-8 relative).
 - **Against brute force.** Branch-and-bound is tested against exhaustive
   enumeration, for every branching rule.
 - **GPU against CPU.** Every GPU operation is tested against its CPU

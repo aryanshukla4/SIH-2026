@@ -463,11 +463,17 @@ End
              p)) {
     return;
   }
-  auto r = solver::solve_milp(p, options_for(BranchingRule::Reliability));
+  const model::Options options = options_for(BranchingRule::Reliability);
+  auto r = solver::solve_milp(p, options);
   CHECK(r.has_value());
   if (!r.has_value()) return;
   CHECK(r->status == SolverStatus::Optimal);
-  CHECK_NEAR(r->objective, -2.8, 1e-9);
+  // An LP goes to the default LP method, the concurrent race, and the race
+  // keeps whichever engine proves optimality first. The simplex engines land
+  // on -2.8 exactly; cuPDLPx, which wins about 1 run in 12 when the machine is
+  // busy, stops at its relative tolerance and returned -2.7999999914. So the
+  // bound is that tolerance, not a fixed 1e-9 only the simplex can meet.
+  CHECK_NEAR(r->objective, -2.8, options.pdlp.termination_tolerance * 2.8 * 10.0);
 }
 
 /// Node selection on trees deep enough for it to matter. The 5-variable
