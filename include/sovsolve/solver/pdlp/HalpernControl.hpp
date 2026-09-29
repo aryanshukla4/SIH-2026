@@ -116,7 +116,7 @@ SOVSOLVE_HOST_DEVICE inline Real halpern_primal_violation(Real ax, Real b, bool 
 /// the part of the reduced cost `raw = c - A'y` that no bound can absorb.
 /// The projection is Pdlp.cpp's `project_reduced_cost`, restated with plain
 /// comparisons against the `core::INF` sentinel so device code can run it.
-SOVSOLVE_HOST_DEVICE inline Real halpern_dual_leftover(Real raw, Real lower, Real upper) {
+SOVSOLVE_HOST_DEVICE inline Real halpern_absorbed(Real raw, Real lower, Real upper) {
   const bool has_lower = lower > -core::INF;
   const bool has_upper = upper < core::INF;
   Real absorbed = raw;
@@ -127,7 +127,11 @@ SOVSOLVE_HOST_DEVICE inline Real halpern_dual_leftover(Real raw, Real lower, Rea
   } else if (!has_upper) {
     absorbed = raw > 0.0 ? raw : 0.0;
   }
-  return raw - absorbed;
+  return absorbed;
+}
+
+SOVSOLVE_HOST_DEVICE inline Real halpern_dual_leftover(Real raw, Real lower, Real upper) {
+  return raw - halpern_absorbed(raw, lower, upper);
 }
 
 /// `lambda_k = (k+1)/(k+2)`, with `k` counted within the epoch -- the reset

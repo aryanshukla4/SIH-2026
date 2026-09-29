@@ -54,6 +54,14 @@ struct Tolerances {
 
 /// Interior-point algorithm controls.
 struct IpmOptions {
+  /// Mehrotra (1992) section 7's starting point, adapted to bounds and
+  /// inequality slacks (Initializer.cpp), instead of the fixed bound-midpoint
+  /// start. Ignored when a warm-start hint is given. OFF by default on
+  /// measurement: on the GPU interior point it helped boeing1 and removed
+  /// greenbea's wrong optimum, but lost bnl1 (Optimal -> NotConverged) -- the
+  /// paper's "significantly smaller number of iterations" did not hold here.
+  bool mehrotra_start = false;
+
   /// Step-length safety factor, `alpha = eta * alpha_max`, 0 < eta < 1.
   /// Applied separately to the primal and dual steps -- see FORMULATION.md
   /// section 8. A single shared step length costs 20-30% more iterations.
@@ -606,9 +614,9 @@ struct HsdOptions {
   /// the factor as CG's preconditioner, instead of the Jacobi diagonal. Off
   /// reproduces the matrix-free engine exactly.
   bool direct = true;
-  /// Altman & Gondzio (1999) section 5: when a factorization breaks down, the
-  /// dual regularization is multiplied by 10 and the factorization retried,
-  /// at most this many times before falling back to the Jacobi diagonal.
+  /// Altman & Gondzio (1999) section 5: when a solve needs it, the
+  /// regularization is "multiplied by 10" and the factorization retried. The
+  /// number of retries before falling back to the Jacobi diagonal is OURS.
   std::size_t regularization_retries = 6;
 };
 
@@ -703,6 +711,20 @@ struct PdlpOptions {
   /// and, once restarts land, a normalized duality gap evaluation -- real work
   /// that does not advance the iterate. The paper uses 40.
   std::size_t check_interval = 40;
+
+  /// Evaluate the termination criteria where the iterate lives, when the
+  /// backend can (cuPDLPx, arXiv 2507.14051, section 4, computes them on the
+  /// GPU): five sums come back instead of the whole iterate, and the host
+  /// re-measures in full only when they say "converged" and at exit, so every
+  /// reported number is computed exactly as before. Off restores the
+  /// download-every-check path.
+  bool resident_check = true;
+
+  /// With `resident_check`, the infeasibility certificates -- which need the
+  /// iterate and its difference sequences on the host -- are tested at every
+  /// this-many-th check instead of every check. OURS: no paper sets it; 10
+  /// delays a certificate by at most 10 * check_interval iterations.
+  std::size_t certificate_check_every = 10;
 
   /// Choose each step's size by trial (paper Algorithm 2) instead of fixing
   /// it at `0.9/||K||_2`. Off is the textbook rule; keep the switch because

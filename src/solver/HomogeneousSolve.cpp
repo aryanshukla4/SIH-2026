@@ -242,7 +242,9 @@ core::Expected<HsdResult> solve_hsd(const model::CanonicalProblem& problem,
     // Optimal that dual simplex would not recognise. So an Optimal stop must
     // also meet the project's own measure, relative to the data: the residuals
     // of the recovered point x/tau against 1 + ||b|| and 1 + ||c||.
-    // The bar is 10x the project tolerance: measured, the residual floors near
+    // The bar is 10x the project tolerance -- OURS. [AA] section 1.4.5 itself
+    // accepts tolerances "relaxed by a factor 100" once convergence is fast;
+    // 10 is the tighter of the two, chosen by measurement: the residual floors near
     // 3e-8 of (1 + ||b||) on grow15/grow22 however small the regularization
     // (1.5e-8, 1e-10, 1e-12 all give 2.6e-8 to 5.9e-8; dual simplex itself
     // reaches 3.7e-8 on grow7), while the infeasible CPLEX2 sits at 0.56.

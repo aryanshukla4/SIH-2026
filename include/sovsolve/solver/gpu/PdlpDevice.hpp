@@ -85,6 +85,9 @@ class DevicePdlpBackend final : public pdlp::IterationBackend {
   [[nodiscard]] pdlp::HalpernState read_halpern_state() override;
   void run_halpern(std::size_t count, std::uint64_t first_iteration,
                    const pdlp::HalpernParams& params, bool track_differences) override;
+  [[nodiscard]] bool evaluate_resident(core::HostSpan<const Real> row_scale,
+                                       core::HostSpan<const Real> col_scale,
+                                       ResidentSums& out) override;
   void snapshot_iterate() override;
   void finish_difference() override;
   void accumulate_average(Real weight) override;

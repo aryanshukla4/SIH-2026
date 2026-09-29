@@ -23,23 +23,26 @@ using core::Real;
 using core::Status;
 using Rec = LpPostsolveRecord;
 
-/// Reductions act on a violation at most this large (relative to the row) --
-/// the same scale as `Tolerances::bound_violation`.
+/// Reductions act on a violation at most this large (relative to the row).
+/// OURS: [AA95] gives no tolerances; this is Tolerances::bound_violation.
 constexpr Real kActTol = 1e-9;
 
 /// A PrimalInfeasible verdict needs a violation this large. Everything between
 /// the two is left for the engine: a missed verdict costs a solve, a false one
-/// is a wrong answer.
+/// is a wrong answer. OURS: no paper sets it; checked on the 29 infeasible and
+/// 94 feasible Netlib models (no verdict changed).
 constexpr Real kVerdictTol = 1e-6;
 
-/// Strict dual dominance needs this margin ([AA95] (26)), relative to |c_j|.
+/// Strict dual dominance needs this margin, relative to |c_j|. [AA95] (26) is
+/// a strict inequality with no tolerance; the margin is OURS.
 constexpr Real kDominanceTol = 1e-7;
 
-/// [AGH] 4.5's Markowitz guard: a pivot this small against the largest entry
-/// of its row amplifies rounding into the recovered value.
+/// [AGH] section 4.5: substitute only if |a_ij| >= 0.01 * max|a_i.| -- "similar
+/// to a Markowitz type criterion"; a smaller pivot amplifies rounding.
 constexpr Real kPivotRatio = 0.01;
 
-/// Relative agreement for two columns to count as parallel.
+/// Relative agreement for two columns to count as parallel. OURS ([AA95]
+/// section 3.6 assumes exact arithmetic).
 constexpr Real kParallelTol = 1e-12;
 
 constexpr std::uint8_t kFlagEquality = 1;   ///< Substitute: row was an equality
@@ -119,6 +122,8 @@ class Presolve {
   bool col_on(std::size_t j) const { return col_on_[j] != 0; }
 
  private:
+  /// [AA95] section 5 repeats "until no reductions in last pass"; the cap is
+  /// OURS, a guard against slow one-at-a-time chains.
   static constexpr std::size_t kMaxRounds = 200;
 
   bool is_eq(std::size_t i) const { return i < p_.num_equality; }

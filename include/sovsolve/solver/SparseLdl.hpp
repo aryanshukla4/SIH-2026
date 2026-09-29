@@ -18,11 +18,17 @@
 // the factorization -- a pivot found too small while eliminating is corrected
 // on the spot -- which a black-box Cholesky does not expose.
 //
-// THE PIVOT RULE. A pivot `d_k` that has lost all but `pivot_tolerance` of the
-// diagonal entry it started from (`d_k <= pivot_tolerance * a_kk`, or
-// non-finite) is replaced by an effectively infinite value, [W99]'s
-// modification: the corresponding component of the solution is dropped
-// rather than amplified by 1/d_k. That is the limit of [AG99]'s dynamic dual
+// THE PIVOT RULE. The MECHANISM is [W99]'s (section 3, algorithm modchol): a
+// pivot too small to trust is skipped, "simulated, as in LIPSOL and PCx, by
+// inserting a huge element in the pivot position" (section 6), so its
+// component of the solution is dropped rather than amplified by 1/d_k.
+// The THRESHOLD is OURS: skip when `d_k <= pivot_tolerance * a_kk`, the
+// pivot's own entry before elimination -- i.e. when cancellation destroyed it.
+// [W99]'s own threshold, 1e-13 times the LARGEST diagonal of the matrix, was
+// measured here and rejected: this factor preconditions CG on a system whose
+// diagonal spans ~1e20, so the global threshold skipped legitimate pivots and
+// the GPU interior point lost 25fv47 (3 s -> 17 s), fffff800 and 80bau3b
+// (Optimal -> NotConverged). [W99] analyses a factor used directly. That is the limit of [AG99]'s dynamic dual
 // regularization for a pivot that is zero up to rounding; the uniform part of
 // their regularization (the small R_p, R_d on every pivot) is added by the
 // caller to the matrix itself, before factorizing.
