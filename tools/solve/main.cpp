@@ -73,6 +73,8 @@ void print_usage(const char* argv0) {
       "  --pdlp-tol=X          PdlpOptions::termination_tolerance (default 1e-8)\n"
       "  --pdlp-max-iter=N     PdlpOptions::max_iterations   (0 = auto, 1000000)\n"
       "  --pdlp-check-interval=N  PdlpOptions::check_interval (default 40)\n"
+      "  --pdlp-resident-check=0|1  termination check on the GPU (default 1)\n"
+      "  --pdlp-certificate-every=N  infeasibility test every N-th check (default 10)\n"
       "  --pdlp-adaptive=0|1   PdlpOptions::adaptive_step_size (default 1)\n"
       "  --pdlp-restart=0|1    PdlpOptions::adaptive_restart   (default 1)\n"
       "  --pdlp-primal-weight=0|1  PdlpOptions::primal_weight_update (default 1)\n"
@@ -108,6 +110,7 @@ void print_usage(const char* argv0) {
       "  --hsd-direct=0|1      HsdOptions::direct: factor the normal equations and\n"
       "                        precondition CG with it (default 1)\n"
       "  --hsd-delta-d=X       HsdOptions::delta_d, dual regularization (default 1.49e-8)\n"
+      "  --ipm-mehrotra-start=0|1  Mehrotra (1992) starting point (default 0)\n"
       "  --ipm-direct=0|1|2    GPU CG preconditioner: 0 IC(0)/Jacobi, 1 cuDSS\n"
       "                        Cholesky, 2 in-house SparseLdl on the host (default)\n"
       "  --simplex-max-iter=N  SimplexOptions::max_iterations   (0 = auto)\n"
@@ -319,6 +322,14 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.pdlp.check_interval = static_cast<std::size_t>(std::stoull(val));
       return true;
     }
+    if (key == "pdlp-resident-check") {
+      options.pdlp.resident_check = val != "0";
+      return true;
+    }
+    if (key == "pdlp-certificate-every") {
+      options.pdlp.certificate_check_every = static_cast<std::size_t>(std::stoull(val));
+      return true;
+    }
     if (key == "method") {
       if (val == "ipm" || val == "interior-point") {
         options.simplex.method = sovsolve::model::Method::InteriorPoint;
@@ -431,6 +442,8 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.hsd.cg_max_iterations = static_cast<std::size_t>(std::stoul(val));
     } else if (key == "hsd-cg-tol") {
       options.hsd.cg_tolerance = std::stod(val);
+    } else if (key == "ipm-mehrotra-start") {
+      options.ipm.mehrotra_start = val != "0";
     } else if (key == "ipm-direct") {
       options.ipm.direct = std::stoi(val);
     } else if (key == "hsd-direct") {

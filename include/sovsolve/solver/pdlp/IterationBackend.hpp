@@ -244,6 +244,29 @@ class IterationBackend {
   virtual void run_halpern(std::size_t /*count*/, std::uint64_t /*first_iteration*/,
                            const HalpernParams& /*params*/, bool /*track_differences*/) {}
 
+  // ---- the termination check, where the iterate lives --------------------
+  //
+  // The cold path's `evaluate` downloads T(z) and recomputes K T(z)_x and
+  // K' T(z)_y on the host. A device backend already HOLDS both images from
+  // the step, so it can reduce the same five sums in place and return 40
+  // bytes instead of the whole iterate -- cuPDLPx (arXiv 2507.14051) section 4
+  // evaluates its termination criteria on the GPU for the same reason.
+  // Returns false when unsupported; the solver then takes the host path.
+  struct ResidentSums {
+    Real primal_objective = 0.0;  ///< c' T(z)_x
+    Real b_dot_y = 0.0;           ///< b' T(z)_y
+    Real bound_term = 0.0;        ///< l' lambda+ - u' lambda-
+    Real primal_sq = 0.0;         ///< ||primal violation||^2, original units
+    Real dual_sq = 0.0;           ///< ||unabsorbed reduced cost||^2, original units
+  };
+  /// `row_scale`/`col_scale` are the preconditioner's factors, or empty; the
+  /// sums divide by them exactly as `evaluate` does.
+  [[nodiscard]] virtual bool evaluate_resident(core::HostSpan<const Real> /*row_scale*/,
+                                               core::HostSpan<const Real> /*col_scale*/,
+                                               ResidentSums& /*out*/) {
+    return false;
+  }
+
   // ---- infeasibility sequences (arXiv 2102.04592 section 1.1) ------------
 
   /// `diff <- z`, taken BEFORE a step.

@@ -115,12 +115,10 @@ core::Status SparseLdl::factorize(const std::vector<Real>& values, Real pivot_to
     std::size_t top = n;
     flag_[k] = k;
     const std::size_t kk = perm_[k];
-    Real diag = 0.0;
     for (std::size_t p = col_ptr_[kk]; p < col_ptr_[kk + 1]; ++p) {
       std::size_t i = pinv_[row_idx_[p]];
       if (i > k) continue;
       y_[i] += values[p];
-      if (i == k) diag += values[p];
       std::size_t len = 0;
       for (; flag_[i] != k; i = static_cast<std::size_t>(parent_[i])) {
         pattern_[len++] = i;
@@ -129,6 +127,7 @@ core::Status SparseLdl::factorize(const std::vector<Real>& values, Real pivot_to
       while (len > 0) pattern_[--top] = pattern_[--len];
     }
     Real d = y_[k];
+    const Real diag = std::fabs(d);  // this pivot's entry before elimination
     y_[k] = 0.0;
     for (; top < n; ++top) {
       const std::size_t i = pattern_[top];
@@ -144,7 +143,7 @@ core::Status SparseLdl::factorize(const std::vector<Real>& values, Real pivot_to
     }
     // [AG99] section 5 / [W99]: a pivot that lost (almost) everything to
     // cancellation belongs to a dependent row; drop that component.
-    if (!std::isfinite(d) || d <= pivot_tolerance * std::fabs(diag)) {
+    if (!std::isfinite(d) || d <= pivot_tolerance * diag) {
       d = kHugePivot;
       ++modified_;
     }

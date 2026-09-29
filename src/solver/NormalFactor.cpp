@@ -25,7 +25,7 @@ constexpr std::size_t kMaxDense = 50;
 
 /// SparseLdl's pivot rule: a pivot keeping less than this fraction of its
 /// original diagonal is a dependent row ([W99], see SparseLdl.hpp).
-constexpr Real kPivotTolerance = 1e-14;
+constexpr Real kPivotTolerance = 1e-14;  // OURS, see SparseLdl.hpp's pivot rule
 
 }  // namespace
 

@@ -832,6 +832,7 @@ core::Expected<PdlpResult> PdlpSolver::run() {
   if (halpern) backend_.begin_halpern();
 
   std::size_t iteration = 0;
+  std::size_t checks = 0;  ///< termination checks so far
   SolverStatus outcome = SolverStatus::MaxIterations;
 
   // The controller's parameters and state (HalpernControl.hpp). The state
@@ -898,12 +899,39 @@ core::Expected<PdlpResult> PdlpSolver::run() {
     }
 
     if (iteration % interval == 0) {
-      sync_from_backend();
-      if (!backend_.status().ok()) {
+      ++checks;
+      // Resident first (IterationBackend::evaluate_resident): five sums, no
+      // download. The host re-measures in full only when they say
+      // "converged" -- so the verdict and every reported number still come
+      // from the host `evaluate` -- or when a certificate test is due.
+      IterationBackend::ResidentSums sums;
+      const bool resident = halpern && opt_.pdlp.resident_check &&
+                            backend_.evaluate_resident(row_scale_, col_scale_, sums);
+      const bool certificate_due =
+          detect_infeasibility &&
+          (!resident ||
+           checks % std::max<std::size_t>(opt_.pdlp.certificate_check_every, 1) == 0);
+      if (resident) {
+        const Real dual_objective = sums.b_dot_y + sums.bound_term;
+        conv.primal_objective = sums.primal_objective;
+        conv.gap = std::fabs(dual_objective - sums.primal_objective) /
+                   (1.0 + std::fabs(dual_objective) + std::fabs(sums.primal_objective));
+        conv.primal = std::sqrt(sums.primal_sq) / (1.0 + b_norm_);
+        conv.dual = std::sqrt(sums.dual_sq) / (1.0 + c_norm_);
+      }
+      const bool host_needed = !resident || certificate_due ||
+                               conv.converged(opt_.pdlp.termination_tolerance);
+      if (host_needed) {
+        sync_from_backend();
+        if (!backend_.status().ok()) {
+          outcome = SolverStatus::NumericalError;
+          break;
+        }
+        evaluate(conv);
+      } else if (!backend_.status().ok()) {
         outcome = SolverStatus::NumericalError;
         break;
       }
-      evaluate(conv);
       if (conv.converged(opt_.pdlp.termination_tolerance)) {
         outcome = SolverStatus::Optimal;
         break;
@@ -932,7 +960,7 @@ core::Expected<PdlpResult> PdlpSolver::run() {
       // A certificate is a terminal verdict, so it is tested BEFORE the
       // restart -- restarting would move the iterate off the very direction
       // the certificate is measured along.
-      if (detect_infeasibility) {
+      if (certificate_due) {
         const CertificateKind kind = check_certificates(iteration);
         if (kind == CertificateKind::PrimalInfeasible) {
           outcome = SolverStatus::Infeasible;
