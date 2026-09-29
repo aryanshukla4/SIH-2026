@@ -33,10 +33,9 @@
 // their regularization (the small R_p, R_d on every pivot) is added by the
 // caller to the matrix itself, before factorizing.
 //
-// ORDERING. Minimum degree on the explicit elimination graph, ties broken by
-// the lower index so the ordering -- and with it every bit of the factor -- is
-// deterministic. Adequate for Netlib-sized normal equations; an approximate
-// minimum degree on the quotient graph is the upgrade for very large ones.
+// ORDERING. Approximate minimum degree on the quotient graph (SparseLdl.cpp),
+// written from general knowledge of Amestoy, Davis & Duff (1996) rather than
+// transcribed, and checked against CHOLMOD's fill. Deterministic run to run.
 
 #ifndef SOVSOLVE_SOLVER_SPARSE_LDL_HPP
 #define SOVSOLVE_SOLVER_SPARSE_LDL_HPP
