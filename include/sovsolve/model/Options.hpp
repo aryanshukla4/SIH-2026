@@ -197,10 +197,13 @@ struct IpmOptions {
   /// (`PredictorCorrector.cu`) already knows what to do with that signal.
   int cg_max_iterations = 500;
 
-  /// Precondition the normal-equations CG with an EXACT sparse Cholesky
-  /// through cuDSS (solver/gpu/Preconditioner.hpp) when the build links it;
-  /// otherwise, or off, IC(0) then Jacobi as before.
-  bool direct = true;
+  /// Preconditioner for the normal-equations CG (solver/gpu/Preconditioner.hpp):
+  ///   0  IC(0), then Jacobi -- no exact factor
+  ///   1  exact sparse Cholesky through cuDSS, when the build links it
+  ///   2  exact factor from the in-house SparseLdl on the host -- the same
+  ///      matrix, factored by our own code, so the two can be compared
+  /// A failed factor falls back to IC(0), then Jacobi.
+  int direct = 2;
 
   /// Same role as `cg_tolerance`, for the augmented path's matrix-free MINRES
   /// solve (`solve_minres`) -- see that function's doc comment.

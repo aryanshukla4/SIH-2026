@@ -667,7 +667,7 @@ Expected<LinearSolveResult> solve_spd_dense(const NormalEquationsSystem& system)
 
 Expected<LinearSolveResult> solve_spd_cg(const NormalEquationsSystem& system,
                                           Real cg_tolerance, int cg_max_iterations,
-                                          bool try_direct) {
+                                          int direct) {
   if (system.a == nullptr) {
     return core::make_error(core::ErrorCode::DimensionMismatch,
                             "solve_spd_cg: NormalEquationsSystem::a is null");
@@ -903,13 +903,24 @@ Expected<LinearSolveResult> solve_spd_cg(const NormalEquationsSystem& system,
   // of erroring out.
   // Preconditioner, strongest first: the exact cuDSS factor (CG then only
   // absorbs the dense columns and rounding), IC(0), then the Jacobi diagonal.
-  bool use_direct =
-      try_direct && cudss_build(*system.a, system.theta, system.diag_add, dev.is_dense_column).ok();
+  const auto build_direct = [&]() {
+    if (direct == 1) {
+      return cudss_build(*system.a, system.theta, system.diag_add, dev.is_dense_column).ok();
+    }
+    if (direct == 2) {
+      return host_ldl_build(*system.a, system.theta, system.diag_add, dev.is_dense_column).ok();
+    }
+    return false;
+  };
+  const auto apply_direct = [&](const double* r_in, double* z_out) {
+    return direct == 1 ? cudss_apply(r_in, z_out, m) : host_ldl_apply(r_in, z_out, m);
+  };
+  bool use_direct = build_direct();
   bool use_ic0 =
       !use_direct && ic0_build(*system.a, system.theta, system.diag_add, dev.is_dense_column).ok();
   const auto precond = [&](const double* r_in, double* z_out) -> Status {
     if (use_direct) {
-      if (cudss_apply(r_in, z_out, m).ok()) return Status::Ok();
+      if (apply_direct(r_in, z_out).ok()) return Status::Ok();
       use_direct = false;
       use_ic0 = ic0_build(*system.a, system.theta, system.diag_add, dev.is_dense_column).ok();
     }
