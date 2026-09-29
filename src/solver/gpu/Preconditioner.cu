@@ -1,6 +1,7 @@
 #include "sovsolve/solver/gpu/Preconditioner.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -8,6 +9,8 @@
 
 #include <cuda_runtime.h>
 #include <cusparse.h>
+
+#include "sovsolve/solver/SparseLdl.hpp"
 
 #ifdef SOVSOLVE_HAVE_CUDSS
 #include <cudss.h>
@@ -420,6 +423,115 @@ Status ic0_apply(const Real* r_device, Real* z_device, std::size_t m) {
 }
 
 // ---------------------------------------------------------------------------
+// In-house exact factor on the host. See Preconditioner.hpp.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct HostLdlContext {
+  SparseLdl ldl;
+  std::vector<int> lower_offsets, lower_indices;  ///< pattern of the cached analysis
+  std::vector<std::size_t> col_ptr, row_idx;      ///< full symmetric pattern
+  std::vector<std::size_t> lower_to_full_a, lower_to_full_b;  ///< where each lower entry goes
+  std::vector<Real> full_values, work;
+  std::size_t m = 0;
+  bool ready = false;
+};
+
+HostLdlContext& host_ldl_context() {
+  static HostLdlContext ctx;
+  return ctx;
+}
+
+/// SparseLdl pivots at or below this fraction of their starting diagonal are
+/// treated as dependent rows (Wright 1999, see SparseLdl.hpp).
+constexpr Real kHostPivotTolerance = 1e-14;
+
+}  // namespace
+
+Status host_ldl_build(const core::SparseMatrixPair<>& a, const RealVector& theta,
+                      const RealVector& diag_add, const std::vector<bool>& is_dense_column) {
+  HostLdlContext& ctx = host_ldl_context();
+  ctx.ready = false;
+  const std::size_t m = a.rows();
+  if (m == 0) return Status::Ok();
+
+  std::vector<int> offsets, indices;
+  std::vector<double> values;
+  build_host_pattern(a, theta, diag_add, is_dense_column, offsets, indices, values);
+
+  const bool same = ctx.m == m && ctx.lower_offsets == offsets && ctx.lower_indices == indices;
+  if (!same) {
+    // Lower CSR (row i, columns <= i) -> full symmetric compressed columns,
+    // remembering where each lower entry lands (once, or twice off-diagonal).
+    std::vector<std::size_t> count(m, 0);
+    for (std::size_t i = 0; i < m; ++i) {
+      for (int p = offsets[i]; p < offsets[i + 1]; ++p) {
+        const auto j = static_cast<std::size_t>(indices[static_cast<std::size_t>(p)]);
+        ++count[j];
+        if (j != i) ++count[i];
+      }
+    }
+    ctx.col_ptr.assign(m + 1, 0);
+    for (std::size_t j = 0; j < m; ++j) ctx.col_ptr[j + 1] = ctx.col_ptr[j] + count[j];
+    ctx.row_idx.assign(ctx.col_ptr[m], 0);
+    std::vector<std::size_t> next(ctx.col_ptr.begin(), ctx.col_ptr.end() - 1);
+    ctx.lower_to_full_a.assign(indices.size(), 0);
+    ctx.lower_to_full_b.assign(indices.size(), static_cast<std::size_t>(-1));
+    for (std::size_t i = 0; i < m; ++i) {
+      for (int p = offsets[i]; p < offsets[i + 1]; ++p) {
+        const auto e = static_cast<std::size_t>(p);
+        const auto j = static_cast<std::size_t>(indices[e]);
+        ctx.row_idx[next[j]] = i;  // entry (i, j) in column j
+        ctx.lower_to_full_a[e] = next[j]++;
+        if (j != i) {
+          ctx.row_idx[next[i]] = j;  // its mirror (j, i) in column i
+          ctx.lower_to_full_b[e] = next[i]++;
+        }
+      }
+    }
+    Status st = ctx.ldl.analyze(m, ctx.col_ptr, ctx.row_idx);
+    if (!st.ok()) return st;
+    ctx.lower_offsets = std::move(offsets);
+    ctx.lower_indices = std::move(indices);
+    ctx.full_values.assign(ctx.row_idx.size(), 0.0);
+    ctx.work.assign(m, 0.0);
+    ctx.m = m;
+  }
+
+  for (std::size_t e = 0; e < values.size(); ++e) {
+    ctx.full_values[ctx.lower_to_full_a[e]] = values[e];
+    if (ctx.lower_to_full_b[e] != static_cast<std::size_t>(-1)) {
+      ctx.full_values[ctx.lower_to_full_b[e]] = values[e];
+    }
+  }
+  Status st = ctx.ldl.factorize(ctx.full_values, kHostPivotTolerance);
+  if (!st.ok()) return st;
+  ctx.ready = true;
+  return Status::Ok();
+}
+
+Status host_ldl_apply(const Real* r_device, Real* z_device, std::size_t m) {
+  HostLdlContext& ctx = host_ldl_context();
+  if (!ctx.ready || ctx.m != m) {
+    return core::make_error(core::ErrorCode::NumericalError, "host_ldl_apply: no factor");
+  }
+  Status st = cuda_check(
+      cudaMemcpy(ctx.work.data(), r_device, m * sizeof(double), cudaMemcpyDeviceToHost),
+      "cudaMemcpy(host ldl r, device->host)");
+  if (!st.ok()) return st;
+  ctx.ldl.solve(ctx.work);
+  for (std::size_t i = 0; i < m; ++i) {
+    if (!std::isfinite(ctx.work[i])) {
+      return core::make_error(core::ErrorCode::NumericalError, "host_ldl_apply: non-finite");
+    }
+  }
+  return cuda_check(
+      cudaMemcpy(z_device, ctx.work.data(), m * sizeof(double), cudaMemcpyHostToDevice),
+      "cudaMemcpy(host ldl z, host->device)");
+}
+
+// ---------------------------------------------------------------------------
 // cuDSS: the exact factor. See Preconditioner.hpp.
 // ---------------------------------------------------------------------------
 
@@ -506,6 +618,14 @@ Status cudss_build(const core::SparseMatrixPair<>& a, const RealVector& theta,
     st = cudss_check(cudssCreate(&dev.handle), "cudssCreate");
     if (!st.ok()) return st;
     st = cudss_check(cudssConfigCreate(&dev.config), "cudssConfigCreate");
+    if (!st.ok()) return st;
+    // Measured: without this, the same model gave Optimal on one run and
+    // NotConverged on the next (Netlib capri, sctap1). Results must not
+    // depend on the run -- the project's determinism rule.
+    int deterministic = 1;
+    st = cudss_check(cudssConfigSet(dev.config, CUDSS_CONFIG_DETERMINISTIC_MODE, &deterministic,
+                                    sizeof(deterministic)),
+                     "cudssConfigSet(deterministic)");
     if (!st.ok()) return st;
   }
 

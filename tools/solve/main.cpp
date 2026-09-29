@@ -108,8 +108,8 @@ void print_usage(const char* argv0) {
       "  --hsd-direct=0|1      HsdOptions::direct: factor the normal equations and\n"
       "                        precondition CG with it (default 1)\n"
       "  --hsd-delta-d=X       HsdOptions::delta_d, dual regularization (default 1.49e-8)\n"
-      "  --ipm-direct=0|1      IpmOptions::direct: cuDSS Cholesky as the GPU CG\n"
-      "                        preconditioner, when linked (default 1)\n"
+      "  --ipm-direct=0|1|2    GPU CG preconditioner: 0 IC(0)/Jacobi, 1 cuDSS\n"
+      "                        Cholesky, 2 in-house SparseLdl on the host (default)\n"
       "  --simplex-max-iter=N  SimplexOptions::max_iterations   (0 = auto)\n"
       "  --pivot-tolerance=X   SimplexOptions::pivot_tolerance  (default 0.1)\n"
       "  --pivot-floor=X       SimplexOptions::pivot_floor      (default 1e-9)\n"
@@ -432,7 +432,7 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
     } else if (key == "hsd-cg-tol") {
       options.hsd.cg_tolerance = std::stod(val);
     } else if (key == "ipm-direct") {
-      options.ipm.direct = val != "0";
+      options.ipm.direct = std::stoi(val);
     } else if (key == "hsd-direct") {
       options.hsd.direct = val != "0";
     } else if (key == "hsd-delta-d") {
