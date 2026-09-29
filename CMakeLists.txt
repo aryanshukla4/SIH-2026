@@ -31,6 +31,26 @@ if(SOVSOLVE_ENABLE_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
 
+  # nvcc alone is not enough: the GPU library links cuBLAS, cuSPARSE and
+  # cuSOLVER (src/solver/CMakeLists.txt). An image that has the compiler but
+  # not these dev packages would otherwise fail later, at generate time, with
+  # an unhelpful "links to CUDA::cusolver but the target was not found".
+  set(_sovsolve_cuda_pkg "${CUDAToolkit_VERSION_MAJOR}-${CUDAToolkit_VERSION_MINOR}")
+  set(_sovsolve_cuda_missing "")
+  foreach(_lib cublas cusparse cusolver)
+    if(NOT TARGET CUDA::${_lib})
+      list(APPEND _sovsolve_cuda_missing "lib${_lib}-dev-${_sovsolve_cuda_pkg}")
+    endif()
+  endforeach()
+  if(_sovsolve_cuda_missing)
+    list(JOIN _sovsolve_cuda_missing " " _sovsolve_cuda_missing)
+    message(FATAL_ERROR
+      "CUDA ${CUDAToolkit_VERSION} found at ${CUDAToolkit_BIN_DIR}, but its "
+      "library dev packages are missing. Install them into the same toolkit:\n"
+      "  apt-get install -y ${_sovsolve_cuda_missing}\n"
+      "or point -DCUDAToolkit_ROOT at a complete toolkit.")
+  endif()
+
   # cuDSS is OPTIONAL and looked for in src/solver/CMakeLists.txt. It is a
   # sparse direct LINEAR solver -- linear algebra, like cuSPARSE, not an LP
   # solver -- and it is used for one thing: an exact Cholesky preconditioner
