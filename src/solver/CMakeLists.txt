@@ -5,6 +5,7 @@ add_library(sovsolve_solver STATIC
   LpPresolve.cpp
   SparseLdl.cpp
   NormalFactor.cpp
+  Certificate.cpp
   MilpPresolve.cpp
   SolutionReconstructor.cpp
   SolutionQuality.cpp

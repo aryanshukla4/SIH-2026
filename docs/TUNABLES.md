@@ -78,6 +78,7 @@ file named.
 | `direct` | 2 (our SparseLdl) | OURS: 81/94 Netlib and repeatable; cuDSS 79-80/94 and varied run to run | `--ipm-direct=0/1/2` |
 | cuDSS deterministic mode | on | OURS: capri/sctap1 flipped between runs without it | - |
 | `mehrotra_start` | off | M92 section 7 (bounds adaptation OURS); off on measurement: helped boeing1, lost bnl1 | `--ipm-mehrotra-start` |
+| optimality certificate | Optimal needs primal, per-column dual and gap <= 1e-6 on the ORIGINAL model | weak duality with PDLP's reduced-cost projection (NeurIPS 2021, section 2); per-column measure and 1e-6 are OURS: the norm-relative test passed greenbea 1.3e-3 off (per-column residual 2e-4); rejects pilot.we (row violation 1.6e-5), keeps 81/94, 0 wrong | - |
 | `primal_regularization_floor` | 1e-8 | kept on measurement: AG99's r_p = 1.8e-12 gave 78/94 against 81/94 and twice the time (it did turn greenbea's wrong optimum into NotConverged) | `--pfloor` |
 | `dual_regularization_floor` | 1e-8 | pre-existing; AG99 r_d = 1.5e-8 | `--dfloor` |
 
