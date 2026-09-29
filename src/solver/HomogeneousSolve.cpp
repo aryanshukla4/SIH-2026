@@ -7,6 +7,7 @@
 #include "sovsolve/solver/HostKkt.hpp"
 #include "sovsolve/solver/NormalFactor.hpp"
 #include "sovsolve/solver/SolutionQuality.hpp"
+#include "sovsolve/solver/simplex/SolveSimplex.hpp"
 
 namespace sovsolve::solver {
 
@@ -112,6 +113,35 @@ bool strictly_interior(const model::CanonicalProblem& problem, const SolverState
   return true;
 }
 
+/// Ceiling for [AG99]'s x10 escalation. OURS: the paper states no cap; this
+/// matches IpmOptions::delta_max, the GPU interior point's own ceiling.
+constexpr Real kMaxDeltaD = 1e-2;
+
+/// Settles a dual-infeasibility certificate: primal feasible -> Unbounded,
+/// primal infeasible -> Infeasible, otherwise no verdict. The dual simplex
+/// solves the feasibility problem (zero objective) and is the engine whose
+/// Infeasible is a proof, checked on every infeasible Netlib model.
+core::SolverStatus settle_dual_certificate(const model::CanonicalProblem& problem,
+                                           const model::Options& options) {
+  model::CanonicalProblem feasibility;
+  feasibility.c = core::RealVector(problem.num_cols(), 0.0);
+  feasibility.A = problem.A.clone();
+  feasibility.Q = problem.Q.clone();
+  feasibility.b = problem.b.clone();
+  feasibility.col_lower = problem.col_lower.clone();
+  feasibility.col_upper = problem.col_upper.clone();
+  feasibility.num_range = problem.num_range;
+  feasibility.num_equality = problem.num_equality;
+
+  model::Options simplex_options = options;
+  simplex_options.simplex.method = model::Method::DualSimplex;
+  auto r = simplex::solve_simplex(feasibility, simplex_options);
+  if (!r.has_value()) return core::SolverStatus::NotConverged;
+  if (r->status == core::SolverStatus::Optimal) return core::SolverStatus::Unbounded;
+  if (r->status == core::SolverStatus::Infeasible) return core::SolverStatus::Infeasible;
+  return core::SolverStatus::NotConverged;
+}
+
 core::SolverStatus status_for(HomogeneousVerdict verdict) {
   switch (verdict) {
     case HomogeneousVerdict::Optimal:
@@ -210,6 +240,7 @@ core::Expected<HsdResult> solve_hsd(const model::CanonicalProblem& problem,
   for (std::size_t i = 0; i < problem.num_rows(); ++i) b_norm = std::fmax(b_norm, std::fabs(problem.b[i]));
   Real c_norm = 0.0;
   for (std::size_t j = 0; j < problem.num_cols(); ++j) c_norm = std::fmax(c_norm, std::fabs(problem.c[j]));
+  bool primal_feasible_seen = false;
   for (std::size_t iteration = 0; iteration < max_iterations; ++iteration) {
     // Another engine already won the race (core/Cancel.hpp). Every check here
     // is one interior-point iteration apart, each costing a KKT solve, so
@@ -230,6 +261,14 @@ core::Expected<HsdResult> solve_hsd(const model::CanonicalProblem& problem,
     status = compute_homogeneous_residuals(problem, state, 0.0, residuals);
     if (!status.ok()) break;
     state.mu = homogeneous_mu(problem, state);
+    // Evidence the PRIMAL is feasible: some recovered point x/tau met the
+    // primal test (the same 10x bar as the Optimal stop below). Needed to
+    // turn a dual-infeasibility certificate into "Unbounded" -- see the
+    // verdict mapping after the loop.
+    if (state.tau > 0.0 && residuals.rp_inf / state.tau <=
+                               10.0 * options.tolerances.primal_feasibility * (1.0 + b_norm)) {
+      primal_feasible_seen = true;
+    }
 
     status = homogeneous_progress(problem, state, residuals, reference, result.progress);
     if (!status.ok()) break;
@@ -293,6 +332,26 @@ core::Expected<HsdResult> solve_hsd(const model::CanonicalProblem& problem,
     result.cg_iterations += kkt.cg_iterations();
     if (kkt.hit_iteration_cap()) result.inexact_solves = true;
 
+    // [AG99] section 5: when a solve needs more than one step of iterative
+    // refinement, "in the following interior point iteration the default
+    // regularizations are multiplied by 10". The CG around the factor IS the
+    // refinement: with an accurate factor it needs about one step, plus one
+    // per dense column kept out of the factor. More than that means the factor
+    // no longer describes the system -- measured on Netlib brandy, whose
+    // dependent rows stall at delta_d = 1.5e-8 and converge at 1e-6. Raised
+    // for one iteration at a time and reset once the solves are clean again.
+    if (kkt.direct() && kkt.solves() > 0) {
+      const std::size_t allowed =
+          2 + (factor ? factor->dense_columns() : 0);  // OURS: 1 refinement step of slack
+      const bool struggling = kkt.cg_iterations() > allowed * kkt.solves();
+      // The DEFAULT times 10, not the current value times 10: AG99 raises it
+      // for the following iteration only. Compounding (tried first) drove
+      // fit1p/fit2p, whose dense columns make CG legitimately longer, to the
+      // 1e-2 cap and lost both.
+      kkt_options.delta_d = struggling ? std::min(options.hsd.delta_d * 10.0, kMaxDeltaD)
+                                       : options.hsd.delta_d;
+    }
+
     Real alpha = homogeneous_step_size(problem, state, /*affine=*/false, params);
     if (!(alpha > 0.0)) {
       // No positive step satisfies the centrality condition. Reported as a
@@ -352,6 +411,18 @@ core::Expected<HsdResult> solve_hsd(const model::CanonicalProblem& problem,
       break;
   }
   result.status = status_for(result.verdict);
+  // A dual-infeasibility certificate proves the primal is unbounded OR
+  // infeasible ([AA] section 1.4.5); only a feasible primal makes it
+  // unbounded. Measured on Netlib CPLEX1 -- infeasible, and dual infeasible
+  // as well -- this path reported Unbounded. So unless an iterate already
+  // showed a feasible primal, settle it EXACTLY: the dual simplex on the
+  // feasibility problem (same constraints, zero objective). Feasible ->
+  // Unbounded; infeasible -> Infeasible, with the simplex's own proof; no
+  // verdict -> none. Rare (a dual certificate at all is rare), so its cost is
+  // paid only when the answer depends on it. OURS.
+  if (result.verdict == HomogeneousVerdict::DualInfeasible && !primal_feasible_seen) {
+    result.status = settle_dual_certificate(problem, options);
+  }
 
   if (result.verdict == HomogeneousVerdict::Optimal) {
     status = recover_from_homogeneous(state);

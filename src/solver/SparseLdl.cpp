@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
-#include <iterator>
-#include <set>
 #include <utility>
 #include <vector>
 
@@ -18,43 +16,142 @@ constexpr std::size_t kNone = static_cast<std::size_t>(-1);
 /// against any real entry, small enough that d * y stays finite.
 constexpr Real kHugePivot = 1e128;
 
-/// Minimum degree on the explicit elimination graph. Deterministic: the set
-/// orders by (degree, index).
-std::vector<std::size_t> minimum_degree(std::size_t n, const std::vector<std::size_t>& col_ptr,
-                                        const std::vector<std::size_t>& row_idx) {
-  std::vector<std::vector<std::size_t>> adj(n);
+/// Approximate minimum degree on the QUOTIENT graph.
+///
+/// NOT TRANSCRIBED from a paper: written from general knowledge of the method
+/// of Amestoy, Davis & Duff (SIAM J. Matrix Anal. Appl. 17, 1996), which the
+/// project does not have. Judged by measurement instead -- fill against
+/// CHOLMOD's own AMD on the same matrices, and ordering time against the
+/// explicit-graph minimum degree it replaced (in git history).
+///
+/// An explicit elimination graph stores every fill edge and so costs
+/// time and memory proportional to the factor. The quotient graph instead
+/// represents an eliminated pivot by one ELEMENT, the clique of its remaining
+/// neighbours, so a variable's neighbourhood is its variable list A_i plus
+/// the union of its elements' lists; storage never exceeds the original
+/// graph's.
+///
+/// Eliminating pivot p:
+///   L_p  = A_p u (union of L_e over e in E_p), minus p; those elements are
+///          absorbed into p, which becomes the new element.
+///   For each i in L_p: E_i <- (E_i \ absorbed) u {p}; A_i <- A_i \ L_p \ {p}.
+///   Degree: with w(e) = |L_e \ L_p| for each other element of i,
+///          d_i = min( n_left - 1,  d_i_old + |L_p| - 1,
+///                     |A_i| + |L_p| - 1 + sum_e w(e) )
+///   -- an upper bound on the true external degree, which is what makes the
+///   ordering "approximate". An element with w(e) = 0 lies inside L_p and is
+///   absorbed as well.
+///
+/// Ties go to the most recently updated variable of the lowest degree
+/// (buckets are LIFO), which is deterministic run to run.
+std::vector<std::size_t> approximate_minimum_degree(std::size_t n,
+                                                    const std::vector<std::size_t>& col_ptr,
+                                                    const std::vector<std::size_t>& row_idx) {
+  constexpr std::size_t kNil = static_cast<std::size_t>(-1);
+  std::vector<std::vector<std::size_t>> A(n), E(n), L(n);
+  std::vector<std::size_t> lsize(n, 0), degree(n, 0);
+  std::vector<char> variable(n, 1), element_alive(n, 0);
   for (std::size_t j = 0; j < n; ++j) {
     for (std::size_t p = col_ptr[j]; p < col_ptr[j + 1]; ++p) {
-      if (row_idx[p] != j) adj[j].push_back(row_idx[p]);
+      if (row_idx[p] != j) A[j].push_back(row_idx[p]);
     }
-    std::sort(adj[j].begin(), adj[j].end());
-    adj[j].erase(std::unique(adj[j].begin(), adj[j].end()), adj[j].end());
+    std::sort(A[j].begin(), A[j].end());
+    A[j].erase(std::unique(A[j].begin(), A[j].end()), A[j].end());
+    degree[j] = A[j].size();
   }
 
-  std::set<std::pair<std::size_t, std::size_t>> queue;
-  for (std::size_t j = 0; j < n; ++j) queue.emplace(adj[j].size(), j);
+  // Degree buckets: doubly linked, LIFO.
+  std::vector<std::size_t> head(n + 1, kNil), next(n, kNil), prev(n, kNil);
+  const auto insert = [&](std::size_t i) {
+    const std::size_t d = std::min(degree[i], n);
+    next[i] = head[d];
+    prev[i] = kNil;
+    if (head[d] != kNil) prev[head[d]] = i;
+    head[d] = i;
+  };
+  const auto remove = [&](std::size_t i) {
+    const std::size_t d = std::min(degree[i], n);
+    if (prev[i] != kNil) next[prev[i]] = next[i]; else head[d] = next[i];
+    if (next[i] != kNil) prev[next[i]] = prev[i];
+  };
+  for (std::size_t j = n; j-- > 0;) insert(j);
 
+  std::vector<std::size_t> mark(n, kNil), wstamp(n, kNil), w(n, 0);
   std::vector<std::size_t> order;
   order.reserve(n);
-  std::vector<std::size_t> merged;
-  while (!queue.empty()) {
-    const std::size_t v = queue.begin()->second;
-    queue.erase(queue.begin());
-    order.push_back(v);
-    const std::vector<std::size_t> nb = std::move(adj[v]);
-    adj[v].clear();
-    // Eliminating v joins its neighbours into a clique.
-    for (const std::size_t u : nb) {
-      queue.erase({adj[u].size(), u});
-      merged.clear();
-      std::set_union(adj[u].begin(), adj[u].end(), nb.begin(), nb.end(),
-                     std::back_inserter(merged));
-      merged.erase(std::remove_if(merged.begin(), merged.end(),
-                                  [&](std::size_t w) { return w == u || w == v; }),
-                   merged.end());
-      adj[u].swap(merged);
-      queue.emplace(adj[u].size(), u);
+  std::size_t min_degree = 0;
+
+  for (std::size_t k = 0; k < n; ++k) {
+    while (head[min_degree] == kNil) ++min_degree;
+    const std::size_t p = head[min_degree];
+    remove(p);
+    order.push_back(p);
+    variable[p] = 0;
+
+    // L_p, absorbing p's elements.
+    std::vector<std::size_t> lp;
+    mark[p] = k;
+    for (const std::size_t v : A[p]) {
+      if (variable[v] && mark[v] != k) { mark[v] = k; lp.push_back(v); }
     }
+    for (const std::size_t e : E[p]) {
+      if (!element_alive[e]) continue;
+      for (const std::size_t v : L[e]) {
+        if (variable[v] && mark[v] != k) { mark[v] = k; lp.push_back(v); }
+      }
+      element_alive[e] = 0;
+      L[e].clear();
+      L[e].shrink_to_fit();
+    }
+    A[p].clear();
+    A[p].shrink_to_fit();
+    E[p].clear();
+    E[p].shrink_to_fit();
+    std::sort(lp.begin(), lp.end());  // deterministic order for the updates below
+    element_alive[p] = 1;
+    lsize[p] = lp.size();
+
+    // w(e) = |L_e \ L_p| for every live element meeting L_p.
+    for (const std::size_t i : lp) {
+      for (const std::size_t e : E[i]) {
+        if (!element_alive[e] || e == p) continue;
+        if (wstamp[e] != k) { wstamp[e] = k; w[e] = lsize[e]; }
+        --w[e];
+      }
+    }
+
+    const std::size_t left = n - k - 1;
+    for (const std::size_t i : lp) {
+      remove(i);
+      // Elements: drop the absorbed ones and those now inside L_p, add p.
+      std::size_t ext = 0;
+      std::size_t out = 0;
+      for (const std::size_t e : E[i]) {
+        if (!element_alive[e] || e == p) continue;
+        if (wstamp[e] == k && w[e] == 0) {  // L_e inside L_p: absorb into p
+          element_alive[e] = 0;
+          continue;
+        }
+        E[i][out++] = e;
+        ext += wstamp[e] == k ? w[e] : lsize[e];
+      }
+      E[i].resize(out);
+      E[i].push_back(p);
+      // Variables: those in L_p are now reached through element p.
+      out = 0;
+      for (const std::size_t v : A[i]) {
+        if (variable[v] && mark[v] != k) A[i][out++] = v;
+      }
+      A[i].resize(out);
+
+      const std::size_t bound = A[i].size() + (lp.size() - 1) + ext;
+      degree[i] = std::min({left > 0 ? left - 1 : 0, degree[i] + lp.size() - 1, bound});
+      insert(i);
+      if (degree[i] < min_degree) min_degree = degree[i];
+    }
+    L[p] = std::move(lp);
+    // Elements absorbed during the w pass leave stale ids behind in other
+    // variables' E lists; they are skipped (element_alive) when met.
   }
   return order;
 }
@@ -66,7 +163,7 @@ core::Status SparseLdl::analyze(std::size_t n, const std::vector<std::size_t>& c
   n_ = n;
   col_ptr_ = col_ptr;
   row_idx_ = row_idx;
-  perm_ = minimum_degree(n, col_ptr, row_idx);
+  perm_ = approximate_minimum_degree(n, col_ptr, row_idx);
   pinv_.assign(n, 0);
   for (std::size_t k = 0; k < n; ++k) pinv_[perm_[k]] = k;
 
