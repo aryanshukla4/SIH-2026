@@ -76,3 +76,6 @@ tests\data\mittleman lp.rar
 
 
 
+
+# Local run notebooks (A100 benchmark), kept out of the repo
+notebooks/

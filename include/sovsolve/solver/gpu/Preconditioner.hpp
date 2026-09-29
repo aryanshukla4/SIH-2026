@@ -100,6 +100,17 @@ using core::Status;
                                  const RealVector& diag_add,
                                  const std::vector<bool>& is_dense_column);
 
+/// The same exact factor as `cudss_build`, computed by the in-house SparseLdl
+/// (solver/SparseLdl.hpp) on the host: our own ordering and LDL', no library.
+/// Deterministic bit for bit. Its analysis is cached while the pattern holds.
+[[nodiscard]] Status host_ldl_build(const core::SparseMatrixPair<>& a, const RealVector& theta,
+                                    const RealVector& diag_add,
+                                    const std::vector<bool>& is_dense_column);
+
+/// `z = M^-1 r` with the last `host_ldl_build` factor; copies r to the host and
+/// z back. DEVICE pointers of length m; `r == z` is allowed.
+[[nodiscard]] Status host_ldl_apply(const Real* r_device, Real* z_device, std::size_t m);
+
 /// `z = M^-1 r` with the factor the last successful `cudss_build` produced.
 /// DEVICE pointers of length m; `r == z` is allowed.
 [[nodiscard]] Status cudss_apply(const Real* r_device, Real* z_device, std::size_t m);
