@@ -21,6 +21,9 @@ sovsolve_add_test(qplib_reader_test    unit/qplib_reader_test.cpp)
 sovsolve_add_test(solver_types_test    unit/solver_types_test.cpp)
 sovsolve_add_test(presolver_test       property/presolver_test.cpp)
 sovsolve_add_test(milp_presolve_test   property/milp_presolve_test.cpp)
+sovsolve_add_test(lp_presolve_test     property/lp_presolve_test.cpp)
+target_compile_definitions(lp_presolve_test PRIVATE
+  SOVSOLVE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 
 # Module 23. Host-only by construction (see src/solver/CMakeLists.txt), so
 # unlike the IPM's tests these run in the default `release` preset with no

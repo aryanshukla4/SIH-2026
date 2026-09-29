@@ -53,6 +53,7 @@ core::Status compute_homogeneous_border(const model::CanonicalProblem& problem,
   ensure(out.h_x, n);
   ensure(out.g_x, n);
   ensure(out.d_slack, m_i);
+  ensure(out.w_gap, n);
   out.w = 0.0;
 
   for (std::size_t j = 0; j < n; ++j) {
@@ -91,6 +92,11 @@ core::Status compute_homogeneous_border(const model::CanonicalProblem& problem,
     }
 
     out.theta_inv[j] = theta_l + theta_u;
+    out.w_gap[j] = 0.0;
+    if (theta_l > 0.0 && theta_u > 0.0) {
+      const Real width = problem.col_upper[j] - problem.col_lower[j];
+      out.w_gap[j] = theta_l * theta_u / (theta_l + theta_u) * width * width;
+    }
     // The column and the row differ by `2c`, not by a sign. See the header.
     out.h_x[j] = bound_term - problem.c[j];
     out.g_x[j] = bound_term + problem.c[j];
@@ -106,7 +112,8 @@ core::Status compute_homogeneous_border(const model::CanonicalProblem& problem,
     out.d_slack[k] = state.s[k] / sigma;
   }
 
-  out.trailing = -(out.w + state.kappa / tau);
+  out.kappa_over_tau = state.kappa / tau;
+  out.trailing = -(out.w + out.kappa_over_tau);
   return core::Status::Ok();
 }
 
@@ -133,6 +140,46 @@ core::Status refresh_border_solve(const model::CanonicalProblem& problem,
   core::Status st = solver.solve(in(border.h_x), in(work.rp_hat), out_span(work.p_x),
                                  out_span(work.p_y));
   if (!st.ok()) return st;
+
+  // The Schur complement's denominator, `g'p_x - b'p_y - trailing`, with
+  // `trailing = -(w + kappa/tau)`. Summed as written, `g'p_x` and `w` are both
+  // ~1e15 on a model with large bounds and cancel to exactly zero (Netlib
+  // `nesm`: -6.54043e15 against -6.54043e15). Substituting
+  // `p_x = Theta (A'p_y - h_x)`, the per-column term becomes
+  //
+  //     g_j p_j + w_j = Theta_j (g_j a_j + c_j^2) + w_gap_j,   a = A'p_y,
+  //
+  // since `w_j - Theta_j bt_j^2 = w_gap_j >= 0` exactly (bt = Theta_l l +
+  // Theta_u u, g = bt + c, h = bt - c) -- no difference of large numbers left.
+  // A free column has no bound terms and keeps the direct form.
+  ensure(work.aty, n);
+  const auto& csc = problem.A.csc;
+  for (std::size_t j = 0; j < n; ++j) {
+    Real acc = 0.0;
+    for (auto k = csc.slice_begin(j); k < csc.slice_end(j); ++k) {
+      acc += csc.values()[k] * work.p_y[static_cast<std::size_t>(csc.indices()[k])];
+    }
+    work.aty[j] = acc;
+  }
+  Real schur = border.kappa_over_tau;
+  for (std::size_t j = 0; j < n; ++j) {
+    const Real tinv = border.theta_inv[j];
+    if (tinv > 0.0 && tinv >= work.theta_inv_floor) {
+      const Real c = problem.c[j];
+      schur += (border.g_x[j] * work.aty[j] + c * c) / tinv + border.w_gap[j];
+    } else if (tinv > 0.0) {
+      // Floored by the solver: bt = (g + h)/2 is tiny here, so the direct form
+      // `g p + w_j`, with `w_j = w_gap_j + bt^2 / Theta_inv`, has nothing large
+      // to cancel.
+      const Real bt = 0.5 * (border.g_x[j] + border.h_x[j]);
+      schur += border.g_x[j] * work.p_x[j] + border.w_gap[j] + bt * bt / tinv;
+    } else {
+      schur += border.g_x[j] * work.p_x[j];
+    }
+  }
+  for (std::size_t i = 0; i < m; ++i) schur -= problem.b[i] * work.p_y[i];
+  work.schur = schur;
+
   work.p_valid = true;
   return core::Status::Ok();
 }
@@ -215,17 +262,11 @@ core::Status solve_homogeneous_newton(const model::CanonicalProblem& problem,
   //     dtau = (gr'u - rho) / (gr'p - trailing)
   //     (dx; dy) = u - dtau * p
   Real gr_u = 0.0;
-  Real gr_p = 0.0;
-  for (std::size_t j = 0; j < n; ++j) {
-    gr_u += border.g_x[j] * work.u_x[j];
-    gr_p += border.g_x[j] * work.p_x[j];
-  }
-  for (std::size_t i = 0; i < m; ++i) {
-    gr_u -= problem.b[i] * work.u_y[i];
-    gr_p -= problem.b[i] * work.p_y[i];
-  }
+  for (std::size_t j = 0; j < n; ++j) gr_u += border.g_x[j] * work.u_x[j];
+  for (std::size_t i = 0; i < m; ++i) gr_u -= problem.b[i] * work.u_y[i];
 
-  const Real denominator = gr_p - border.trailing;
+  // `gr'p - trailing`, formed without cancellation in refresh_border_solve.
+  const Real denominator = work.schur;
   if (!std::isfinite(denominator) || denominator == 0.0) {
     return core::make_error(core::ErrorCode::NumericalError,
                             "solve_homogeneous_newton: the Schur complement is "
