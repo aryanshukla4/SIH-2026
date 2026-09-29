@@ -17,6 +17,8 @@ add_library(sovsolve_solver STATIC
   MilpSolve.cpp
   # Module 30: the concurrent optimizer. Needs Threads::Threads (below).
   ConcurrentSolve.cpp
+  # Crash basis and primal push from a tolerance-optimal point to a vertex.
+  Crossover.cpp
   Homogeneous.cpp
   HomogeneousSolve.cpp
   HostKkt.cpp

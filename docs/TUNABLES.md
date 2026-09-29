@@ -26,6 +26,7 @@ Paper keys:
 | CPX  | cuPDLPx, arXiv 2507.14051 |
 | HPR  | HPR-LP, arXiv 2408.12179 |
 | AY96 | Andersen & Ye, "Combining interior-point and pivoting algorithms for linear programming", Management Science 42(12) (1996) |
+| BS94 | Bixby & Saltzman, "Recovering an optimal LP basis from an interior point solution", Operations Research Letters 15(4) (1994) |
 
 Values in `Options.hpp` are runtime options; the rest are compile-time constants in the
 file named.
@@ -95,15 +96,28 @@ file named.
 | `resident_check` | on | CPX section 4 evaluates termination on the GPU | `--pdlp-resident-check` |
 | `certificate_check_every` | 10 | OURS: delays a certificate by at most 400 iterations | `--pdlp-certificate-every` |
 
-## Concurrent race crossover (`Options.hpp` `ConcurrentOptions`, `src/solver/ConcurrentSolve.cpp`)
+## Concurrent race crossover (`Options.hpp` `ConcurrentOptions`, `src/solver/ConcurrentSolve.cpp`, `src/solver/Crossover.cpp`)
 
-Measured 2026-09-30, i5-12450H, best of 3, on the 31 Netlib LPs where cuPDLPx or HSD
-wins the race: SGM10 0.60 s off, 1.21 s with the primal finish, 1.40 s with the dual.
+Measured 2026-09-30, i5-12450H, best of 3, all 123 Netlib LPs: 123/123 correct off and
+on; SGM10 0.175 s off, 0.220 s on. The crossover runs on the 31 models cuPDLPx or HSD
+wins and reaches a vertex on 29; median cost 1.24x the race there. The path there, on
+those 31 models: crash straight into the simplex, SGM10 1.21 s; + primal push, 1.01 s;
++ dual push, batch LU repair and the agreement guard, 0.76 s (0.57 s off).
 
 | name | value | source | flag |
 |---|---|---|---|
-| `crossover` | off | OURS: fixes the objective's last digits (-2.7999999914 -> -2.8 on the milp_test LP) but costs ~2x where it runs | `--concurrent-crossover` |
-| crash-basis ranking | x/(x+z) indicator | AY96 (Andersen & Ye, Management Science 42(12), 1996); plain distance from bounds measured worse (SGM10 0.41 s vs 0.22 s off, all 123 models) | - |
-| `crossover_method` | primal | OURS: 1.21 s vs 1.40 s SGM10 above; the dual reached a vertex more often (21 vs 18 of 31) | `--concurrent-crossover-method` |
-| `crossover_time_factor` | 1.0 | OURS: caps the worst case at twice the race | `--concurrent-crossover-factor` |
+| `crossover` | off | OURS: fixes the objective's last digits (-2.7999999914 -> -2.8 on the milp_test LP) at +25% SGM10 overall | `--concurrent-crossover` |
+| crash-basis ranking | x/(x+z) indicator | AY96; plain distance from bounds measured worse (SGM10 0.41 s vs 0.22 s off) | - |
+| primal and dual push | on | Megiddo 1991; BS94 (Bixby & Saltzman, OR Letters 15(4), 1994) | - |
+| `crossover_method` | dual | OURS: after the primal push, truss needs 688 dual vs >491,000 primal cleanup iterations (the primal stalls in Bland's rule) | `--concurrent-crossover-method` |
+| `kCrossoverAgreement` | 1e-7 rel. | OURS: 10x the engines' 1e-8 stop; rejects pilot (2.0e-6) and pilot87 (1.6e-6) vertices, which were wrong answers | - |
+| `kSnapTolerance` | 1e-9 rel. | OURS: below the engines' own 1e-8 residual | - |
+| `kDualSuperbasicTolerance` | 1e-9 | OURS: duals are accurate to ~1e-8, anything smaller is noise | - |
+| `kPushPivotTolerance`, `kHarrisTolerance` | 1e-9, 1e-9 | Harris 1973 two-pass ratio test; values OURS | - |
+| `crossover_time_factor` | 1.0 | OURS: caps the worst case (pilot87) at twice the race | `--concurrent-crossover-factor` |
 | `crossover_min_seconds` | 1.0 | OURS: keeps microsecond races from starving the crossover | `--concurrent-crossover-min` |
+
+Two fixes found on the way, both outside the crossover: the LU repair now replaces every
+dependent column of a stall in one pass (dfl001's crash basis: 1418 refactorizations ->
+1, crash 3.66 s -> 0.007 s), and `solve_simplex` gives its primal cleanup only the time
+the dual left (it had run for up to twice `--time-limit`).

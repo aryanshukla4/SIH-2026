@@ -48,8 +48,8 @@
 // (ConcurrentOptions::crossover, opt-in) removes that: a tolerance win is
 // finished by the simplex, warm-started from a basis read off the winning
 // point, so every Optimal the race returns is a simplex vertex and its
-// objective is exact. It is off by default because it roughly doubles the
-// solve time where it runs -- see the measurement on the option.
+// objective is exact. It is off by default because it adds about a quarter to
+// the solve time where it runs -- see the measurement on the option.
 //
 // What is still not fixed is WHICH optimal vertex: a degenerate LP has many,
 // with the same objective, and two starting bases may reach different ones.
@@ -106,8 +106,30 @@ struct ConcurrentReport {
   /// winner's answer was returned unchanged.
   bool crossover_used = false;
   core::SolverStatus crossover_status = core::SolverStatus::NotConverged;
+  /// Cleanup simplex iterations after the push.
   std::size_t crossover_iterations = 0;
+  /// Wall time of crash, push and cleanup together.
   double crossover_seconds = 0.0;
+  /// Nonbasic variables off their bounds after the crash, and how many of
+  /// them the primal push pivoted into the basis (Crossover.hpp).
+  std::size_t crossover_superbasic = 0;
+  std::size_t crossover_push_pivots = 0;
+  /// The same for the dual push: basic variables with a nonzero reduced cost,
+  /// and how many were pivoted out.
+  std::size_t crossover_dual_superbasic = 0;
+  std::size_t crossover_dual_pivots = 0;
+  /// Where the crossover's time went: crash, primal push, dual push, and the
+  /// cleanup simplex.
+  double crossover_crash_seconds = 0.0;
+  /// Columns the LU repair replaced over the whole crossover.
+  std::size_t crossover_repairs = 0;
+  /// Relative objective difference between the vertex and the winner's
+  /// answer. Above 1e-7 the vertex is discarded and the winner's answer kept
+  /// (ConcurrentSolve.cpp, kCrossoverAgreement).
+  core::Real crossover_disagreement = 0.0;
+  double crossover_primal_push_seconds = 0.0;
+  double crossover_dual_push_seconds = 0.0;
+  double crossover_cleanup_seconds = 0.0;
 };
 
 /// The engines this build can race, in PRIORITY order.

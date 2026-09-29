@@ -112,49 +112,56 @@ Status LuFactorization::factorize_repairing(const AugmentedMatrix& matrix, Basis
   const std::size_t rows = matrix.num_rows();
   std::size_t replaced = 0;
 
-  // At most one substitution per row: every repair puts a logical into the
-  // basis that was not there before, and there are only `rows` logicals.
+  // Every repair puts at least one logical into the basis that was not there
+  // before, and there are only `rows` logicals, so this loop is bounded. A
+  // stall is repaired as a whole (see factorize_impl): all its active slots at
+  // once, paired with the logicals of all its active rows. One at a time is
+  // also correct but refactorizes once per column -- measured at 1418
+  // refactorizations for one crossover crash basis on Netlib dfl001.
+  std::vector<std::size_t> stall_rows;
+  std::vector<std::size_t> stall_slots;
   for (std::size_t attempt = 0; attempt <= rows; ++attempt) {
-    std::size_t stall_row = rows;
-    std::size_t stall_slot = rows;
     const Status status =
-        factorize_impl(matrix, basis, pivot_tolerance, &stall_row, &stall_slot);
+        factorize_impl(matrix, basis, pivot_tolerance, &stall_rows, &stall_slots);
     if (status.ok()) {
       if (repairs != nullptr) *repairs = replaced;
       return status;
     }
     // A dimension mismatch is the caller's bug, not a singular basis.
     if (status.error().code != ErrorCode::NumericalError) return status;
-    if (stall_row >= rows || stall_slot >= rows) return status;
+    if (stall_rows.empty() || stall_rows.size() != stall_slots.size()) return status;
 
-    const std::size_t logical = matrix.logical_of_row(stall_row);
-    if (basis.status[logical] == VarStatus::Basic) {
-      // The header argues this is unreachable. If it ever is reached, the
-      // argument is wrong somewhere and silently carrying on would replace a
-      // column with one already in the basis -- still singular, and now also
-      // untraceable. Report instead.
-      return status;
+    for (std::size_t k = 0; k < stall_rows.size(); ++k) {
+      const std::size_t logical = matrix.logical_of_row(stall_rows[k]);
+      if (basis.status[logical] == VarStatus::Basic) {
+        // The header argues this is unreachable: a basic logical's column is
+        // the unit vector of its row, so an active row with its logical in an
+        // active slot would have offered a pivot. If it is ever reached, the
+        // argument is wrong somewhere and silently carrying on would put a
+        // column in the basis twice. Report instead.
+        return status;
+      }
+      const std::size_t slot = stall_slots[k];
+      const auto displaced = static_cast<std::size_t>(basis.basic[slot]);
+      // Any non-Basic status makes the basis well formed again. Which bound
+      // the displaced column should actually rest on depends on the caller's
+      // WORKING bounds (phase 1 installs artificial ones this class cannot
+      // see), so this picks from the model's own bounds and leaves the caller
+      // to re-place it.
+      if (core::is_finite_bound(matrix.lower(displaced))) {
+        basis.status[displaced] = core::is_finite_bound(matrix.upper(displaced)) &&
+                                          matrix.lower(displaced) == matrix.upper(displaced)
+                                      ? VarStatus::Fixed
+                                      : VarStatus::AtLower;
+      } else if (core::is_finite_bound(matrix.upper(displaced))) {
+        basis.status[displaced] = VarStatus::AtUpper;
+      } else {
+        basis.status[displaced] = VarStatus::Free;
+      }
+      basis.basic[slot] = static_cast<Index>(logical);
+      basis.status[logical] = VarStatus::Basic;
+      ++replaced;
     }
-
-    const auto displaced = static_cast<std::size_t>(basis.basic[stall_slot]);
-    // Any non-Basic status makes the basis well formed again. Which bound the
-    // displaced column should actually rest on depends on the caller's WORKING
-    // bounds (phase 1 installs artificial ones this class cannot see), so this
-    // picks from the model's own bounds and leaves the caller to re-place it.
-    if (core::is_finite_bound(matrix.lower(displaced))) {
-      basis.status[displaced] = core::is_finite_bound(matrix.upper(displaced)) &&
-                                        matrix.lower(displaced) == matrix.upper(displaced)
-                                    ? VarStatus::Fixed
-                                    : VarStatus::AtLower;
-    } else if (core::is_finite_bound(matrix.upper(displaced))) {
-      basis.status[displaced] = VarStatus::AtUpper;
-    } else {
-      basis.status[displaced] = VarStatus::Free;
-    }
-
-    basis.basic[stall_slot] = static_cast<Index>(logical);
-    basis.status[logical] = VarStatus::Basic;
-    ++replaced;
   }
 
   if (repairs != nullptr) *repairs = replaced;
@@ -164,8 +171,9 @@ Status LuFactorization::factorize_repairing(const AugmentedMatrix& matrix, Basis
 }
 
 Status LuFactorization::factorize_impl(const AugmentedMatrix& matrix, const Basis& basis,
-                                       Real pivot_tolerance, std::size_t* stall_row,
-                                       std::size_t* stall_slot) {
+                                       Real pivot_tolerance,
+                                       std::vector<std::size_t>* stall_rows,
+                                       std::vector<std::size_t>* stall_slots) {
   clear();
 
   if (!basis.validate()) {
@@ -265,30 +273,32 @@ Status LuFactorization::factorize_impl(const AugmentedMatrix& matrix, const Basi
     }
 
     if (best_col < 0) {
-      if (stall_row != nullptr && stall_slot != nullptr) {
-        std::size_t row = dim_;
+      // Every active column is below the drop tolerance on every active row:
+      // the pivot search above rejects a column only when its largest active
+      // entry is. So the whole active submatrix is numerically zero, and ALL
+      // the active slots are dependent on the columns already pivoted -- not
+      // just one of them. Report them all, so the caller can repair them in
+      // one pass instead of refactorizing once per column.
+      if (stall_rows != nullptr && stall_slots != nullptr) {
+        stall_rows->clear();
+        stall_slots->clear();
         for (std::size_t i = 0; i < dim_; ++i) {
-          if (ws.row_active[i] != 0) {
-            row = i;
-            break;
-          }
+          if (ws.row_active[i] != 0) stall_rows->push_back(i);
         }
-        // Prefer displacing a structural column: that strictly increases the
+        // Structural slots first: displacing those strictly increases the
         // number of basic logicals, which is bounded by m, so the repair loop
-        // cannot cycle. Falling back to an active logical slot is still
-        // progress, since the logical being installed is a different one.
-        std::size_t slot = dim_;
-        std::size_t structural_slot = dim_;
+        // cannot cycle. An active logical slot is still progress, since the
+        // logical installed there is a different one.
         for (std::size_t q = 0; q < dim_; ++q) {
-          if (ws.col_active[q] == 0) continue;
-          if (slot == dim_) slot = q;
-          if (!matrix.is_logical(static_cast<std::size_t>(basis.basic[q]))) {
-            structural_slot = q;
-            break;
+          if (ws.col_active[q] != 0 && !matrix.is_logical(static_cast<std::size_t>(basis.basic[q]))) {
+            stall_slots->push_back(q);
           }
         }
-        *stall_row = row;
-        *stall_slot = structural_slot != dim_ ? structural_slot : slot;
+        for (std::size_t q = 0; q < dim_; ++q) {
+          if (ws.col_active[q] != 0 && matrix.is_logical(static_cast<std::size_t>(basis.basic[q]))) {
+            stall_slots->push_back(q);
+          }
+        }
       }
       return singular(step);
     }

@@ -1,6 +1,7 @@
 #include "sovsolve/solver/simplex/SolveSimplex.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -139,6 +140,22 @@ core::Expected<SimplexResult> solve_simplex(const model::CanonicalProblem& probl
   const bool perturb = options.simplex.cost_perturbation &&
                        make_cost_perturbation(problem, options, perturbed);
 
+  // One time limit for the dual AND its primal cleanup. Each engine starts its
+  // own clock, so handing the cleanup `options` unchanged let the pair run for
+  // up to twice the limit (measured: 9.4 s of a 4.6 s crossover budget on
+  // Netlib pilot87). The cleanup gets what the dual left; a limit of 0 means
+  // "none" to the engines, so an exhausted one becomes a vanishing positive.
+  const auto start = std::chrono::steady_clock::now();
+  const auto cleanup_options = [&options, &start]() {
+    model::Options o = options;
+    if (o.limits.time_limit_seconds > 0.0) {
+      const double used =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+      o.limits.time_limit_seconds = std::max(1e-9, o.limits.time_limit_seconds - used);
+    }
+    return o;
+  };
+
   auto dual = solve_dual_simplex(problem, options, warm_start,
                                  perturb ? &perturbed : nullptr);
   if (!dual.has_value()) return dual;
@@ -164,7 +181,7 @@ core::Expected<SimplexResult> solve_simplex(const model::CanonicalProblem& probl
                         dual->status == core::SolverStatus::Unbounded ||
                         options.simplex.primal_cleanup;
     if (finish) {
-      auto primal = solve_primal_simplex(problem, options, &dual->basis);
+      auto primal = solve_primal_simplex(problem, cleanup_options(), &dual->basis);
       if (primal.has_value()) {
         add_counts(*primal, *dual);
         return primal;
@@ -187,7 +204,7 @@ core::Expected<SimplexResult> solve_simplex(const model::CanonicalProblem& probl
   // primal feasible for the model (it is feasible for the narrower boxed
   // problem, and the true bounds contain the box), so this normally costs no
   // phase-1 pivots at all.
-  auto primal = solve_primal_simplex(problem, options, &dual->basis);
+  auto primal = solve_primal_simplex(problem, cleanup_options(), &dual->basis);
   if (!primal.has_value()) return dual;  // keep the better-understood outcome
   if (!is_verdict(primal->status) && is_verdict(dual->status)) return dual;
 
