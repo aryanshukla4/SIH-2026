@@ -16,7 +16,7 @@ using core::Status;
 
 /// Opaque handle: on the GPU path this is expected to be a thin pass-through
 /// to cuDSS's own analysis phase rather than a from-scratch symbolic
-/// factorization (module.txt Module 10's explicit deferral clause), so its
+/// factorization (docs/spec/module.txt Module 10's explicit deferral clause), so its
 /// contents are backend-defined.
 class SymbolicFactorization {
  public:

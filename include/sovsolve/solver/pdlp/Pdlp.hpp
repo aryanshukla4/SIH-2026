@@ -232,7 +232,7 @@
 // bytes -- the three scalars of `r(z)` -- because the restart DECISION is made
 // here. That is one synchronization per iteration, the same price Algorithm
 // 2's trial already paid. cuPDLPx keeps even that decision on the device; this
-// does not yet, and the measurement in module.txt says what it costs.
+// does not yet, and the measurement in docs/spec/module.txt says what it costs.
 
 #ifndef SOVSOLVE_SOLVER_PDLP_PDLP_HPP
 #define SOVSOLVE_SOLVER_PDLP_PDLP_HPP

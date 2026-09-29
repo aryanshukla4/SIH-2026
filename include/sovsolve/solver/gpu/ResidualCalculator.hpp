@@ -1,5 +1,5 @@
 // Module 7. SpMV + vector ops -- GPU-resident per the spec's GPU-boundary
-// text (architecture.txt, "## GPU boundary").
+// text (docs/spec/architecture.txt, "## GPU boundary").
 
 #ifndef SOVSOLVE_SOLVER_GPU_RESIDUAL_CALCULATOR_HPP
 #define SOVSOLVE_SOLVER_GPU_RESIDUAL_CALCULATOR_HPP

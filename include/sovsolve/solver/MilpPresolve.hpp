@@ -6,7 +6,7 @@
 // integrality. This reduction genuinely needs to know which columns are
 // discrete, so it runs on the raw Problem, once, before Module 22's search
 // begins (BranchAndBound.cu) -- a new, clearly scoped piece, not folded into
-// Module 4 (module.txt's "no module silently implements another module's
+// Module 4 (docs/spec/module.txt's "no module silently implements another module's
 // job").
 
 #ifndef SOVSOLVE_SOLVER_MILP_PRESOLVE_HPP

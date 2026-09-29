@@ -1,6 +1,6 @@
 // Per-iteration record and the container that accumulates it.
 //
-// module.txt Module 19: theta_floor_activations and refinement_passes are
+// docs/spec/module.txt Module 19: theta_floor_activations and refinement_passes are
 // "the evidence for any numerical-robustness claim in the submission" -- this
 // is a benchmarking/grading artifact, not incidental logging, so it needs
 // CSV/JSON export rather than printf.
@@ -53,7 +53,7 @@ struct IterationRecord {
 };
 
 /// Iteration history plus export. Independent of Logging (Logging.hpp) --
-/// this is the data record, Logging is presentation, and module.txt Module 20
+/// this is the data record, Logging is presentation, and docs/spec/module.txt Module 20
 /// requires the two stay decoupled.
 class Diagnostics {
  public:

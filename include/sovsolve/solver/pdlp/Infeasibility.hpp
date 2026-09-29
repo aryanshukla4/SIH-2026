@@ -112,7 +112,7 @@
 //                   and this project has already been burned by exactly that
 //                   failure -- `greenbea` reporting a false `Infeasible` from
 //                   the dual simplex's artificially-bounded phase 1
-//                   (module.txt section 23, bug 3).
+//                   (docs/spec/module.txt section 23, bug 3).
 //
 // So the default is strict, and where the conditions do not hold the engine
 // stays silent and lets the iteration limit speak.

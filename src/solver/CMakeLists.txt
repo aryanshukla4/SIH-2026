@@ -86,7 +86,7 @@ endif()
 
 # GPU-boundary modules (Modules 7, 9, 10, 12-16): SpMV, KKT assembly,
 # factorization/solve, refinement, step length, state update -- see
-# architecture.txt "## GPU boundary". Built only under WSL2/Linux with the
+# docs/spec/architecture.txt "## GPU boundary". Built only under WSL2/Linux with the
 # CUDA toolkit; the host library above stays fully self-contained without it.
 if(SOVSOLVE_ENABLE_CUDA)
   add_library(sovsolve_solver_gpu STATIC

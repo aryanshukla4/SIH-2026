@@ -1,6 +1,6 @@
 // Module 9. Builds Theta^-1 = X_L^-1 Z + (U-X)^-1 V first, floors it
 // elementwise at delta_p, only then inverts -- never inverts a possibly-zero
-// diagonal directly (module.txt Module 9).
+// diagonal directly (docs/spec/module.txt Module 9).
 
 #ifndef SOVSOLVE_SOLVER_GPU_KKT_BUILDER_HPP
 #define SOVSOLVE_SOLVER_GPU_KKT_BUILDER_HPP

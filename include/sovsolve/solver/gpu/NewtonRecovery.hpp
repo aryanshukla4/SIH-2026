@@ -1,7 +1,7 @@
 // Module 13. Uses `system.descriptor` to know what was actually solved: on
 // the normal-equations path `dy` comes out of the linear solve and
 // `dx, ds, dz, dv` are recovered from it; on the augmented path the full
-// direction set comes out directly, and `dy` is not privileged (module.txt
+// direction set comes out directly, and `dy` is not privileged (docs/spec/module.txt
 // Module 13: "never assume dy is always the solved direction").
 //
 // QpAugmentedKkt (gpu::build_kkt) and LpNormalEquationsDy

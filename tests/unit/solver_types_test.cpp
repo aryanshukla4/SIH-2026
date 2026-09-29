@@ -41,7 +41,7 @@ void test_solver_state_default_sizes() {
 
 void test_slack_dual_helper() {
   // slack_dual(y) = -y -- sign tests should always read through this helper
-  // rather than an inline negation (module.txt Module 14).
+  // rather than an inline negation (docs/spec/module.txt Module 14).
   CHECK_NEAR(solver::slack_dual(3.0), -3.0, 1e-15);
   CHECK_NEAR(solver::slack_dual(-2.0), 2.0, 1e-15);
 }

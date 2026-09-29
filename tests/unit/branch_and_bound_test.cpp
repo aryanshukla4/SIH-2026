@@ -1,5 +1,5 @@
 // Behavioural tests for Module 22 (branch-and-bound over MILP, see
-// module.txt and BranchAndBound.hpp).
+// docs/spec/module.txt and BranchAndBound.hpp).
 //
 // A separate executable, registered only when SOVSOLVE_ENABLE_CUDA is on --
 // same reason as solver_gpu_algorithms_test: BranchAndBound.cu lives in

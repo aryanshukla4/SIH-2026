@@ -1,4 +1,4 @@
-// Module 23 (added post-v3, see module.txt): the simplex working form and the
+// Module 23 (added post-v3, see docs/spec/module.txt): the simplex working form and the
 // basis that indexes it.
 //
 // The canonical model (docs/FORMULATION.md section 2) is

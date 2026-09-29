@@ -265,7 +265,7 @@ Expected<Solution> solve(const Problem& problem, const Options& options) {
     // Node/time limit hit, search space not exhausted: report the best
     // incumbent found so far (or none) as NotConverged -- NEVER Infeasible.
     // Same "stagnation is not a verdict about the model" principle
-    // module.txt's Module 18 applies to the continuous solver's own stall
+    // docs/spec/module.txt's Module 18 applies to the continuous solver's own stall
     // detection. The best remaining bound anywhere in the tree is still
     // informative -- it shows the true, still-open gap -- so report it
     // rather than 0.

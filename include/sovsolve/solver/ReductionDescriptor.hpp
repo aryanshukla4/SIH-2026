@@ -1,7 +1,7 @@
 // What the KKT builder actually built, so the linear solver and Newton
 // direction recovery know what they are looking at.
 //
-// module.txt Module 9 mandates this explicitly: "never hardcode dy
+// docs/spec/module.txt Module 9 mandates this explicitly: "never hardcode dy
 // universally." The KKT builder picks one of several reductions depending on
 // Q's structure and the free-column share (see KktSystem.hpp); every module
 // downstream must read that choice from here rather than assuming it.
@@ -41,7 +41,7 @@ struct ReductionDescriptor {
   std::size_t theta_floor_activations = 0;
 
   /// Human-readable justification, e.g. "44% free columns -> augmented path"
-  /// or "diagonal Q -> normal equations". Required by module.txt Module 9:
+  /// or "diagonal Q -> normal equations". Required by docs/spec/module.txt Module 9:
   /// the chosen reduction must be recorded, not just applied.
   std::string reason;
 };
