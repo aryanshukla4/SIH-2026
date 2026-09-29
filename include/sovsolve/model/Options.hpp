@@ -276,6 +276,11 @@ struct LogOptions {
 /// can be switched off" -- this is that switch.
 struct PresolveOptions {
   bool enabled = true;
+
+  /// The LP presolve of solver/LpPresolve.hpp (Andersen & Andersen 1995) in
+  /// place of Module 4's, wherever the model is an LP and the pipeline has
+  /// no warm start to forward-map. Off gives Module 4 alone (`--presolve=1`).
+  bool lp_reductions = true;
 };
 
 /// How branch-and-bound picks the variable to branch on (solver/MilpSolve.hpp).
@@ -583,8 +588,20 @@ struct HsdOptions {
   /// exactly zero and would invert to infinity.
   Real theta_inv_floor = 1.0e-12;
   /// Dual regularization on the normal-equations diagonal, covering rank
-  /// deficiency in `A` that no floor on `Theta` can reach.
-  Real delta_d = 1.0e-10;
+  /// deficiency in `A` that no floor on `Theta` can reach. Altman & Gondzio
+  /// (1999) section 5's default r_d = eps^(1/2): measured on the 94 feasible
+  /// Netlib models with the direct factor, 92 optimal against 91 at the old
+  /// 1e-10 with SparseLdl, and 93 either way with CHOLMOD.
+  Real delta_d = 1.49e-8;
+
+  /// Factor the normal equations directly (solver/NormalFactor.hpp) and use
+  /// the factor as CG's preconditioner, instead of the Jacobi diagonal. Off
+  /// reproduces the matrix-free engine exactly.
+  bool direct = true;
+  /// Altman & Gondzio (1999) section 5: when a factorization breaks down, the
+  /// dual regularization is multiplied by 10 and the factorization retried,
+  /// at most this many times before falling back to the Jacobi diagonal.
+  std::size_t regularization_retries = 6;
 };
 
 /// Module 24 controls: PDLP (solver/pdlp/Pdlp.hpp).
@@ -877,7 +894,13 @@ struct ScalingOptions {
 
 /// Module 23 controls: the dual simplex (solver/simplex/DualSimplex.hpp).
 struct SimplexOptions {
-  Method method = Method::InteriorPoint;
+  /// The concurrent race by default: it is the configuration every published
+  /// benchmark of this solver measures, and it works on every build. The
+  /// previous default, the GPU interior point, made a plain `solve model.mps`
+  /// on the CPU-only build fail with "no CUDA" -- the first thing a new user
+  /// would run. Branch-and-bound is unaffected: MilpSolve sets its own node
+  /// and relaxation method explicitly.
+  Method method = Method::Concurrent;
 
   /// Threshold-pivoting factor for the basis LU: an entry is an eligible
   /// pivot only at this fraction or more of the largest remaining magnitude

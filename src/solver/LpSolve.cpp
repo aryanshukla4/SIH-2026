@@ -5,6 +5,7 @@
 #include "sovsolve/model/Canonical.hpp"
 #include "sovsolve/solver/ConcurrentSolve.hpp"
 #include "sovsolve/solver/Logging.hpp"
+#include "sovsolve/solver/LpPresolve.hpp"
 #include "sovsolve/solver/Presolver.hpp"
 #include "sovsolve/solver/Scaler.hpp"
 #include "sovsolve/solver/SolutionReconstructor.hpp"
@@ -93,7 +94,16 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options,
   }
   canonicalize_seconds = lap();
 
-  core::Status status = presolve(canon->problem, options, canon->transforms);
+  // The LP presolve keeps its own postsolve stack (LpPresolve.hpp), so when it
+  // runs, scaling goes on a stack of its own too and is undone before that
+  // postsolve -- recover_solution then sees the pre-presolve canonical model
+  // and the canonicalizer's records only. Module 4 keeps the old shape.
+  LpPostsolve postsolve;
+  LpPresolveStats presolve_stats;
+  core::Status status = options.presolve.lp_reductions
+                            ? lp_presolve(canon->problem, options, postsolve, &presolve_stats)
+                            : presolve(canon->problem, options, canon->transforms);
+  if (status.ok() && postsolve.active()) log_lp_presolve(presolve_stats, options.log);
   if (!status.ok()) {
     if (is_verdict(status.error().code)) {
       return verdict(problem, verdict_status(status.error().code));
@@ -102,7 +112,9 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options,
   }
   presolve_seconds = lap();
 
-  status = scale(canon->problem, options, canon->transforms);
+  model::TransformStack scaling;
+  model::TransformStack& scale_stack = postsolve.active() ? scaling : canon->transforms;
+  status = scale(canon->problem, options, scale_stack);
   if (!status.ok()) return status.error();
   scale_seconds = lap();
 
@@ -115,7 +127,7 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options,
   // HERE, for the whole call; the options below only borrow them.
   std::vector<Real> row_scale(canon->problem.num_rows(), 1.0);
   std::vector<Real> col_scale(canon->problem.num_cols(), 1.0);
-  for (const auto& rec : canon->transforms.records()) {
+  for (const auto& rec : scale_stack.records()) {
     if (rec.kind == model::TransformKind::RowScaling) {
       const auto i = static_cast<std::size_t>(rec.primary);
       if (i < row_scale.size()) row_scale[i] *= rec.value;
@@ -132,7 +144,12 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options,
   // shared; only the middle differs, and each engine is responsible for
   // producing the same five canonical-space vectors.
   Solution canonical;
-  if (options.simplex.method == model::Method::Concurrent) {
+  if (canon->problem.num_cols() == 0) {
+    // Presolve solved the whole model; every value comes from postsolve.
+    canonical.status = core::SolverStatus::Optimal;
+    canonical.y = core::RealVector(canon->problem.num_rows(), 0.0);
+    canonical.s = core::RealVector(canon->problem.num_inequality_rows(), 0.0);
+  } else if (options.simplex.method == model::Method::Concurrent) {
     // Module 30: race several engines and keep the first verdict. The GPU
     // PDLP backend is deliberately NOT forwarded -- one device shared by
     // three racing threads would serialize them on the same hardware, which
@@ -180,9 +197,22 @@ Expected<Solution> solve_lp(const Problem& problem, const Options& options,
 
   engine_seconds = lap();
 
-  auto recovered =
-      reconstruct_solution(problem, canon->problem, canon->transforms, canonical);
+  const std::size_t presolved_rows = canon->problem.num_rows();
+  const std::size_t presolved_cols = canon->problem.num_cols();
+  const std::size_t presolved_nnz = canon->problem.A.nnz();
+
+  auto recovered = [&]() {
+    if (!postsolve.active()) {
+      return reconstruct_solution(problem, canon->problem, canon->transforms, canonical);
+    }
+    unscale_canonical_solution(scaling, canonical);
+    const Solution expanded = postsolve.expand(canonical);
+    return reconstruct_solution(problem, postsolve.original(), canon->transforms, expanded);
+  }();
   if (!recovered.has_value()) return recovered.error();
+  recovered->presolved_rows = presolved_rows;
+  recovered->presolved_cols = presolved_cols;
+  recovered->presolved_nnz = presolved_nnz;
 
   const std::chrono::duration<double> elapsed = Clock::now() - start;
   recovered->solve_time_seconds = elapsed.count();

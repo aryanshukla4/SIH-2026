@@ -2,6 +2,8 @@
 
 #include <cmath>
 
+#include "sovsolve/solver/NormalFactor.hpp"
+
 namespace sovsolve::solver {
 
 namespace {
@@ -19,7 +21,7 @@ Real dot(const core::RealVector& a, const core::RealVector& b) {
 
 HostKktSolver::HostKktSolver(const model::CanonicalProblem& problem,
                              const HomogeneousBorder& border,
-                             const HostKktOptions& options)
+                             const HostKktOptions& options, NormalFactor* factor)
     : problem_(&problem), matvec_(problem), options_(options) {
   const std::size_t n = problem.num_cols();
   const std::size_t m = problem.num_rows();
@@ -50,12 +52,66 @@ HostKktSolver::HostKktSolver(const model::CanonicalProblem& problem,
     jacobi_[i] = acc > 0.0 ? 1.0 / acc : 1.0;
   }
 
+  // Direct factor of A_S Theta A_S' + D_s + delta_d I, [AG99] section 5: on a
+  // breakdown the dual regularization goes up by 10 and the factorization is
+  // retried. The CG operator uses the SAME delta_d as the factor, so CG
+  // converges to the regularized (proximal) Newton direction -- whose
+  // right-hand side the regularization does not change, [AG99] (45).
+  if (factor != nullptr) {
+    core::RealVector diag(m);
+    for (std::size_t attempt = 0; attempt <= options_.regularization_retries; ++attempt) {
+      for (std::size_t i = 0; i < m; ++i) diag[i] = d_slack_[i] + options_.delta_d;
+      if (factor->factorize(theta_, diag).ok()) {
+        factor_ = factor;
+        break;
+      }
+      options_.delta_d *= 10.0;
+    }
+    if (factor_ != nullptr) {
+      precond_.assign(m, 0.0);
+    } else {
+      options_.delta_d = options.delta_d;  // Jacobi fallback, as without a factor
+    }
+    for (std::size_t i = 0; i < m; ++i) {
+      Real acc = d_slack_[i] + options_.delta_d;
+      for (std::size_t k = csr.slice_begin(i); k < csr.slice_end(i); ++k) {
+        const Real a = csr.values()[k];
+        acc += a * a * theta_[static_cast<std::size_t>(csr.indices()[k])];
+      }
+      jacobi_[i] = acc > 0.0 ? 1.0 / acc : 1.0;
+    }
+  }
+
   r_ = core::RealVector(m);
   p_ = core::RealVector(m);
   ap_ = core::RealVector(m);
   zvec_ = core::RealVector(m);
   rhs_ = core::RealVector(m);
   scratch_n_ = core::RealVector(n);
+}
+
+void HostKktSolver::precondition() {
+  const std::size_t m = r_.size();
+  if (factor_ == nullptr) {
+    for (std::size_t i = 0; i < m; ++i) zvec_[i] = jacobi_[i] * r_[i];
+    return;
+  }
+  for (std::size_t i = 0; i < m; ++i) precond_[i] = r_[i];
+  factor_->solve(precond_);
+  // A factor can pass the backend's own positive-definiteness test with a
+  // pivot so small that the solve overflows (CHOLMOD's supernodal code has no
+  // per-pivot rule, unlike SparseLdl). An overflowed preconditioner would
+  // poison CG with NaN, so this solver drops back to Jacobi for the rest of
+  // its life instead.
+  bool finite = true;
+  for (std::size_t i = 0; i < m && finite; ++i) finite = std::isfinite(precond_[i]);
+  if (!finite) {
+    factor_ = nullptr;
+    ++factor_failures_;
+    for (std::size_t i = 0; i < m; ++i) zvec_[i] = jacobi_[i] * r_[i];
+    return;
+  }
+  for (std::size_t i = 0; i < m; ++i) zvec_[i] = precond_[i];
 }
 
 void HostKktSolver::apply(const core::RealVector& input, core::RealVector& output) {
@@ -88,9 +144,9 @@ core::Status HostKktSolver::solve(core::HostSpan<const Real> rhs_x,
   for (std::size_t i = 0; i < m; ++i) {
     dy[i] = 0.0;
     r_[i] = rhs_[i];
-    zvec_[i] = jacobi_[i] * r_[i];
-    p_[i] = zvec_[i];
   }
+  precondition();
+  for (std::size_t i = 0; i < m; ++i) p_[i] = zvec_[i];
   Real rz = dot(r_, zvec_);
   const Real rhs_norm = std::sqrt(dot(rhs_, rhs_));
   const Real target = options_.tolerance * std::fmax(rhs_norm, 1.0);
@@ -115,7 +171,7 @@ core::Status HostKktSolver::solve(core::HostSpan<const Real> rhs_x,
         ++iteration;
         break;
       }
-      for (std::size_t i = 0; i < m; ++i) zvec_[i] = jacobi_[i] * r_[i];
+      precondition();
       const Real rz_next = dot(r_, zvec_);
       const Real beta = rz_next / rz;
       rz = rz_next;

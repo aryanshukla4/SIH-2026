@@ -58,14 +58,14 @@ void print_usage(const char* argv0) {
       "                        `concurrent` (Module 30) races dual simplex, cuPDLPx,\n"
       "                        primal simplex and HSD on separate cores and keeps\n"
       "                        the first verdict. SimplexOptions::method\n"
+      "                        (default concurrent; ipm is the GPU interior point,\n"
+      "                        the rest are host engines and run on every build)\n"
       "  --concurrent-threads=N  ConcurrentOptions::max_threads (0 = use the\n"
       "                        machine's own core count; the engine line-up is\n"
       "                        truncated to this)\n"
       "  --concurrent-gpu-ipm=0|1  race the GPU interior-point engine too\n"
       "                        (default 0 -- worth turning on for a datacentre\n"
       "                        card, where FP64 is not 1/64 rate)\n"
-      "                        (default ipm; simplex, pdlp and hsd are host-only,\n"
-      "                        and are the only engines a non-CUDA build has)\n"
       "  --scaling=geometric|ruiz  ScalingOptions::mode (ruiz is implied by\n"
       "                        --method=pdlp; pass this AFTER it to override)\n"
       "  --pdlp-tol=X          PdlpOptions::termination_tolerance (default 1e-8)\n"
@@ -103,6 +103,9 @@ void print_usage(const char* argv0) {
       "  --hsd-max-iter=N      HsdOptions::max_iterations    (default 200)\n"
       "  --hsd-cg-max-iter=N   HsdOptions::cg_max_iterations (default 5000)\n"
       "  --hsd-cg-tol=X        HsdOptions::cg_tolerance      (default 1e-10)\n"
+      "  --hsd-direct=0|1      HsdOptions::direct: factor the normal equations and\n"
+      "                        precondition CG with it (default 1)\n"
+      "  --hsd-delta-d=X       HsdOptions::delta_d, dual regularization (default 1e-10)\n"
       "  --simplex-max-iter=N  SimplexOptions::max_iterations   (0 = auto)\n"
       "  --pivot-tolerance=X   SimplexOptions::pivot_tolerance  (default 0.1)\n"
       "  --pivot-floor=X       SimplexOptions::pivot_floor      (default 1e-9)\n"
@@ -145,7 +148,7 @@ void print_usage(const char* argv0) {
       "  --minres-tol=X        IpmOptions::minres_tolerance           (default 1e-10)\n"
       "  --minres-max-iter=N   IpmOptions::minres_max_iterations      (default 5000 --\n"
       "                        measured necessary, see Options.hpp)\n"
-      "  --presolve=0|1        PresolveOptions::enabled               (default 1)\n"
+      "  --presolve=0|1|2      0 off, 1 Module 4 only, 2 LP presolve  (default 2)\n"
       "  --node-selection=best-first|interleaved\n"
       "                        MilpOptions::node_selection (default interleaved):\n"
       "                        CIP ch. 6 best estimate + plunging, best-bound\n"
@@ -424,6 +427,10 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.hsd.cg_max_iterations = static_cast<std::size_t>(std::stoul(val));
     } else if (key == "hsd-cg-tol") {
       options.hsd.cg_tolerance = std::stod(val);
+    } else if (key == "hsd-direct") {
+      options.hsd.direct = val != "0";
+    } else if (key == "hsd-delta-d") {
+      options.hsd.delta_d = std::stod(val);
     } else if (key == "simplex-max-iter") {
       options.simplex.max_iterations = static_cast<std::size_t>(std::stoul(val));
     } else if (key == "pivot-tolerance") {
@@ -487,7 +494,9 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
     } else if (key == "minres-max-iter") {
       options.ipm.minres_max_iterations = std::stoi(val);
     } else if (key == "presolve") {
-      options.presolve.enabled = std::stoi(val) != 0;
+      const int level = std::stoi(val);
+      options.presolve.enabled = level != 0;
+      options.presolve.lp_reductions = level >= 2;
     } else if (key == "mip-int-tol") {
       options.milp.integer_tolerance = std::stod(val);
     } else if (key == "mip-node-limit") {
@@ -694,6 +703,11 @@ int main(int argc, char** argv) {
   // the same run as the total.
   std::printf("canonicalize_seconds=%.6f\n", solution->canonicalize_seconds);
   std::printf("lp_presolve_seconds=%.6f\n", solution->presolve_seconds);
+  if (solution->presolved_rows + solution->presolved_cols > 0) {
+    std::printf("presolved_rows=%zu\n", solution->presolved_rows);
+    std::printf("presolved_cols=%zu\n", solution->presolved_cols);
+    std::printf("presolved_nnz=%zu\n", solution->presolved_nnz);
+  }
   std::printf("scale_seconds=%.6f\n", solution->scale_seconds);
   std::printf("engine_seconds=%.6f\n", solution->engine_seconds);
   if (is_milp) {

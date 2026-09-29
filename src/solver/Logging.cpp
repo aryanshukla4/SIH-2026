@@ -58,6 +58,21 @@ void log_presolve_summary(std::size_t rows_before, std::size_t cols_before,
                nnz_after, nnz_before - nnz_after);
 }
 
+void log_lp_presolve(const LpPresolveStats& s, const LogOptions& options, std::FILE* out) {
+  if (options.level == LogOptions::Level::Silent) return;
+  std::fprintf(out,
+               "lp presolve: rows %zu -> %zu  cols %zu -> %zu  nnz %zu -> %zu  (%zu rounds)\n",
+               s.rows_before, s.rows_after, s.cols_before, s.cols_after, s.nnz_before,
+               s.nnz_after, s.rounds);
+  std::fprintf(out,
+               "  rows: empty %zu redundant %zu singleton %zu forcing %zu | cols: fixed %zu "
+               "empty %zu free-singleton %zu implied-free %zu doubleton %zu dominated %zu "
+               "parallel %zu\n",
+               s.empty_rows, s.redundant_rows, s.singleton_rows, s.forcing_rows,
+               s.fixed_columns, s.empty_columns, s.free_singletons, s.implied_free_singletons,
+               s.doubletons, s.dominated_columns, s.parallel_columns);
+}
+
 void log_concurrent_race(const ConcurrentReport& report, const LogOptions& options,
                          std::FILE* out) {
   if (options.level == LogOptions::Level::Silent) return;
