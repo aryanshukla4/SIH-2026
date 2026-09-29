@@ -1,0 +1,11 @@
+model,winner,wall_seconds,status,objective,iterations,solve_time_seconds,engine_seconds,relative_gap,original_primal_residual,pdlpx_status,pdlpx_seconds,pdlpx_iterations,ipm_status,ipm_seconds,ipm_iterations
+16_n14.mps.gz,none,600.47,,,,,,,,TimeLimit,301.95,2840480,Stopped,,
+lo10.mps.gz,pdlpx,37.21,Optimal,1.4513431236e+12,215040,35.332879,34.727130,2.757605e-10,2.227669e-02,Optimal,37.12,215040,Stopped,,
+i_n13.mps.gz,pdlpx,303.14,Optimal,8.4771602650e+11,1342880,301.004560,299.417508,1.868467e-08,6.935035e-04,Optimal,303.04,1342880,Stopped,,
+square15.mps.gz,pdlpx,20.64,Optimal,6.1454920028e+10,60520,18.205138,16.771915,1.996109e-08,2.609385e-03,Optimal,20.55,60520,Stopped,,
+long15.mps.gz,pdlpx,25.63,Optimal,6.3335034701e+10,79040,23.067551,21.752377,1.988135e-08,1.202441e-04,Optimal,25.55,79040,Stopped,,
+wide15.mps.gz,pdlpx,25.64,Optimal,6.3335034701e+10,79040,23.192506,21.842376,1.988070e-08,1.202415e-04,Optimal,25.55,79040,Stopped,,
+netlarge2.mps.gz,pdlpx,111.44,Optimal,5.7448429400e+08,289200,108.290720,105.030401,1.980656e-08,2.471528e-07,Optimal,111.34,289200,Stopped,,
+netlarge3.mps.gz,pdlpx,307.15,Optimal,1.5242118400e+08,190280,297.144195,273.994871,1.960544e-08,3.393340e-07,Optimal,307.02,190280,Stopped,,
+netlarge1.mps.gz,none,600.19,,,,,,,,TimeLimit,345.2,122160,Stopped,,
+netlarge6.mps.gz,none,600.63,,,,,,,,TimeLimit,364.67,56120,Stopped,,
