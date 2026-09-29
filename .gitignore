@@ -1,3 +1,4 @@
+# Build trees and compiler output
 build/
 build-*/
 out/
@@ -16,66 +17,55 @@ compile_commands.json
 *.ptx
 *.cubin
 *.fatbin
+
+# Editors
 .vs/
 .vscode/
 .idea/
 CMakeUserPresets.json
 
-# Benchmark corpora are fetched by scripts/fetch_netlib.py, not committed --
-# the full set is several MB. afiro and adlittle are the exceptions: they are
-# small, and committing them keeps the corpus test meaningful with no network.
-tests/data/netlib/*.mps
-!tests/data/netlib/afiro.mps
-!tests/data/netlib/adlittle.mps
-tests/data/miplib/
-# MIPLIB instances for the MILP work (module.txt section 28), dropped in by
-# hand. Third-party and large; nothing in the test suite reads them. Both
-# spellings, because the folder on disk is MILP/ and a case-sensitive
-# checkout (WSL, CI) would otherwise not match one of them.
-tests/data/MILP/
-tests/data/milp/
-tests/data/qplib/
-# Same rule for tests/data/lp/: it holds a large third-party instance set used
-# only for ad-hoc reader checks. blend.lp is the exception, force-added because
-# lp_reader_test needs it and it is tiny.
-tests/data/lp/
+# Test data. Only what the test suite reads is committed: the 19 small Netlib
+# models in tests/data/netlib/ (3.3 MB) and tests/data/lp/blend.lp, so that
+# clone -> build -> ctest passes with no network. Everything else under
+# tests/data/ -- the full Netlib set (scripts/fetch_netlib.py), MIPLIB, QPLIB,
+# the Mittelmann LPs, archives -- is third-party, large, and dropped in by hand.
+tests/data/*
+!tests/data/netlib/
+!tests/data/lp/
+tests/data/lp/*
 !tests/data/lp/blend.lp
 bench/results/*.json
 bench/results/*.csv
 
 # Oracle cross-check output (regenerated).
 tests/oracle/*.json
+
+# Python
 __pycache__/
 *.pyc
 .venv/
-# Team handover / explainer pages. Generated for onboarding and shared as a
-# link; the repo's own docs/ directory is the tracked source of truth.
+
+# Team handover / explainer pages, and local run notebooks (A100 benchmark).
 *.handover.html
 handover/
 docs/handover/
+notebooks/
 
-# Vendored third-party solvers, kept locally as CORRECTNESS ORACLES and
-# reference corpora only -- never linked, never built, never committed, and
-# their solver sources deliberately NOT read (PS 26119: "shall not be built
-# upon any existing open source solver library"). See docs/HIGHS-COMPARISON.md.
+# Third-party solvers kept locally as CORRECTNESS ORACLES only -- never linked,
+# never built, never committed, and their sources deliberately NOT read
+# (PS 26119: "shall not be built upon any existing open source solver
+# library"). See docs/HIGHS-COMPARISON.md.
 #   HiGHS/    -- oracle via scripts/oracle_check.py (SciPy wraps it)
 #   or-tools/ -- GLOP/PDLP/CP-SAT, cross-check via scripts/compare_solvers.py
 or-tools/
 HIGHS/
 
-# Large benchmark instances, dropped in by hand for the GPU A/B. Deliberately
-# untracked: `bab2.mps` alone is 106 MB, and a repository is not a place to put
-# MIPLIB. `scripts/gpu_ab.sh` and `--method=pdlp --gpu-spmv=1` take a path, so
-# they work fine against files that live only on the machine running them.
-tests/data/bab2.mps
-tests/data/*.mps.gz
+# Ad-hoc benchmark CSVs written to the repository root. The runs we publish
+# live in results/.
 /*.csv
-tests/data/mittelman/
-tests/
-tests\data\mittleman lp.rar
 
-
-
-
-# Local run notebooks (A100 benchmark), kept out of the repo
-notebooks/
+# Run by-products: CTest's scratch output, HiGHS's log when it is run as an
+# oracle from the repository root, and bench_suite.py's lock files.
+Testing/
+Highs.log
+*.lock
