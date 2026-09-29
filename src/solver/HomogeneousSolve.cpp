@@ -205,6 +205,11 @@ core::Expected<HsdResult> solve_hsd(const model::CanonicalProblem& problem,
   // Why the loop ended. Continue after the loop means it ran out of
   // iterations without any [AA] section 1.4.5 test firing.
   HomogeneousTermination stopped_by = HomogeneousTermination::Continue;
+
+  Real b_norm = 0.0;
+  for (std::size_t i = 0; i < problem.num_rows(); ++i) b_norm = std::fmax(b_norm, std::fabs(problem.b[i]));
+  Real c_norm = 0.0;
+  for (std::size_t j = 0; j < problem.num_cols(); ++j) c_norm = std::fmax(c_norm, std::fabs(problem.c[j]));
   for (std::size_t iteration = 0; iteration < max_iterations; ++iteration) {
     // Another engine already won the race (core/Cancel.hpp). Every check here
     // is one interior-point iteration apart, each costing a KKT solve, so
@@ -229,8 +234,26 @@ core::Expected<HsdResult> solve_hsd(const model::CanonicalProblem& problem,
     status = homogeneous_progress(problem, state, residuals, reference, result.progress);
     if (!status.ok()) break;
 
-    const HomogeneousTermination termination = check_homogeneous_termination(
+    HomogeneousTermination termination = check_homogeneous_termination(
         state, result.progress, reference, last_alpha, params);
+    // [AA]'s rho_P/rho_D are reductions RELATIVE TO THE START. When the start
+    // is far worse than the data (Netlib grow7/15/22: b = 0, ||r_p^0|| = 5.9e7)
+    // "1e-8 of the start" still leaves an absolute residual near 0.6 -- an
+    // Optimal that dual simplex would not recognise. So an Optimal stop must
+    // also meet the project's own measure, relative to the data: the residuals
+    // of the recovered point x/tau against 1 + ||b|| and 1 + ||c||.
+    // The bar is 10x the project tolerance: measured, the residual floors near
+    // 3e-8 of (1 + ||b||) on grow15/grow22 however small the regularization
+    // (1.5e-8, 1e-10, 1e-12 all give 2.6e-8 to 5.9e-8; dual simplex itself
+    // reaches 3.7e-8 on grow7), while the infeasible CPLEX2 sits at 0.56.
+    constexpr Real kAbsoluteFactor = 10.0;
+    if (termination == HomogeneousTermination::Optimal && state.tau > 0.0) {
+      const bool primal_ok = residuals.rp_inf / state.tau <=
+                             kAbsoluteFactor * options.tolerances.primal_feasibility * (1.0 + b_norm);
+      const bool dual_ok = residuals.rd_inf / state.tau <=
+                           kAbsoluteFactor * options.tolerances.dual_feasibility * (1.0 + c_norm);
+      if (!primal_ok || !dual_ok) termination = HomogeneousTermination::Continue;
+    }
     stopped_by = termination;
     if (termination != HomogeneousTermination::Continue) {
       // `Optimal` here is the EMBEDDING's verdict, not the model's. Which one

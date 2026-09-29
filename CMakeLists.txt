@@ -31,15 +31,11 @@ if(SOVSOLVE_ENABLE_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
 
-  # cuDSS is deliberately NOT looked for. It is a complete sparse direct
-  # solver, which PS 26119 rules out building on ("shall not be built upon
-  # any existing open source solver library"), and no code here ever called
-  # it. An earlier version of this file searched for it anyway and, when the
-  # build machine happened to have it installed, linked it automatically and
-  # announced a "sparse-direct GPU path" that did not exist -- the kind of
-  # thing a reviewer would rightly question. The GPU interior point is
-  # matrix-free (CG / MINRES over cuSPARSE products); see
-  # include/sovsolve/solver/gpu/LinearSolver.hpp.
+  # cuDSS is OPTIONAL and looked for in src/solver/CMakeLists.txt. It is a
+  # sparse direct LINEAR solver -- linear algebra, like cuSPARSE, not an LP
+  # solver -- and it is used for one thing: an exact Cholesky preconditioner
+  # for the GPU interior point's normal-equations CG (solver/gpu/
+  # Preconditioner.hpp). Without it the CG runs on IC(0) or Jacobi as before.
 endif()
 
 # --------------------------------------------------------------------------

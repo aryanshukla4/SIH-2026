@@ -83,6 +83,27 @@ using core::Status;
 /// scratch buffer, not `r`/`z` themselves, so aliasing `r == z` is safe).
 [[nodiscard]] Status ic0_apply(const Real* r_device, Real* z_device, std::size_t m);
 
+/// True when this build links cuDSS (SOVSOLVE_HAVE_CUDSS).
+[[nodiscard]] bool cudss_available() noexcept;
+
+/// EXACT sparse Cholesky of the same matrix `ic0_build` approximates --
+/// `A_S T A_S^T + D` with dense columns kept to the diagonal -- through
+/// NVIDIA cuDSS, a sparse direct linear solver (a linear-algebra library, not
+/// an LP solver). Used as `solve_spd_cg`'s preconditioner, so CG converges in
+/// a few iterations and its dense-column and refinement duties stay with CG.
+/// The reordering and symbolic analysis are cached while the pattern is
+/// unchanged, which it is for every Newton solve of one interior-point run.
+///
+/// Returns an error when cuDSS is not linked or the factorization reports a
+/// non-positive pivot; the caller then falls back to IC(0), then Jacobi.
+[[nodiscard]] Status cudss_build(const core::SparseMatrixPair<>& a, const RealVector& theta,
+                                 const RealVector& diag_add,
+                                 const std::vector<bool>& is_dense_column);
+
+/// `z = M^-1 r` with the factor the last successful `cudss_build` produced.
+/// DEVICE pointers of length m; `r == z` is allowed.
+[[nodiscard]] Status cudss_apply(const Real* r_device, Real* z_device, std::size_t m);
+
 }  // namespace sovsolve::solver::gpu
 
 #endif  // SOVSOLVE_SOLVER_GPU_PRECONDITIONER_HPP

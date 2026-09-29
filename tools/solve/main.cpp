@@ -14,6 +14,8 @@
 // this file does not invent new parameters, it just exposes the existing
 // ones so tuning doesn't require an edit-rebuild cycle per attempt.
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -105,7 +107,9 @@ void print_usage(const char* argv0) {
       "  --hsd-cg-tol=X        HsdOptions::cg_tolerance      (default 1e-10)\n"
       "  --hsd-direct=0|1      HsdOptions::direct: factor the normal equations and\n"
       "                        precondition CG with it (default 1)\n"
-      "  --hsd-delta-d=X       HsdOptions::delta_d, dual regularization (default 1e-10)\n"
+      "  --hsd-delta-d=X       HsdOptions::delta_d, dual regularization (default 1.49e-8)\n"
+      "  --ipm-direct=0|1      IpmOptions::direct: cuDSS Cholesky as the GPU CG\n"
+      "                        preconditioner, when linked (default 1)\n"
       "  --simplex-max-iter=N  SimplexOptions::max_iterations   (0 = auto)\n"
       "  --pivot-tolerance=X   SimplexOptions::pivot_tolerance  (default 0.1)\n"
       "  --pivot-floor=X       SimplexOptions::pivot_floor      (default 1e-9)\n"
@@ -427,6 +431,8 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.hsd.cg_max_iterations = static_cast<std::size_t>(std::stoul(val));
     } else if (key == "hsd-cg-tol") {
       options.hsd.cg_tolerance = std::stod(val);
+    } else if (key == "ipm-direct") {
+      options.ipm.direct = val != "0";
     } else if (key == "hsd-direct") {
       options.hsd.direct = val != "0";
     } else if (key == "hsd-delta-d") {
@@ -670,6 +676,24 @@ int main(int argc, char** argv) {
   std::printf("complementarity=%.6e\n", solution->quality.complementarity);
   std::printf("max_bound_violation=%.6e\n", solution->quality.max_bound_violation);
   std::printf("from_best_iterate=%s\n", solution->from_best_iterate ? "true" : "false");
+  // Measured HERE, on the model as read, from the reported x alone -- not the
+  // engine's own figures, which describe its presolved, scaled working model.
+  // Worst row violation relative to 1 + |row bound|.
+  if (solution->x.size() == problem->num_cols()) {
+    double worst = 0.0;
+    const auto& csr = problem->A.csr;
+    for (std::size_t i = 0; i < problem->num_rows(); ++i) {
+      double act = 0.0;
+      for (auto k = csr.slice_begin(i); k < csr.slice_end(i); ++k) {
+        act += csr.values()[k] * solution->x[static_cast<std::size_t>(csr.indices()[k])];
+      }
+      const double lo = problem->row_lower[i];
+      const double hi = problem->row_upper[i];
+      if (sovsolve::core::is_finite_bound(lo)) worst = std::max(worst, (lo - act) / (1.0 + std::fabs(lo)));
+      if (sovsolve::core::is_finite_bound(hi)) worst = std::max(worst, (act - hi) / (1.0 + std::fabs(hi)));
+    }
+    std::printf("original_primal_residual=%.6e\n", worst);
+  }
 #ifdef SOVSOLVE_ENABLE_CUDA
   if (gpu_backend) {
     std::printf("gpu_resident=1\n");
