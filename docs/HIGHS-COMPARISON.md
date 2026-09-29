@@ -70,7 +70,7 @@ derivation is written down where it can be checked:
 | Dual ratio test, sigma-folded pivot row, bound flipping | The bounded-variable dual ratio test | the sign derivation in `DualSimplex.hpp`'s header, worked out symbol by symbol from `y = B^-T c_B` |
 | Dual phase 1 by artificial bounds | Bound the free directions, solve, escalate | `DualSimplex.cpp::restore_dual_feasibility` |
 | Primal phase 1 by sum of infeasibilities | Piecewise-linear composite objective | `PrimalSimplex.hpp` header |
-| Bland's rule as an anti-cycling escape | Bland's smallest-index rule | `PrimalSimplex.cpp::choose_entering` |
+| EXPAND anti-degeneracy ratio test | Gill, Murray, Saunders & Wright, Math. Prog. 45 (1989), sections 4 and 7 | `PrimalSimplex.cpp::iterate` |
 
 These are the *definitions* — the mathematical statements you would find in
 any linear-programming text. The code that implements them here was written

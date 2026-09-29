@@ -1074,9 +1074,10 @@ struct ConcurrentOptions {
 
   /// Which simplex finishes the crossover after the pushes (Crossover.hpp):
   /// `DualSimplex` (with its primal cleanup) or `PrimalSimplex`. OURS: the
-  /// dual. After the primal push, Netlib truss needs 688 dual iterations and
-  /// more than 491,000 primal ones (the primal stalls in Bland's rule there,
-  /// and cannot solve truss cold either); pilot87 10.3 s vs 17.7 s.
+  /// dual, measured when the primal still fell back on Bland's rule: after the
+  /// primal push, Netlib truss needed 688 dual iterations and more than
+  /// 491,000 primal ones; pilot87 10.3 s vs 17.7 s. With EXPAND the primal
+  /// finishes truss in 33 iterations (dual 257); the full A/B is not re-run.
   Method crossover_method = Method::DualSimplex;
 };
 

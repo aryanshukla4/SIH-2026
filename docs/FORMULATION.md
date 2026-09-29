@@ -640,11 +640,20 @@ Phase 1 minimizes the sum of infeasibilities with `c1_j = -1` below lower,
 `+1` above upper, `0` otherwise, and `d1 = -Ahat' y1`. Phase 2 begins with no
 artificial variables to remove.
 
-Bland's smallest-index rule is an **escape from cycling, not a pricing
-rule.** It engages after a run of degenerate pivots and must be released the
-moment any pivot moves a positive distance. Latching it permanently left
-`greenbea` 1.7 away from feasible after 600,000 pivots; releasing it on the
-first real step solved the same instance in 112,421.
+Degeneracy is handled by the **EXPAND** ratio test (Gill, Murray, Saunders
+& Wright, Math. Prog. 45, 1989), not by a pricing rule. A working feasibility
+tolerance `delta` grows by `tau` every iteration; every variable is within the
+previous tolerance, so a step of at least `tau / |pivot|` is always possible
+and the objective strictly falls -- no basis can repeat. The two passes are
+Harris's: pass 1 finds the largest step that keeps every basic variable
+within its bounds widened by `delta`; pass 2 picks, among the variables whose
+step to the exact bound is within that, the largest pivot. A leaving variable
+may become nonbasic up to `delta` past its bound; a reset every K = 10,000
+iterations, and on each tentative verdict, puts every nonbasic back.
+
+This replaced Bland's smallest-index rule after 100 zero-length steps. Bland's
+cannot cycle but picks such poor pivots that Netlib `truss` had not finished
+after 491,000 iterations; EXPAND solves it in 42,874 (docs/TUNABLES.md).
 
 ### 12.8 Composite dual → primal
 

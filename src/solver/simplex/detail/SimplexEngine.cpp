@@ -89,7 +89,7 @@ Status SimplexEngine::refactorize() {
     }
   }
 
-  reset_nonbasic_values();
+  if (repairs > 0 || !preserve_nonbasic_values_) reset_nonbasic_values();
   compute_dual();
   on_refactorized(repairs > 0);
   compute_primal();
