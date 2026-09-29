@@ -339,6 +339,75 @@ __global__ void restart_final_kernel(unsigned blocks, const pdlp::HalpernState* 
   }
 }
 
+/// The termination check's five sums over T(z) and its two images, in place
+/// (IterationBackend::evaluate_resident). Term by term the host `evaluate` in
+/// Pdlp.cpp: `inv_row`/`inv_col` are the preconditioner's inverse factors, or
+/// null for the problem as given. Two stages with a fixed-order final sum, as
+/// every other reduction here, so the result is bit-for-bit repeatable.
+constexpr int kEvalSums = 5;
+
+__global__ void eval_partial_kernel(std::size_t n, std::size_t m, std::size_t num_equality,
+                                    const Real* x_trial, const Real* y_trial,
+                                    const Real* kx_trial, const Real* kty_trial, const Real* b,
+                                    const Real* c, const Real* lower, const Real* upper,
+                                    const Real* inv_row, const Real* inv_col, Real* partials) {
+  __shared__ Real s[kEvalSums][kBlock];
+  Real acc[kEvalSums] = {0.0, 0.0, 0.0, 0.0, 0.0};
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  const std::size_t len = n > m ? n : m;
+  for (std::size_t k = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       k < len; k += stride) {
+    if (k < n) {
+      const Real raw = c[k] - kty_trial[k];
+      const Real lambda = pdlp::halpern_absorbed(raw, lower[k], upper[k]);
+      const Real leftover = (raw - lambda) * (inv_col != nullptr ? inv_col[k] : 1.0);
+      acc[4] += leftover * leftover;
+      if (lambda > 0.0 && lower[k] > -core::INF) {
+        acc[2] += lower[k] * lambda;
+      } else if (lambda < 0.0 && upper[k] < core::INF) {
+        acc[2] += upper[k] * lambda;
+      }
+      acc[0] += c[k] * x_trial[k];
+    }
+    if (k < m) {
+      const Real v = pdlp::halpern_primal_violation(kx_trial[k], b[k], k < num_equality) *
+                     (inv_row != nullptr ? inv_row[k] : 1.0);
+      acc[3] += v * v;
+      acc[1] += b[k] * y_trial[k];
+    }
+  }
+  for (int q = 0; q < kEvalSums; ++q) s[q][threadIdx.x] = acc[q];
+  __syncthreads();
+  for (unsigned half = kBlock / 2; half > 0; half >>= 1) {
+    if (threadIdx.x < half) {
+      for (int q = 0; q < kEvalSums; ++q) s[q][threadIdx.x] += s[q][threadIdx.x + half];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    for (int q = 0; q < kEvalSums; ++q) partials[kEvalSums * blockIdx.x + q] = s[q][0];
+  }
+}
+
+__global__ void eval_final_kernel(unsigned blocks, const Real* partials, Real* out) {
+  __shared__ Real s[kEvalSums][kBlock];
+  Real acc[kEvalSums] = {0.0, 0.0, 0.0, 0.0, 0.0};
+  for (unsigned k = threadIdx.x; k < blocks; k += kBlock) {
+    for (int q = 0; q < kEvalSums; ++q) acc[q] += partials[kEvalSums * k + q];
+  }
+  for (int q = 0; q < kEvalSums; ++q) s[q][threadIdx.x] = acc[q];
+  __syncthreads();
+  for (unsigned half = kBlock / 2; half > 0; half >>= 1) {
+    if (threadIdx.x < half) {
+      for (int q = 0; q < kEvalSums; ++q) s[q][threadIdx.x] += s[q][threadIdx.x + half];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    for (int q = 0; q < kEvalSums; ++q) out[q] = s[q][0];
+  }
+}
+
 /// ONE thread: the controller's half of a restart, when pending -- HPR-LP's
 /// rule or the PID, per `params.weight_rule`. `sums` is `restart_final_kernel`'s
 /// output for this iteration.
@@ -525,6 +594,16 @@ struct DevicePdlpBackend::Impl {
   Real* metrics = nullptr;
   Real* host_metrics = nullptr;  ///< pinned, so the 24-byte copy is a DMA
 
+  // evaluate_resident: its own partials and outputs, the inverse scale
+  // factors uploaded once (keyed by the host spans they came from).
+  Real* eval_partials = nullptr;
+  Real* eval_out = nullptr;
+  Real* eval_host = nullptr;  ///< pinned, 5 doubles
+  Real* inv_row = nullptr;
+  Real* inv_col = nullptr;
+  const Real* inv_row_src = nullptr;
+  const Real* inv_col_src = nullptr;
+
   std::size_t hot_products = 0;
   std::size_t bytes = 0;
   Status sticky = Status::Ok();
@@ -594,10 +673,13 @@ struct DevicePdlpBackend::Impl {
                     static_cast<void*>(cold_in_n), static_cast<void*>(cold_out_m),
                     static_cast<void*>(cold_in_m), static_cast<void*>(cold_out_n),
                     buffer_a, buffer_at, static_cast<void*>(partials),
-                    static_cast<void*>(metrics)}) {
+                    static_cast<void*>(metrics), static_cast<void*>(eval_partials),
+                    static_cast<void*>(eval_out), static_cast<void*>(inv_row),
+                    static_cast<void*>(inv_col)}) {
       cudaFree(p);
     }
     if (host_metrics) cudaFreeHost(host_metrics);
+    if (eval_host) cudaFreeHost(eval_host);
   }
 };
 
@@ -1372,6 +1454,62 @@ void DevicePdlpBackend::run_halpern(std::size_t count, std::uint64_t first_itera
     }
     ++d.graph_launches;
   }
+}
+
+bool DevicePdlpBackend::evaluate_resident(core::HostSpan<const Real> row_scale,
+                                          core::HostSpan<const Real> col_scale,
+                                          ResidentSums& out) {
+  Impl& d = *impl_;
+  if (!d.sticky.ok()) return false;
+
+  const auto ensure = [&](Real** p, std::size_t count) {
+    if (*p == nullptr) d.record(cudaMalloc(reinterpret_cast<void**>(p), count * sizeof(Real)),
+                                "cudaMalloc(evaluate_resident)");
+  };
+  ensure(&d.eval_partials, kEvalSums * static_cast<std::size_t>(d.reduction_blocks));
+  ensure(&d.eval_out, kEvalSums);
+  if (d.eval_host == nullptr &&
+      cudaMallocHost(reinterpret_cast<void**>(&d.eval_host), kEvalSums * sizeof(Real)) !=
+          cudaSuccess) {
+    return false;
+  }
+  // `1/scale`, uploaded the first time and again only if the caller's factors
+  // change (they are fixed for a run).
+  const auto upload_inverse = [&](core::HostSpan<const Real> scale, std::size_t len, Real** dev,
+                                  const Real** src) {
+    if (scale.empty()) return;
+    if (*dev != nullptr && *src == scale.data()) return;
+    ensure(dev, len);
+    std::vector<Real> inv(len);
+    for (std::size_t k = 0; k < len; ++k) inv[k] = 1.0 / scale[k];
+    d.record(cudaMemcpy(*dev, inv.data(), len * sizeof(Real), cudaMemcpyHostToDevice),
+             "cudaMemcpy(inverse scale)");
+    *src = scale.data();
+  };
+  upload_inverse(row_scale, d.m, &d.inv_row, &d.inv_row_src);
+  upload_inverse(col_scale, d.n, &d.inv_col, &d.inv_col_src);
+  if (!d.sticky.ok()) return false;
+
+  // On the resident stream, after the chunk just enqueued.
+  eval_partial_kernel<<<d.reduction_blocks, kBlock, 0, d.stream>>>(
+      d.n, d.m, d.num_equality, d.x_trial, d.y_trial, d.kx_trial, d.kty_trial, d.b, d.c,
+      d.lower, d.upper, row_scale.empty() ? nullptr : d.inv_row,
+      col_scale.empty() ? nullptr : d.inv_col, d.eval_partials);
+  d.check_launch("eval_partial_kernel");
+  eval_final_kernel<<<1, kBlock, 0, d.stream>>>(d.reduction_blocks, d.eval_partials, d.eval_out);
+  d.check_launch("eval_final_kernel");
+  d.record(cudaMemcpyAsync(d.eval_host, d.eval_out, kEvalSums * sizeof(Real),
+                           cudaMemcpyDeviceToHost, d.stream),
+           "cudaMemcpyAsync(eval sums)");
+  d.record(cudaStreamSynchronize(d.stream), "cudaStreamSynchronize(eval)");
+  if (!d.sticky.ok()) return false;
+
+  out.primal_objective = d.eval_host[0];
+  out.b_dot_y = d.eval_host[1];
+  out.bound_term = d.eval_host[2];
+  out.primal_sq = d.eval_host[3];
+  out.dual_sq = d.eval_host[4];
+  return true;
 }
 
 void DevicePdlpBackend::set_use_graphs(bool enabled) { impl_->use_graphs = enabled; }

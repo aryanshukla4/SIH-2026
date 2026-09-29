@@ -445,7 +445,7 @@ HostLdlContext& host_ldl_context() {
 
 /// SparseLdl pivots at or below this fraction of their starting diagonal are
 /// treated as dependent rows (Wright 1999, see SparseLdl.hpp).
-constexpr Real kHostPivotTolerance = 1e-14;
+constexpr Real kHostPivotTolerance = 1e-14;  // OURS, see SparseLdl.hpp's pivot rule
 
 }  // namespace
 
