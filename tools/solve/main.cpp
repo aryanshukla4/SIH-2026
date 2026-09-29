@@ -20,9 +20,11 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "sovsolve/io/Load.hpp"
 #include "sovsolve/model/Options.hpp"
+#include "sovsolve/solver/Certificate.hpp"
 #include "sovsolve/solver/Iis.hpp"
 #include "sovsolve/solver/LpSolve.hpp"
 #include "sovsolve/solver/MilpSolve.hpp"
@@ -706,6 +708,17 @@ int main(int argc, char** argv) {
       if (sovsolve::core::is_finite_bound(hi)) worst = std::max(worst, (act - hi) / (1.0 + std::fabs(hi)));
     }
     std::printf("original_primal_residual=%.6e\n", worst);
+  }
+  // The certificate on the model as read (Certificate.hpp): the weak-duality
+  // bound from the reported y, and per-column dual residual -- the same
+  // measure the GPU interior point must pass before it may report Optimal.
+  {
+    const auto cert = sovsolve::solver::certify(*problem, *solution);
+    if (cert.valid && !problem->has_quadratic()) {
+      std::printf("original_dual_bound=%.10e\n", cert.dual_bound);
+      std::printf("original_dual_residual=%.6e\n", cert.dual);
+      std::printf("original_gap=%.6e\n", cert.gap);
+    }
   }
 #ifdef SOVSOLVE_ENABLE_CUDA
   if (gpu_backend) {

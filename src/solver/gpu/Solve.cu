@@ -5,6 +5,7 @@
 #include <cstddef>
 
 #include "sovsolve/model/Canonical.hpp"
+#include "sovsolve/solver/Certificate.hpp"
 #include "sovsolve/solver/ConvergenceChecker.hpp"
 #include "sovsolve/solver/Initializer.hpp"
 #include "sovsolve/solver/Logging.hpp"
@@ -22,6 +23,7 @@
 namespace sovsolve::solver::gpu {
 
 namespace {
+
 
 /// b'y + l'z - u'v - 0.5*x'Qx (finite-bound terms only). NOT just b'y: with
 /// stationarity (rd=0, Qx-A'y-z+v+c=0) and primal feasibility (rp=0)
@@ -240,7 +242,19 @@ Expected<Solution> solve_problem(const Problem& problem, const Options& options,
   best.solve_time_seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
 
-  return finish(best);
+  // Never report an uncertified optimum. The interior point's own test
+  // measures its residuals against the data's NORMS and passed Netlib greenbea
+  // 1.3e-3 away from the optimum; the certificate (Certificate.hpp) is
+  // measured per column on the ORIGINAL model and catches it.
+  auto out = finish(best);
+  // LP only: the certificate is LP weak duality and has no Qx term, so on a
+  // QP it would reject correct answers (Netlib-style 2821.mps, a unit test).
+  if (out.has_value() && out->status == SolverStatus::Optimal && !problem.has_quadratic() &&
+      !(certify(problem, *out).worst() <= kCertificateTolerance)) {
+    out->status = SolverStatus::NotConverged;
+    out->from_best_iterate = true;
+  }
+  return out;
 }
 
 }  // namespace sovsolve::solver::gpu
