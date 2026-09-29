@@ -208,6 +208,48 @@ void test_report_covers_every_entrant() {
   CHECK(report.entries[report.winner].won);
 }
 
+/// Claim 6: with crossover on, a win by an engine that stops at a tolerance
+/// is finished at a vertex -- the objective then matches the simplex's to
+/// rounding, not merely to the engine's 1e-8. A line-up of ONE tolerance
+/// engine makes that engine win every time, so this does not depend on
+/// thread timing. With crossover off nothing runs after the race.
+void test_crossover_finishes_a_tolerance_win_at_a_vertex() {
+  for (const std::string& text : models()) {
+    model::Problem problem;
+    if (!parse(text, problem)) continue;
+    auto canon = model::canonicalize(problem);
+    CHECK(canon.has_value());
+    if (!canon.has_value()) continue;
+
+    model::Options exact_options = options_for(Method::Concurrent);
+    auto exact = solver::solve_concurrent(canon->problem, exact_options,
+                                          {Method::DualSimplex});
+    CHECK(exact.has_value());
+    if (!exact.has_value() || exact->status != SolverStatus::Optimal) continue;
+
+    for (const Method tolerance_engine : {Method::PdlpX, Method::Hsd}) {
+      model::Options on = options_for(Method::Concurrent);
+      on.concurrent.crossover = true;
+      solver::ConcurrentReport report;
+      auto crossed = solver::solve_concurrent(canon->problem, on, {tolerance_engine}, &report);
+      CHECK(crossed.has_value());
+      if (!crossed.has_value()) continue;
+      CHECK(crossed->status == SolverStatus::Optimal);
+      CHECK(report.crossover_ran);
+      CHECK(report.crossover_used);
+      CHECK_NEAR(crossed->objective, exact->objective,
+                 1e-12 * (1.0 + std::fabs(exact->objective)));
+
+      model::Options off = options_for(Method::Concurrent);
+      off.concurrent.crossover = false;
+      solver::ConcurrentReport off_report;
+      auto plain = solver::solve_concurrent(canon->problem, off, {tolerance_engine}, &off_report);
+      CHECK(plain.has_value());
+      CHECK(!off_report.crossover_ran);
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -216,5 +258,6 @@ int main() {
   test_thread_budget_controls_the_line_up();
   test_infeasible_model_still_gets_a_verdict();
   test_report_covers_every_entrant();
+  test_crossover_finishes_a_tolerance_win_at_a_vertex();
   return ::sovsolve::test::report("concurrent_test");
 }

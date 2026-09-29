@@ -25,6 +25,7 @@ Paper keys:
 | PDLP | Applegate et al., "Practical large-scale LP using PDHG", NeurIPS 2021 |
 | CPX  | cuPDLPx, arXiv 2507.14051 |
 | HPR  | HPR-LP, arXiv 2408.12179 |
+| AY96 | Andersen & Ye, "Combining interior-point and pivoting algorithms for linear programming", Management Science 42(12) (1996) |
 
 Values in `Options.hpp` are runtime options; the rest are compile-time constants in the
 file named.
@@ -93,3 +94,16 @@ file named.
 | `check_interval` | 40 | PDLP section 3 (cuPDLP.jl uses 64, HPR 150) | `--pdlp-check-interval` |
 | `resident_check` | on | CPX section 4 evaluates termination on the GPU | `--pdlp-resident-check` |
 | `certificate_check_every` | 10 | OURS: delays a certificate by at most 400 iterations | `--pdlp-certificate-every` |
+
+## Concurrent race crossover (`Options.hpp` `ConcurrentOptions`, `src/solver/ConcurrentSolve.cpp`)
+
+Measured 2026-09-30, i5-12450H, best of 3, on the 31 Netlib LPs where cuPDLPx or HSD
+wins the race: SGM10 0.60 s off, 1.21 s with the primal finish, 1.40 s with the dual.
+
+| name | value | source | flag |
+|---|---|---|---|
+| `crossover` | off | OURS: fixes the objective's last digits (-2.7999999914 -> -2.8 on the milp_test LP) but costs ~2x where it runs | `--concurrent-crossover` |
+| crash-basis ranking | x/(x+z) indicator | AY96 (Andersen & Ye, Management Science 42(12), 1996); plain distance from bounds measured worse (SGM10 0.41 s vs 0.22 s off, all 123 models) | - |
+| `crossover_method` | primal | OURS: 1.21 s vs 1.40 s SGM10 above; the dual reached a vertex more often (21 vs 18 of 31) | `--concurrent-crossover-method` |
+| `crossover_time_factor` | 1.0 | OURS: caps the worst case at twice the race | `--concurrent-crossover-factor` |
+| `crossover_min_seconds` | 1.0 | OURS: keeps microsecond races from starving the crossover | `--concurrent-crossover-min` |
