@@ -8,6 +8,7 @@
 #include "sovsolve/solver/ConvergenceChecker.hpp"
 #include "sovsolve/solver/Initializer.hpp"
 #include "sovsolve/solver/Logging.hpp"
+#include "sovsolve/solver/LpPresolve.hpp"
 #include "sovsolve/solver/Presolver.hpp"
 #include "sovsolve/solver/Regularization.hpp"
 #include "sovsolve/solver/Residuals.hpp"
@@ -82,15 +83,54 @@ Expected<Solution> solve_problem(const Problem& problem, const Options& options,
   const std::size_t cols_before_presolve = canon->problem.num_cols();
   const std::size_t nnz_before_presolve = canon->problem.A.nnz();
 
-  core::Status st = presolve(canon->problem, options, canon->transforms);
+  // The LP presolve (LpPresolve.hpp) whenever it applies: an LP, and no warm
+  // start -- forward_map_to_canonical_hint only understands Module 4's
+  // records, so a warm-started node keeps Module 4. Scaling then goes on its
+  // own stack, undone before the LP postsolve, exactly as in LpSolve.cpp.
+  LpPostsolve postsolve;
+  const bool lp_path = options.presolve.lp_reductions && warm_start_x == nullptr &&
+                       !problem.has_quadratic();
+  core::Status st = lp_path ? lp_presolve(canon->problem, options, postsolve)
+                            : presolve(canon->problem, options, canon->transforms);
   if (!st.ok()) return st.error();
 
   log_presolve_summary(rows_before_presolve, cols_before_presolve, nnz_before_presolve,
                        canon->problem.num_rows(), canon->problem.num_cols(),
                        canon->problem.A.nnz(), options.log);
 
-  st = scale(canon->problem, options, canon->transforms);
+  model::TransformStack scaling;
+  model::TransformStack& scale_stack = postsolve.active() ? scaling : canon->transforms;
+  st = scale(canon->problem, options, scale_stack);
   if (!st.ok()) return st.error();
+
+  const auto finish = [&](Solution& reduced) -> Expected<Solution> {
+    const std::size_t rows = canon->problem.num_rows();
+    const std::size_t cols = canon->problem.num_cols();
+    const std::size_t nnz = canon->problem.A.nnz();
+    auto out = [&]() {
+      if (!postsolve.active()) {
+        return reconstruct_solution(problem, canon->problem, canon->transforms, reduced);
+      }
+      unscale_canonical_solution(scaling, reduced);
+      const Solution expanded = postsolve.expand(reduced);
+      return reconstruct_solution(problem, postsolve.original(), canon->transforms, expanded);
+    }();
+    if (out.has_value()) {
+      out->presolved_rows = rows;
+      out->presolved_cols = cols;
+      out->presolved_nnz = nnz;
+    }
+    return out;
+  };
+
+  if (canon->problem.num_cols() == 0) {
+    // Presolve solved the whole model; every value comes from postsolve.
+    Solution empty;
+    empty.status = SolverStatus::Optimal;
+    empty.y = core::RealVector(canon->problem.num_rows(), 0.0);
+    empty.s = core::RealVector(canon->problem.num_inequality_rows(), 0.0);
+    return finish(empty);
+  }
 
   // Module 22 warm start: forward-map the parent's ORIGINAL-space point
   // into THIS call's own freshly-built canonical space (transforms now
@@ -200,7 +240,7 @@ Expected<Solution> solve_problem(const Problem& problem, const Options& options,
   best.solve_time_seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
 
-  return reconstruct_solution(problem, canon->problem, canon->transforms, best);
+  return finish(best);
 }
 
 }  // namespace sovsolve::solver::gpu

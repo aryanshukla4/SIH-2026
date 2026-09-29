@@ -115,6 +115,16 @@ struct HomogeneousBorder {
 
   /// The bordered system's trailing entry, `-(w + kappa/tau)`.
   Real trailing = 0.0;
+
+  /// `kappa/tau` alone. `trailing` folds it into `w`, which can be ~1e15 on a
+  /// model with large bounds; recovering it by subtraction would cancel.
+  Real kappa_over_tau = 0.0;
+
+  /// Per column, `Theta_l Theta_u (u - l)^2 / (Theta_l + Theta_u)`, length n:
+  /// what is left of `w_j - Theta_j (Theta_l l + Theta_u u)^2` once the two
+  /// huge terms have cancelled algebraically instead of numerically. Zero
+  /// unless both bounds are finite. See `refresh_border_solve`.
+  core::RealVector w_gap;
 };
 
 /// Builds `HomogeneousBorder` at `state`. Fails if `tau` is not positive or a
@@ -181,6 +191,16 @@ struct HomogeneousNewtonWorkspace {
   core::RealVector u_x, u_y;  ///< the per-right-hand-side solve
   core::RealVector p_x, p_y;  ///< the once-per-iteration solve, `K (p;q) = h`
   bool p_valid = false;       ///< set by `refresh_border_solve`
+
+  /// The Schur complement `g'p - b'q - trailing`, formed WITHOUT subtracting
+  /// the huge `w` terms from each other (refresh_border_solve).
+  Real schur = 0.0;
+  core::RealVector aty;  ///< scratch, `A'q`
+
+  /// The floor the KKT solver puts under `Theta^-1` (HostKktOptions). The
+  /// cancellation-free Schur form is exact only where the solver used the
+  /// true `Theta`, so a floored column keeps the direct form. 0 = no floor.
+  Real theta_inv_floor = 0.0;
 };
 
 /// Solves `K (p; q) = (h_x; -b)`, the part of the bordered solve that depends

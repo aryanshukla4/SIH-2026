@@ -59162,3 +59162,36 @@ Model name          : bgindy
 Model status        : Infeasible
 Objective value     :  0.0000000000e+00
 HiGHS run time      :          0.01
+Running HiGHS 1.15.1 (git hash: acd8fd4f4): Copyright (c) 2026 under MIT licence terms
+Includes third-party software components, see THIRD_PARTY_NOTICES.md for full details
+Command line parsed using CLI11 2.5.0: Copyright (c) 2017-2025 University of Cincinnati
+LP pilot87 has 2030 rows; 4883 cols; 73152 nonzeros
+Coefficient ranges:
+  Matrix  [1e-06, 1e+03]
+  Cost    [1e-06, 3e+00]
+  Bound   [2e-02, 2e+04]
+  RHS     [1e-02, 6e+03]
+WARNING: Problem has some excessively small costs
+Presolving model
+1980 rows, 4605 cols, 70440 nonzeros 0s
+Dependent equations search running on 102 equations with time limit of 1000.00s
+Dependent equations search removed 0 rows and 0 nonzeros in 0.00s (limit = 1000.00s)
+1700 rows, 4310 cols, 69850 nonzeros 0s
+Presolve reductions: rows 1700(-330); columns 4310(-573); nonzeros 69850(-3302) 
+Solving the presolved LP
+Using dual simplex solver
+  Iteration        Objective     Infeasibilities num(sum)
+          0    -1.9013963147e+01 Ph1: 609(60514.1); Du: 360(19.014) 0.1s
+       6358     2.7291441302e+02 Pr: 604(121919) 5.2s
+       8369     3.0171034733e+02 Pr: 0(0); Du: 0(3.28279e-14) 8.4s
+       8369     3.0171034733e+02 Pr: 0(0); Du: 0(3.28279e-14) 8.4s
+
+Performed postsolve
+Solving the original LP from the solution after postsolve
+
+Model name          : pilot87
+Model status        : Optimal
+Simplex   iterations: 8369
+Objective value     :  3.0171034733e+02
+P-D objective error :  5.3606286212e-15
+HiGHS run time      :          8.47

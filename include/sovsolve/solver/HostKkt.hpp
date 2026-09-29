@@ -41,6 +41,7 @@
 #define SOVSOLVE_SOLVER_HOST_KKT_HPP
 
 #include <cstddef>
+#include <vector>
 
 #include "sovsolve/core/Status.hpp"
 #include "sovsolve/core/Types.hpp"
@@ -76,7 +77,12 @@ struct HostKktOptions {
   /// deficiency in `A`, which no floor on `Theta` can reach: if `A` has a
   /// dependent row then `A Theta A'` is singular for every `Theta`.
   Real delta_d = 1e-10;
+
+  /// Factor retries with delta_d multiplied by 10 each time ([AG99] section 5).
+  std::size_t regularization_retries = 6;
 };
+
+class NormalFactor;
 
 /// Matrix-free `KktSolver` over the canonical problem's existing CSR/CSC pair.
 ///
@@ -85,8 +91,17 @@ struct HostKktOptions {
 /// and nothing else.
 class HostKktSolver final : public KktSolver {
  public:
+  /// With `factor`, the normal equations are factored here (its symbolic
+  /// analysis is shared across iterations) and the factor preconditions CG;
+  /// without one, or if factoring fails at every regularization level, CG
+  /// runs with the Jacobi diagonal as before.
   HostKktSolver(const model::CanonicalProblem& problem, const HomogeneousBorder& border,
-                const HostKktOptions& options);
+                const HostKktOptions& options, NormalFactor* factor = nullptr);
+
+  /// True if this iteration's solves are preconditioned by a direct factor.
+  [[nodiscard]] bool direct() const noexcept { return factor_ != nullptr; }
+  /// The dual regularization actually used, after any escalation.
+  [[nodiscard]] Real delta_d() const noexcept { return options_.delta_d; }
 
   [[nodiscard]] core::Status solve(core::HostSpan<const Real> rhs_x,
                                    core::HostSpan<const Real> rhs_y,
@@ -104,10 +119,14 @@ class HostKktSolver final : public KktSolver {
 
  private:
   void apply(const core::RealVector& in, core::RealVector& out);
+  void precondition();  ///< zvec_ <- P^-1 r_
 
   const model::CanonicalProblem* problem_;
   pdlp::HostMatVec matvec_;
   HostKktOptions options_;
+  NormalFactor* factor_ = nullptr;  ///< null: Jacobi preconditioning
+  std::vector<Real> precond_;       ///< m, scratch for the factor solve
+  std::size_t factor_failures_ = 0; ///< factor solves that overflowed
 
   core::RealVector theta_;      ///< n, the inverted and floored diagonal
   core::RealVector d_slack_;    ///< m, zero on equality rows

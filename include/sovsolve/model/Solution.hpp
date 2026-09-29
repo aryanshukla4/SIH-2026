@@ -99,6 +99,12 @@ struct Solution {
   /// The engine proper -- simplex, PDLP, HSD, IPM, or the concurrent race.
   double engine_seconds = 0.0;
 
+  /// Size of the model the engine actually solved, after presolve. Zero when
+  /// the pipeline did not record it.
+  std::size_t presolved_rows = 0;
+  std::size_t presolved_cols = 0;
+  std::size_t presolved_nnz = 0;
+
   /// Module 24 (PDLP) only: products by `K` and `K'`, counted separately; 0
   /// for every other engine.
   ///

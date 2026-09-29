@@ -2,6 +2,9 @@ add_library(sovsolve_solver STATIC
   Scaler.cpp
   Initializer.cpp
   Presolver.cpp
+  LpPresolve.cpp
+  SparseLdl.cpp
+  NormalFactor.cpp
   MilpPresolve.cpp
   SolutionReconstructor.cpp
   SolutionQuality.cpp
@@ -62,6 +65,23 @@ target_link_libraries(sovsolve_solver PUBLIC
   sovsolve_core sovsolve_model sovsolve_analysis Threads::Threads)
 sovsolve_set_warnings(sovsolve_solver)
 sovsolve_set_sanitizers(sovsolve_solver)
+
+# Optional: CHOLMOD (SuiteSparse) factors the interior-point normal equations
+# (NormalFactor.cpp). A sparse linear-algebra library, not an LP solver; when
+# it is absent -- the MinGW build -- the in-house SparseLdl does the same job.
+option(SOVSOLVE_USE_CHOLMOD "Use CHOLMOD for the CPU normal equations if found" ON)
+if(SOVSOLVE_USE_CHOLMOD)
+  find_path(SOVSOLVE_CHOLMOD_INCLUDE_DIR cholmod.h PATH_SUFFIXES suitesparse)
+  find_library(SOVSOLVE_CHOLMOD_LIBRARY cholmod)
+  if(SOVSOLVE_CHOLMOD_INCLUDE_DIR AND SOVSOLVE_CHOLMOD_LIBRARY)
+    target_include_directories(sovsolve_solver SYSTEM PRIVATE ${SOVSOLVE_CHOLMOD_INCLUDE_DIR})
+    target_link_libraries(sovsolve_solver PUBLIC ${SOVSOLVE_CHOLMOD_LIBRARY})
+    target_compile_definitions(sovsolve_solver PRIVATE SOVSOLVE_HAVE_CHOLMOD)
+    message(STATUS "sovsolve: CHOLMOD found, ${SOVSOLVE_CHOLMOD_LIBRARY}")
+  else()
+    message(STATUS "sovsolve: CHOLMOD not found, using the in-house SparseLdl")
+  endif()
+endif()
 
 # GPU-boundary modules (Modules 7, 9, 10, 12-16): SpMV, KKT assembly,
 # factorization/solve, refinement, step length, state update -- see

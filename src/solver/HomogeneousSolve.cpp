@@ -1,9 +1,11 @@
 #include "sovsolve/solver/HomogeneousSolve.hpp"
 
 #include <cmath>
+#include <memory>
 
 #include "sovsolve/solver/HomogeneousNewton.hpp"
 #include "sovsolve/solver/HostKkt.hpp"
+#include "sovsolve/solver/NormalFactor.hpp"
 #include "sovsolve/solver/SolutionQuality.hpp"
 
 namespace sovsolve::solver {
@@ -88,6 +90,28 @@ void take_step(SolverState& state, Real alpha) {
   state.kappa += alpha * state.dkappa;
 }
 
+/// Every complementarity factor strictly positive, as compute_homogeneous_border
+/// will recompute them: `x - l tau`, `u tau - x`, `z`, `v`, `s`, `-y_I`, `tau`,
+/// `kappa`.
+bool strictly_interior(const model::CanonicalProblem& problem, const SolverState& state) {
+  const auto pos = [](Real v) { return v > 0.0 && std::isfinite(v); };
+  if (!pos(state.tau) || !pos(state.kappa)) return false;
+  for (std::size_t j = 0; j < state.x.size(); ++j) {
+    if (core::is_finite_bound(problem.col_lower[j]) &&
+        (!pos(state.x[j] - problem.col_lower[j] * state.tau) || !pos(state.z[j]))) {
+      return false;
+    }
+    if (core::is_finite_bound(problem.col_upper[j]) &&
+        (!pos(problem.col_upper[j] * state.tau - state.x[j]) || !pos(state.v[j]))) {
+      return false;
+    }
+  }
+  for (std::size_t k = 0; k < state.s.size(); ++k) {
+    if (!pos(state.s[k]) || !pos(slack_dual(state.y[problem.num_equality + k]))) return false;
+  }
+  return true;
+}
+
 core::SolverStatus status_for(HomogeneousVerdict verdict) {
   switch (verdict) {
     case HomogeneousVerdict::Optimal:
@@ -143,6 +167,14 @@ core::Expected<HsdResult> solve_hsd(const model::CanonicalProblem& problem,
   kkt_options.max_iterations = options.hsd.cg_max_iterations;
   kkt_options.theta_inv_floor = options.hsd.theta_inv_floor;
   kkt_options.delta_d = options.hsd.delta_d;
+  kkt_options.regularization_retries = options.hsd.regularization_retries;
+
+  // The normal-equations pattern never changes, so its ordering and symbolic
+  // factorization are computed once here and reused every iteration.
+  std::unique_ptr<NormalFactor> factor;
+  if (options.hsd.direct && problem.num_rows() > 0) {
+    factor = std::make_unique<NormalFactor>(problem);
+  }
 
   HsdResult result;
 
@@ -165,10 +197,14 @@ core::Expected<HsdResult> solve_hsd(const model::CanonicalProblem& problem,
 
   HomogeneousBorder border;
   HomogeneousNewtonWorkspace work;
+  work.theta_inv_floor = kkt_options.theta_inv_floor;
   HomogeneousNewtonRhs rhs;
   Real last_alpha = 0.0;
 
   const std::size_t max_iterations = options.hsd.max_iterations;
+  // Why the loop ended. Continue after the loop means it ran out of
+  // iterations without any [AA] section 1.4.5 test firing.
+  HomogeneousTermination stopped_by = HomogeneousTermination::Continue;
   for (std::size_t iteration = 0; iteration < max_iterations; ++iteration) {
     // Another engine already won the race (core/Cancel.hpp). Every check here
     // is one interior-point iteration apart, each costing a KKT solve, so
@@ -195,6 +231,7 @@ core::Expected<HsdResult> solve_hsd(const model::CanonicalProblem& problem,
 
     const HomogeneousTermination termination = check_homogeneous_termination(
         state, result.progress, reference, last_alpha, params);
+    stopped_by = termination;
     if (termination != HomogeneousTermination::Continue) {
       // `Optimal` here is the EMBEDDING's verdict, not the model's. Which one
       // the model gets is decided by `classify_homogeneous` below, from tau,
@@ -205,7 +242,7 @@ core::Expected<HsdResult> solve_hsd(const model::CanonicalProblem& problem,
     status = compute_homogeneous_border(problem, state, border);
     if (!status.ok()) break;
 
-    HostKktSolver kkt(problem, border, kkt_options);
+    HostKktSolver kkt(problem, border, kkt_options, factor.get());
     status = refresh_border_solve(problem, border, kkt, work);
     if (!status.ok()) break;
 
@@ -231,7 +268,7 @@ core::Expected<HsdResult> solve_hsd(const model::CanonicalProblem& problem,
     result.cg_iterations += kkt.cg_iterations();
     if (kkt.hit_iteration_cap()) result.inexact_solves = true;
 
-    const Real alpha = homogeneous_step_size(problem, state, /*affine=*/false, params);
+    Real alpha = homogeneous_step_size(problem, state, /*affine=*/false, params);
     if (!(alpha > 0.0)) {
       // No positive step satisfies the centrality condition. Reported as a
       // stall rather than pushed through: [AA]'s Theorems 2 and 3 need strict
@@ -243,7 +280,17 @@ core::Expected<HsdResult> solve_hsd(const model::CanonicalProblem& problem,
       result.objective = problem.objective(result.x.span());
       return result;
     }
+    // The step test predicted every gap as `gap + alpha * dgap`; the next
+    // border recomputes it as `u tau - x`, and once a gap is below rounding
+    // relative to `u tau` the two can disagree in sign (Netlib `greenbea`,
+    // iteration 71). Take the step, check the RECOMPUTED gaps, and halve on
+    // a miss rather than let the border fail on it.
     take_step(state, alpha);
+    for (int retry = 0; retry < 30 && !strictly_interior(problem, state); ++retry) {
+      take_step(state, -alpha);
+      alpha *= 0.5;
+      take_step(state, alpha);
+    }
     last_alpha = alpha;
     result.iterations = iteration + 1;
   }
@@ -255,7 +302,30 @@ core::Expected<HsdResult> solve_hsd(const model::CanonicalProblem& problem,
     return result;
   }
 
+  // The verdict must agree with the test that ended the run. classify_homogeneous
+  // reads only tau against kappa, so on its own it will call a run that
+  // stopped for ANY reason Optimal whenever tau has not collapsed -- measured
+  // on the infeasible Netlib models PANG and GRAN, reported Optimal with
+  // primal residuals of 19 and 4.4. So: an Optimal termination may only give
+  // Optimal; an Infeasible or IllPosed one may only give an infeasibility
+  // verdict (or none); a run that simply stopped gives none.
   result.verdict = classify_homogeneous(problem, state, params.rho_i);
+  switch (stopped_by) {
+    case HomogeneousTermination::Optimal:
+      if (result.verdict != HomogeneousVerdict::Optimal) {
+        result.verdict = HomogeneousVerdict::Indeterminate;
+      }
+      break;
+    case HomogeneousTermination::Infeasible:
+    case HomogeneousTermination::IllPosed:
+      if (result.verdict == HomogeneousVerdict::Optimal) {
+        result.verdict = HomogeneousVerdict::Indeterminate;
+      }
+      break;
+    case HomogeneousTermination::Continue:
+      result.verdict = HomogeneousVerdict::Indeterminate;
+      break;
+  }
   result.status = status_for(result.verdict);
 
   if (result.verdict == HomogeneousVerdict::Optimal) {

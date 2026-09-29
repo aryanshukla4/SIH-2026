@@ -10,6 +10,7 @@
 
 #include "sovsolve/model/Options.hpp"
 #include "sovsolve/solver/Diagnostics.hpp"
+#include "sovsolve/solver/LpPresolve.hpp"
 
 namespace sovsolve::solver {
 
@@ -32,6 +33,10 @@ void log_presolve_summary(std::size_t rows_before, std::size_t cols_before,
                           std::size_t nnz_before, std::size_t rows_after,
                           std::size_t cols_after, std::size_t nnz_after,
                           const LogOptions& options, std::FILE* out = stdout);
+
+/// The LP presolve's (LpPresolve.hpp) sizes and per-reduction counts.
+void log_lp_presolve(const LpPresolveStats& stats, const LogOptions& options,
+                     std::FILE* out = stdout);
 
 /// Writes one line per entrant in a Module 30 concurrent solve: the engine,
 /// its verdict, how long it ran and which one won. Declared here rather than
