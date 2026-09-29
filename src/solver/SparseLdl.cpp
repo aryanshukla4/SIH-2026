@@ -16,6 +16,10 @@ constexpr std::size_t kNone = static_cast<std::size_t>(-1);
 /// against any real entry, small enough that d * y stays finite.
 constexpr Real kHugePivot = 1e128;
 
+/// Widest supernode, in columns. OURS: keeps a dense block cache-sized; the
+/// ordering and fill do not depend on it.
+constexpr std::size_t kMaxSupernode = 64;
+
 /// Approximate minimum degree on the QUOTIENT graph.
 ///
 /// NOT TRANSCRIBED from a paper: written from general knowledge of the method
@@ -186,12 +190,52 @@ core::Status SparseLdl::analyze(std::size_t n, const std::vector<std::size_t>& c
   }
   lp_.assign(n + 1, 0);
   for (std::size_t k = 0; k < n; ++k) lp_[k + 1] = lp_[k] + lnz_[k];
+
+  // The full pattern of L, column by column in increasing row order: row k
+  // of L is the etree reach of column k, the same walk as above.
   li_.assign(lp_[n], 0);
+  std::vector<std::size_t> fill(n, 0);
+  std::fill(flag_.begin(), flag_.end(), kNone);
+  for (std::size_t k = 0; k < n; ++k) {
+    flag_[k] = k;
+    const std::size_t kk = perm_[k];
+    for (std::size_t p = col_ptr_[kk]; p < col_ptr_[kk + 1]; ++p) {
+      std::size_t i = pinv_[row_idx_[p]];
+      if (i >= k) continue;
+      for (; flag_[i] != k; i = static_cast<std::size_t>(parent_[i])) {
+        li_[lp_[i] + fill[i]++] = k;
+        flag_[i] = k;
+      }
+    }
+  }
   lx_.assign(lp_[n], 0.0);
   d_.assign(n, 0.0);
-  y_.assign(n, 0.0);
+  diag_.assign(n, 0.0);
   work_.assign(n, 0.0);
-  pattern_.assign(n, 0);
+  relmap_.assign(n, 0);
+
+  // Supernodes: column c joins c-1's when c is c-1's etree parent and c-1's
+  // pattern is exactly {c} u c's pattern. OURS: capped at kMaxSupernode
+  // columns so a block stays cache-sized.
+  super_.clear();
+  super_of_.assign(n, 0);
+  for (std::size_t c = 0; c < n; ++c) {
+    const bool extend = c > 0 && parent_[c - 1] == static_cast<std::ptrdiff_t>(c) &&
+                        lnz_[c - 1] == lnz_[c] + 1 && c - super_.back() < kMaxSupernode;
+    if (!extend) super_.push_back(c);
+    super_of_[c] = super_.size() - 1;
+  }
+  super_.push_back(n);
+  const std::size_t ns = super_.size() - 1;
+  blk_off_.assign(ns + 1, 0);
+  for (std::size_t s = 0; s < ns; ++s) {
+    const std::size_t f = super_[s];
+    const std::size_t ncol = super_[s + 1] - f;
+    blk_off_[s + 1] = blk_off_[s] + (lnz_[f] + 1) * ncol;
+  }
+  blk_.assign(blk_off_[ns], 0.0);
+  next_row_.assign(ns, 0);
+  pending_.assign(ns, {});
   return core::Status::Ok();
 }
 
@@ -200,51 +244,101 @@ core::Status SparseLdl::factorize(const std::vector<Real>& values, Real pivot_to
     return core::make_error(core::ErrorCode::DimensionMismatch,
                             "SparseLdl::factorize: values do not match the analysed pattern");
   }
-  const std::size_t n = n_;
   modified_ = 0;
-  std::fill(lnz_.begin(), lnz_.end(), 0);
-  std::fill(flag_.begin(), flag_.end(), kNone);
+  std::fill(blk_.begin(), blk_.end(), 0.0);
+  for (auto& list : pending_) list.clear();
+  const std::size_t ns = super_.size() - 1;
 
-  // Up-looking LDL', Davis ch. 4 (ldl_numeric): row k of L from a sparse
-  // triangular solve whose pattern is the reach of column k in the etree.
-  for (std::size_t k = 0; k < n; ++k) {
-    y_[k] = 0.0;
-    std::size_t top = n;
-    flag_[k] = k;
-    const std::size_t kk = perm_[k];
-    for (std::size_t p = col_ptr_[kk]; p < col_ptr_[kk + 1]; ++p) {
-      std::size_t i = pinv_[row_idx_[p]];
-      if (i > k) continue;
-      y_[i] += values[p];
-      std::size_t len = 0;
-      for (; flag_[i] != k; i = static_cast<std::size_t>(parent_[i])) {
-        pattern_[len++] = i;
-        flag_[i] = k;
+  for (std::size_t s = 0; s < ns; ++s) {
+    const std::size_t f = super_[s];
+    const std::size_t ncol = super_[s + 1] - f;
+    const std::size_t nrow = lnz_[f] + 1;
+    const std::size_t* rows_below = li_.data() + lp_[f];  // rows[1..nrow)
+    Real* B = blk_.data() + blk_off_[s];
+    const auto row_at = [&](std::size_t i) { return i == 0 ? f : rows_below[i - 1]; };
+    for (std::size_t i = 0; i < nrow; ++i) relmap_[row_at(i)] = i;
+
+    // Assemble this supernode's columns of A (lower triangle).
+    for (std::size_t c = f; c < f + ncol; ++c) {
+      const std::size_t kk = perm_[c];
+      Real* col = B + nrow * (c - f);
+      diag_[c] = 0.0;
+      for (std::size_t p = col_ptr_[kk]; p < col_ptr_[kk + 1]; ++p) {
+        const std::size_t r = pinv_[row_idx_[p]];
+        if (r < c) continue;
+        col[relmap_[r]] += values[p];
+        if (r == c) diag_[c] += values[p];
       }
-      while (len > 0) pattern_[--top] = pattern_[--len];
     }
-    Real d = y_[k];
-    const Real diag = std::fabs(d);  // this pivot's entry before elimination
-    y_[k] = 0.0;
-    for (; top < n; ++top) {
-      const std::size_t i = pattern_[top];
-      const Real yi = y_[i];
-      y_[i] = 0.0;
-      const std::size_t end = lp_[i] + lnz_[i];
-      for (std::size_t p = lp_[i]; p < end; ++p) y_[li_[p]] -= lx_[p] * yi;
-      const Real lki = yi / d_[i];
-      d -= lki * yi;
-      li_[end] = k;
-      lx_[end] = lki;
-      ++lnz_[i];
+
+    // Updates from every earlier supernode D whose rows reach this one:
+    // B(i, j) -= sum_k L_D(i, k) d_k L_D(j, k), for D's rows i >= j in S.
+    for (const std::size_t D : pending_[s]) {
+      const std::size_t fd = super_[D];
+      const std::size_t ncd = super_[D + 1] - fd;
+      const std::size_t nrd = lnz_[fd] + 1;
+      const std::size_t* rd = li_.data() + lp_[fd];  // D's rows 1..nrd
+      const Real* BD = blk_.data() + blk_off_[D];
+      const std::size_t q0 = next_row_[D];
+      std::size_t q1 = q0;
+      while (q1 < nrd && rd[q1 - 1] < f + ncol) ++q1;
+      // The update block is formed DENSE first -- contiguous loops the
+      // compiler can vectorise -- then scattered into B once, instead of
+      // scattering every multiply-add through relmap_.
+      const std::size_t h = nrd - q0;  // rows of the update
+      const std::size_t w = q1 - q0;   // its columns
+      update_.assign(h * w, 0.0);
+      for (std::size_t k = 0; k < ncd; ++k) {
+        const Real* lk = BD + nrd * k + q0;
+        const Real dk = d_[fd + k];
+        for (std::size_t a = 0; a < w; ++a) {
+          const Real t = lk[a] * dk;
+          if (t == 0.0) continue;
+          Real* u = update_.data() + h * a;
+          for (std::size_t b = a; b < h; ++b) u[b] += lk[b] * t;
+        }
+      }
+      for (std::size_t a = 0; a < w; ++a) {
+        Real* col = B + nrow * (rd[q0 + a - 1] - f);
+        const Real* u = update_.data() + h * a;
+        for (std::size_t b = a; b < h; ++b) col[relmap_[rd[q0 + b - 1]]] -= u[b];
+      }
+      next_row_[D] = q1;
+      if (q1 < nrd) pending_[super_of_[rd[q1 - 1]]].push_back(D);
     }
-    // [AG99] section 5 / [W99]: a pivot that lost (almost) everything to
-    // cancellation belongs to a dependent row; drop that component.
-    if (!std::isfinite(d) || d <= pivot_tolerance * diag) {
-      d = kHugePivot;
-      ++modified_;
+
+    // Dense LDL' of the block, with [W99]'s pivot skipping.
+    for (std::size_t jj = 0; jj < ncol; ++jj) {
+      Real* cj = B + nrow * jj;
+      for (std::size_t kk = 0; kk < jj; ++kk) {
+        const Real* ck = B + nrow * kk;
+        const Real t = ck[jj] * d_[f + kk];
+        if (t == 0.0) continue;
+        for (std::size_t i = jj; i < nrow; ++i) cj[i] -= ck[i] * t;
+      }
+      Real d = cj[jj];
+      if (!std::isfinite(d) || d <= pivot_tolerance * std::fabs(diag_[f + jj])) {
+        d = kHugePivot;
+        ++modified_;
+      }
+      d_[f + jj] = d;
+      const Real inv = 1.0 / d;
+      for (std::size_t i = jj + 1; i < nrow; ++i) cj[i] *= inv;
     }
-    d_[k] = d;
+
+    // Hand this supernode to the first later supernode its rows reach.
+    if (ncol < nrow) {
+      next_row_[s] = ncol;
+      pending_[super_of_[rows_below[ncol - 1]]].push_back(s);
+    }
+
+    // Column form for the solve: column c's below-diagonal entries are the
+    // block rows after its own.
+    for (std::size_t jj = 0; jj < ncol; ++jj) {
+      const std::size_t c = f + jj;
+      const Real* cj = B + nrow * jj;
+      for (std::size_t i = jj + 1; i < nrow; ++i) lx_[lp_[c] + (i - jj - 1)] = cj[i];
+    }
   }
   return core::Status::Ok();
 }

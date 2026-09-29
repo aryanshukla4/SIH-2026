@@ -117,12 +117,12 @@ bool strictly_interior(const model::CanonicalProblem& problem, const SolverState
 /// matches IpmOptions::delta_max, the GPU interior point's own ceiling.
 constexpr Real kMaxDeltaD = 1e-2;
 
-/// Settles a dual-infeasibility certificate: primal feasible -> Unbounded,
-/// primal infeasible -> Infeasible, otherwise no verdict. The dual simplex
-/// solves the feasibility problem (zero objective) and is the engine whose
-/// Infeasible is a proof, checked on every infeasible Netlib model.
-core::SolverStatus settle_dual_certificate(const model::CanonicalProblem& problem,
-                                           const model::Options& options) {
+/// Is the primal feasible? Optimal = yes, Infeasible = no (proved), anything
+/// else = undecided. The dual simplex solves the feasibility problem (zero
+/// objective); it is the engine whose Infeasible is a proof, checked on every
+/// infeasible Netlib model.
+core::SolverStatus primal_feasibility(const model::CanonicalProblem& problem,
+                                      const model::Options& options) {
   model::CanonicalProblem feasibility;
   feasibility.c = core::RealVector(problem.num_cols(), 0.0);
   feasibility.A = problem.A.clone();
@@ -137,9 +137,34 @@ core::SolverStatus settle_dual_certificate(const model::CanonicalProblem& proble
   simplex_options.simplex.method = model::Method::DualSimplex;
   auto r = simplex::solve_simplex(feasibility, simplex_options);
   if (!r.has_value()) return core::SolverStatus::NotConverged;
-  if (r->status == core::SolverStatus::Optimal) return core::SolverStatus::Unbounded;
-  if (r->status == core::SolverStatus::Infeasible) return core::SolverStatus::Infeasible;
+  if (r->status == core::SolverStatus::Optimal || r->status == core::SolverStatus::Infeasible) {
+    return r->status;
+  }
   return core::SolverStatus::NotConverged;
+}
+
+/// A dual-infeasibility certificate plus a feasible primal is Unbounded.
+core::SolverStatus settle_dual_certificate(const model::CanonicalProblem& problem,
+                                           const model::Options& options) {
+  const core::SolverStatus f = primal_feasibility(problem, options);
+  return f == core::SolverStatus::Optimal ? core::SolverStatus::Unbounded : f;
+}
+
+/// Worst row violation of `x`, relative to 1 + |b_i| (inequality rows are
+/// `a'x <= b`).
+Real worst_row_violation(const model::CanonicalProblem& problem, const core::RealVector& x) {
+  Real worst = 0.0;
+  const auto& csr = problem.A.csr;
+  for (std::size_t i = 0; i < problem.num_rows(); ++i) {
+    Real act = 0.0;
+    for (auto k = csr.slice_begin(i); k < csr.slice_end(i); ++k) {
+      act += csr.values()[k] * x[static_cast<std::size_t>(csr.indices()[k])];
+    }
+    const Real slack = act - problem.b[i];
+    const Real v = i < problem.num_equality ? std::fabs(slack) : std::max(slack, 0.0);
+    worst = std::max(worst, v / (1.0 + std::fabs(problem.b[i])));
+  }
+  return worst;
 }
 
 core::SolverStatus status_for(HomogeneousVerdict verdict) {
@@ -428,6 +453,22 @@ core::Expected<HsdResult> solve_hsd(const model::CanonicalProblem& problem,
     status = recover_from_homogeneous(state);
     if (!status.ok()) return status.error();
     if (result.iterations >= max_iterations) result.status = core::SolverStatus::MaxIterations;
+    // THE AMBIGUOUS ZONE. The stop accepts a residual up to 10x the tolerance
+    // (above), and an infeasible model can have a point that close: Netlib
+    // CPLEX2 stopped "optimal" with rows violated by 3.8e-8, and the dual
+    // simplex proves it infeasible. When a row is still violated beyond the
+    // tolerance itself, feasibility is settled exactly before Optimal is
+    // reported. OURS.
+    if (result.status == core::SolverStatus::Optimal &&
+        worst_row_violation(problem, state.x) > options.tolerances.primal_feasibility) {
+      const core::SolverStatus f = primal_feasibility(problem, options);
+      if (f == core::SolverStatus::Infeasible) {
+        result.status = core::SolverStatus::Infeasible;
+        result.verdict = HomogeneousVerdict::PrimalInfeasible;
+      } else if (f != core::SolverStatus::Optimal) {
+        result.status = core::SolverStatus::NotConverged;
+      }
+    }
   } else if (result.iterations >= max_iterations &&
              result.verdict == HomogeneousVerdict::Indeterminate) {
     result.status = core::SolverStatus::MaxIterations;

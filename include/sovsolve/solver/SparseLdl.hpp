@@ -33,6 +33,15 @@
 // their regularization (the small R_p, R_d on every pivot) is added by the
 // caller to the matrix itself, before factorizing.
 //
+// NUMERIC FACTORIZATION. Left-looking SUPERNODAL: consecutive columns whose
+// below-diagonal patterns nest (the parent in the elimination tree is the
+// next column and the column count drops by exactly one) form a supernode,
+// assembled and factored as a dense block, with every update from an earlier
+// supernode applied as a dense block too -- the organisation of the
+// supernodal Cholesky in [AA00] section 1.5.2 and of CHOLMOD. Written from
+// the standard method, not transcribed; the result is checked against the
+// column-by-column factor it replaced (same fill, same pivots skipped).
+//
 // ORDERING. Approximate minimum degree on the quotient graph (SparseLdl.cpp),
 // written from general knowledge of Amestoy, Davis & Duff (1996) rather than
 // transcribed, and checked against CHOLMOD's fill. Deterministic run to run.
@@ -80,9 +89,17 @@ class SparseLdl {
   std::vector<Real> lx_, d_;
   std::size_t modified_ = 0;
 
+  // Supernodes: columns [super_[s], super_[s+1]) share one below-diagonal
+  // pattern and are factored as one dense block (column-major, rows =
+  // {first column} u li_ of the first column) at blk_off_[s] in blk_.
+  std::vector<std::size_t> super_, super_of_, blk_off_;
+  std::vector<Real> blk_;
+
   // Factorization workspace, kept to avoid reallocating each iteration.
-  mutable std::vector<Real> y_, work_;
-  std::vector<std::size_t> flag_, pattern_, lnz_;
+  mutable std::vector<Real> work_;
+  std::vector<std::size_t> flag_, lnz_, relmap_, next_row_;
+  std::vector<Real> diag_, update_;
+  std::vector<std::vector<std::size_t>> pending_;
 };
 
 }  // namespace sovsolve::solver

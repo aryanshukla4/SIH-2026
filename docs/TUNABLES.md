@@ -51,6 +51,7 @@ file named.
 | escalation factor | x10 | AG99 section 5 ("multiplied by 10") | - |
 | escalation trigger | CG steps per solve > 2 + dense columns | OURS: AG99's "more than one refinement step", CG being the refinement; fixed brandy | - |
 | escalation size | default x 10, next iteration only | AG99 section 5; compounding (tried first) pinned fit1p/fit2p at the cap and lost both | - |
+| ambiguous-zone check | HSD Optimal with a row violated beyond `primal_feasibility` (1e-8): dual simplex on the feasibility problem decides | OURS: the stop accepts 10x the tolerance, and infeasible CPLEX2 stopped "optimal" at 3.8e-8; now proved Infeasible | - |
 | dual-certificate check | dual simplex on the feasibility problem | OURS: a dual certificate means "unbounded OR infeasible" (AA00 1.4.5); Netlib CPLEX1 was reported Unbounded, now Infeasible | - |
 | `kMaxDeltaD` | 1e-2 | OURS: AG99 states no cap; matches `IpmOptions::delta_max` | - |
 | `regularization_retries` | 6 | OURS count; the x10 per retry is AG99 section 5 | - |
@@ -69,6 +70,8 @@ file named.
 | `kPivotTolerance` (and `kHostPivotTolerance`) | 1e-14 x the pivot's own diagonal | OURS: W99's 1e-13 x largest diagonal lost 25fv47, fffff800, 80bau3b as a CG preconditioner | - |
 | `kHugePivot` | 1e128 | OURS size of W99's "huge element" | - |
 | ordering | approximate minimum degree | from general knowledge of Amestoy-Davis-Duff 1996 (paper not in hand); ordering 10-57x faster than the old minimum degree, fill within 5-10% of CHOLMOD except dfl001 (1.58M vs 1.14M); HSD 93/94 Netlib, 0 wrong | - |
+| numeric factorization | left-looking supernodal, dense update blocks | standard method (AA00 section 1.5.2 describes MOSEK's supernodal Cholesky); dfl001 factor 1.09 s -> 0.22 s, pilot87/maros-r7 on par with CHOLMOD | - |
+| `kMaxSupernode` | 64 columns | OURS: keeps a block cache-sized | - |
 | backend | CHOLMOD if found, else SparseLdl | build option `SOVSOLVE_USE_CHOLMOD` | - |
 
 ## GPU interior point (`Options.hpp` `IpmOptions`, `src/solver/gpu/`)
