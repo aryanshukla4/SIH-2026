@@ -1040,6 +1040,42 @@ struct ConcurrentOptions {
   /// reverses, and the GPU engine costs no CPU core to run -- it should be in
   /// the race there. Turn it on when the deployment hardware warrants it.
   bool include_gpu_interior_point = false;
+
+  /// Crossover: when the race is won by an engine that stops at a tolerance
+  /// rather than at a vertex -- cuPDLPx or the interior point -- finish its
+  /// answer with the primal simplex, warm-started from a basis read off its
+  /// point. The race then returns an exact vertex whichever engine won, so the
+  /// objective no longer depends on thread timing (measured: cuPDLPx won 5 of
+  /// 60 runs of a two-row LP on a busy machine and returned -2.7999999914
+  /// where the simplex engines return -2.8). Same idea as Gurobi's concurrent
+  /// LP, which crosses a barrier win over to a basis.
+  ///
+  /// OFF by default, because it is not yet cheap. Measured 2026-09-30 on the
+  /// 31 Netlib LPs where cuPDLPx or HSD wins the race (i5-12450H, best of 3):
+  /// SGM10 0.60 s off, 1.21 s with the primal finish, 1.40 s with the dual;
+  /// 10 and 7 of the 31 ran out of budget. From the Andersen-Ye crash basis
+  /// the simplex still needs about as long as a cold solve on models such as
+  /// 25fv47 (0.07 s -> 0.58 s). A crossover that is cheap enough to be the
+  /// default needs the primal and dual "push" phases (Megiddo 1991; Andersen
+  /// & Ye 1996) rather than handing the crash basis straight to the simplex.
+  /// Turn it on (`--concurrent-crossover=1`) when an exact vertex on every run
+  /// matters more than speed.
+  bool crossover = false;
+
+  /// Crossover time budget, as a multiple of the race's own wall time, with a
+  /// floor of `crossover_min_seconds`. If the simplex has not finished by then
+  /// the tolerance answer is returned as it was -- the crossover can make a
+  /// solve at most this much slower, never wrong. OURS: 1.0 caps the worst
+  /// case at twice the race; the floor keeps it from starving on tiny models
+  /// where the race takes microseconds.
+  Real crossover_time_factor = 1.0;
+  Real crossover_min_seconds = 1.0;
+
+  /// Which simplex finishes the crossover from the crash basis:
+  /// `PrimalSimplex`, or `DualSimplex` (with its primal cleanup). OURS: the
+  /// primal, measured faster on the 31 models above (SGM10 1.21 s vs 1.40 s),
+  /// though the dual reached a vertex more often (21 vs 18).
+  Method crossover_method = Method::PrimalSimplex;
 };
 
 struct Options {

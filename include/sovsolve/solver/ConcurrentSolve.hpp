@@ -41,15 +41,22 @@
 // very large sparse LPs, the dual simplex on medium ones, and nothing about
 // the model tells you which in advance.
 //
-// DETERMINISM. The objective value is deterministic; WHICH optimal basis
-// comes back is not, because it depends on which thread finished first. A
-// degenerate LP has many optimal vertices and two engines may legitimately
-// land on different ones with the same objective. Gurobi documents the same
-// tradeoff and offers a deterministic concurrent mode that is "significantly
-// slower". This module therefore stays OPT-IN (`--method=concurrent`), so
-// every existing test and the MILP search -- which compares solution vectors,
-// not just objectives -- keep the single-engine behaviour they were
-// validated against.
+// DETERMINISM. Which engine wins depends on thread timing. Without more
+// care that leaks into the answer: cuPDLPx and the interior point stop at a
+// relative tolerance (1e-8), not at a vertex, so when one of them wins the
+// objective differs from the simplex's in the ninth digit. The CROSSOVER
+// (ConcurrentOptions::crossover, opt-in) removes that: a tolerance win is
+// finished by the simplex, warm-started from a basis read off the winning
+// point, so every Optimal the race returns is a simplex vertex and its
+// objective is exact. It is off by default because it roughly doubles the
+// solve time where it runs -- see the measurement on the option.
+//
+// What is still not fixed is WHICH optimal vertex: a degenerate LP has many,
+// with the same objective, and two starting bases may reach different ones.
+// Gurobi documents the same tradeoff and offers a deterministic concurrent
+// mode that is "significantly slower". The MILP search does not use the race
+// for its node LPs -- it compares solution vectors, not just objectives --
+// and keeps the single-engine behaviour it was validated against.
 
 #ifndef SOVSOLVE_SOLVER_CONCURRENT_SOLVE_HPP
 #define SOVSOLVE_SOLVER_CONCURRENT_SOLVE_HPP
@@ -89,6 +96,18 @@ struct ConcurrentReport {
   std::size_t winner = 0;
   /// Threads actually started.
   std::size_t threads = 0;
+
+  /// The crossover after a tolerance-based win (ConcurrentOptions::crossover).
+  /// `crossover_ran` is false when the winner was already a simplex vertex,
+  /// the verdict was not Optimal, or crossover is off.
+  bool crossover_ran = false;
+  /// True when the crossover's vertex replaced the winner's answer; false
+  /// when it ran out of budget or ended without an Optimal verdict, and the
+  /// winner's answer was returned unchanged.
+  bool crossover_used = false;
+  core::SolverStatus crossover_status = core::SolverStatus::NotConverged;
+  std::size_t crossover_iterations = 0;
+  double crossover_seconds = 0.0;
 };
 
 /// The engines this build can race, in PRIORITY order.

@@ -84,6 +84,12 @@ void log_concurrent_race(const ConcurrentReport& report, const LogOptions& optio
                  e.failed ? "failed" : spell(e.status), e.seconds,
                  e.iterations, e.won ? "<-- winner" : "");
   }
+  if (report.crossover_ran) {
+    std::fprintf(out, "  %-16s %-14s %10.3fs  iters=%-8zu %s\n", "crossover",
+                 spell(report.crossover_status), report.crossover_seconds,
+                 report.crossover_iterations,
+                 report.crossover_used ? "<-- vertex returned" : "(winner's answer kept)");
+  }
 }
 
 }  // namespace sovsolve::solver

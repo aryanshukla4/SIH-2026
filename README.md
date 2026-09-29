@@ -185,6 +185,7 @@ all hold; the premium-petrol order is not part of the conflict.
 | Very large LP, CPU only | `--method=pdlpx` | the same algorithm on the CPU |
 | Convex QP | `--method=ipm` (CUDA build) | the interior point handles the quadratic term |
 | An infeasible model you need explained | add `--iis` | prints an irreducible set of conflicting rows and bounds |
+| The same exact vertex on every run | add `--concurrent-crossover=1` | when cuPDLPx or the interior point wins, the simplex finishes its answer at a vertex; about 2× slower where it runs, so off by default |
 
 ---
 

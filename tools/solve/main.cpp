@@ -70,6 +70,14 @@ void print_usage(const char* argv0) {
       "  --concurrent-gpu-ipm=0|1  race the GPU interior-point engine too\n"
       "                        (default 0 -- worth turning on for a datacentre\n"
       "                        card, where FP64 is not 1/64 rate)\n"
+      "  --concurrent-crossover=0|1  when cuPDLPx or HSD wins, finish its answer at\n"
+      "                        an exact vertex with the simplex, so the objective\n"
+      "                        does not depend on which engine won (default 0 --\n"
+      "                        about 2x slower where it runs; budget: the race's\n"
+      "                        own time, at least 1 s)\n"
+      "  --concurrent-crossover-method=primal|dual  simplex that finishes it\n"
+      "  --concurrent-crossover-factor=X  budget = X * race time (default 1)\n"
+      "  --concurrent-crossover-min=S     budget floor, seconds (default 1)\n"
       "  --scaling=geometric|ruiz  ScalingOptions::mode (ruiz is implied by\n"
       "                        --method=pdlp; pass this AFTER it to override)\n"
       "  --pdlp-tol=X          PdlpOptions::termination_tolerance (default 1e-8)\n"
@@ -397,6 +405,16 @@ bool apply_flag(const std::string& flag, sovsolve::model::Options& options) {
       options.concurrent.max_threads = static_cast<std::size_t>(std::stoul(val));
     } else if (key == "concurrent-gpu-ipm") {
       options.concurrent.include_gpu_interior_point = (val != "0");
+    } else if (key == "concurrent-crossover") {
+      options.concurrent.crossover = (val != "0");
+    } else if (key == "concurrent-crossover-method") {
+      options.concurrent.crossover_method =
+          val == "dual" ? sovsolve::model::Method::DualSimplex
+                        : sovsolve::model::Method::PrimalSimplex;
+    } else if (key == "concurrent-crossover-factor") {
+      options.concurrent.crossover_time_factor = std::stod(val);
+    } else if (key == "concurrent-crossover-min") {
+      options.concurrent.crossover_min_seconds = std::stod(val);
     } else if (key == "mip-presolve-columns") {
       options.milp.presolve_columns = (val != "0");
     } else if (key == "mip-gomory") {
