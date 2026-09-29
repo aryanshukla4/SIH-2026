@@ -102,8 +102,11 @@ struct LinearSolveResult {
 /// than the whole `Options` object -- matches this file's existing
 /// minimal-parameter convention (`build_kkt` takes `delta_p`/`delta_d`
 /// individually the same way).
+/// `try_direct`: precondition with the exact cuDSS factor when this build links
+/// cuDSS (Preconditioner.hpp), falling back to IC(0) and then Jacobi.
 [[nodiscard]] Expected<LinearSolveResult> solve_spd_cg(const NormalEquationsSystem& system,
-                                                        Real cg_tolerance, int cg_max_iterations);
+                                                        Real cg_tolerance, int cg_max_iterations,
+                                                        bool try_direct = true);
 
 /// Matrix-free MINRES solve of the symmetric quasi-definite augmented KKT
 /// system (`KktSystem`, already sparse -- `build_kkt` never densifies it,

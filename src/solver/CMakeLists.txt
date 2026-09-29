@@ -110,6 +110,30 @@ if(SOVSOLVE_ENABLE_CUDA)
   target_link_libraries(sovsolve_solver_gpu PUBLIC
     sovsolve_core sovsolve_model sovsolve_analysis sovsolve_solver
     CUDA::cublas CUDA::cusparse CUDA::cusolver)
+
+  # Optional cuDSS (see the top-level CMakeLists.txt). Found through CUDSS_ROOT
+  # or the pip wheel `nvidia-cudss-cu12` (python -m pip install ...), which
+  # ships only the versioned libcudss.so.0.
+  option(SOVSOLVE_USE_CUDSS "Use cuDSS as the GPU normal-equations preconditioner if found" ON)
+  if(SOVSOLVE_USE_CUDSS)
+    execute_process(
+      COMMAND python3 -c "import nvidia, os; print(os.path.join(nvidia.__path__[0], 'cu12'))"
+      OUTPUT_VARIABLE _sovsolve_cudss_pip OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    set(_sovsolve_cudss_hints $ENV{CUDSS_ROOT} ${CUDSS_ROOT} ${_sovsolve_cudss_pip}
+        $ENV{HOME}/cudss-env/lib/python3.12/site-packages/nvidia/cu12)
+    find_path(SOVSOLVE_CUDSS_INCLUDE_DIR cudss.h HINTS ${_sovsolve_cudss_hints}
+              PATH_SUFFIXES include)
+    find_library(SOVSOLVE_CUDSS_LIBRARY NAMES cudss libcudss.so.0
+                 HINTS ${_sovsolve_cudss_hints} PATH_SUFFIXES lib lib64)
+    if(SOVSOLVE_CUDSS_INCLUDE_DIR AND SOVSOLVE_CUDSS_LIBRARY)
+      target_include_directories(sovsolve_solver_gpu SYSTEM PRIVATE ${SOVSOLVE_CUDSS_INCLUDE_DIR})
+      target_link_libraries(sovsolve_solver_gpu PUBLIC ${SOVSOLVE_CUDSS_LIBRARY})
+      target_compile_definitions(sovsolve_solver_gpu PRIVATE SOVSOLVE_HAVE_CUDSS)
+      message(STATUS "sovsolve: cuDSS found, ${SOVSOLVE_CUDSS_LIBRARY}")
+    else()
+      message(STATUS "sovsolve: cuDSS not found, GPU IPM uses IC(0)/Jacobi")
+    endif()
+  endif()
   # This is a ONE-WAY edge: sovsolve_solver_gpu -> sovsolve_solver, needed
   # because gpu/Solve.cu (the top-level solve_problem() entry point) calls
   # host-only functions (canonicalize, initialize, ConvergenceChecker,
