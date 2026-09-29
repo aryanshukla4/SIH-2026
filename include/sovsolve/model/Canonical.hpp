@@ -211,7 +211,7 @@ struct CanonicalResult {
 /// RemoveFreeSingleton, MergeDuplicateColumn (see the .cpp for the case-by-
 /// case derivation); TightenBound/ShiftVariable/NegateVariable are declared
 /// in Transform.hpp but never pushed by the current Presolver, which writes
-/// tightened bounds directly (module.txt Module 4) rather than recording a
+/// tightened bounds directly (docs/spec/module.txt Module 4) rather than recording a
 /// separate transform for them.
 [[nodiscard]] core::RealVector forward_map_to_canonical_hint(
     const Problem& original, const CanonicalProblem& canonical,

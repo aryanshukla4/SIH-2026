@@ -36,11 +36,11 @@ hiding:
 - A **primal-dual interior-point method** (`src/solver/gpu/`), GPU-resident
   and matrix-free — a predictor-corrector (Mehrotra-style) Newton iteration
   moving through the *interior* of the feasible region.
-- A **revised simplex** engine (`src/solver/simplex/`, `module.txt` §23),
+- A **revised simplex** engine (`src/solver/simplex/`, `docs/spec/module.txt` §23),
   host-only, in both its **dual** and **primal** forms, sharing one
   factorized-basis core (`detail/SimplexEngine`) and selected at the command
   line with `--method=dual-simplex` / `--method=primal-simplex`.
-- **PDLP**, a **first-order** method (`src/solver/pdlp/`, `module.txt` §24),
+- **PDLP**, a **first-order** method (`src/solver/pdlp/`, `docs/spec/module.txt` §24),
   `--method=pdlp`. This one has **no counterpart in HiGHS at all** — it
   factors nothing, ever, and its entire inner loop is a pair of sparse
   matrix-vector products.
@@ -52,7 +52,7 @@ kind as for the simplex: the three things our implementation had to get right
 that the *papers themselves* state wrongly or leave out — an acceptance bound
 that diverges as literally written, a dual objective whose printed sign
 contradicts the paper's own notation section, and a trust-region reduction that
-silently drops finite upper bounds. All three are recorded in `module.txt`
+silently drops finite upper bounds. All three are recorded in `docs/spec/module.txt`
 §24 with the measurements that exposed them. Code copied from a working
 implementation does not reproduce a paper's errata and then fix them.
 
@@ -81,7 +81,7 @@ The vendored `HiGHS/` tree contains its own dual simplex at
 above**, deliberately and for exactly this reason — the same standard §3
 below describes for the presolve rules. The evidence that this is an
 independent derivation is the shape of the bugs it produced, all recorded in
-`module.txt` §23: a sigma sign that had to be re-derived from scratch, a
+`docs/spec/module.txt` §23: a sigma sign that had to be re-derived from scratch, a
 basis-validation check that counted statuses instead of detecting a
 duplicated slot, an artificial-bound escalation that was initially mistaken
 for a genuine `Infeasible` verdict, and a Bland's-rule latch that never
@@ -112,7 +112,7 @@ REVIEW.md` §3.5 measures FP64 factorization on this GA107 at roughly **64×**
 penalised, slower than the CPU, against SpMV at **~2×** because it is
 bandwidth-bound rather than FLOP-bound. Whether that theoretical fit turns into
 a measured win is **still unanswered**: the cuSPARSE backend is not written.
-It is listed as not-done in `module.txt` §24 rather than claimed here.
+It is listed as not-done in `docs/spec/module.txt` §24 rather than claimed here.
 
 The IPM's linear algebra is **matrix-free and GPU-resident**
 (`src/solver/gpu/LinearSolver.cu`): every Newton system is solved by an
@@ -143,7 +143,7 @@ like HiGHS was never designed to do.
 ## 3. Our own presolve module, built by direct derivation
 
 HiGHS ships a large, mature presolve engine developed over years. This
-project's presolve (`src/solver/Presolver.cpp`, `module.txt` §4) was built
+project's presolve (`src/solver/Presolver.cpp`, `docs/spec/module.txt` §4) was built
 from scratch this project cycle, rule by rule, each one algebraically derived
 and independently unit-tested (`tests/property/presolver_test.cpp`) before
 being trusted on the real corpus — not ported from any reference

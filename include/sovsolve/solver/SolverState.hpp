@@ -73,7 +73,7 @@ struct SolverState {
 
 /// `w_s = -y_I` is not stored -- see Solution.hpp. Read the inequality block
 /// of `y` through this helper so a sign test always reads positively; writing
-/// `-y_i > 0` inline is easy to get backwards (module.txt Module 14).
+/// `-y_i > 0` inline is easy to get backwards (docs/spec/module.txt Module 14).
 [[nodiscard]] inline Real slack_dual(Real y_i) noexcept { return -y_i; }
 
 /// Floors a complementarity gap (x-l, u-x, or -y_I) away from exact 0.0

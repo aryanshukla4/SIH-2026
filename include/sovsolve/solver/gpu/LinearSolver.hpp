@@ -22,7 +22,7 @@
 // itself) is right. Neither is called from `PredictorCorrector.cu` anymore.
 //
 // Iterative refinement is NOT implemented for any of the four paths
-// (`refinement_passes` is always 0): module.txt Module 12 / FORMULATION.md
+// (`refinement_passes` is always 0): docs/spec/module.txt Module 12 / FORMULATION.md
 // 10.3 specify refinement against the UNREGULARIZED residual specifically,
 // which needs the true (non-regularized) Newton system's residual -- a real
 // piece of design deferred, not silently approximated. For the Krylov paths

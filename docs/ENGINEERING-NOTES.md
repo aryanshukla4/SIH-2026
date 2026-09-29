@@ -331,7 +331,7 @@ Two things worth knowing:
   (`Regularization.hpp`) became header-only so this doesn't create a link
   cycle between the host and GPU solver libraries; see that header's
   comment for the full reasoning.
-- Module 8's "reuse structure where valid" (module.txt) -- reusing the
+- Module 8's "reuse structure where valid" (docs/spec/module.txt) -- reusing the
   affine solve's factorization for the corrector solve -- is **not**
   implemented. The dense cuSOLVER stopgap (`LinearSolver.hpp`) factorizes
   from scratch both times; real reuse needs the sparse solver this project
@@ -470,7 +470,7 @@ everything:
    `NotConverged` purely because of this. Fixed: `dual_objective()` now
    includes `l'z - u'v` (finite-bound terms only) and `-x'Qx` for QP.
 2. `PredictorCorrector.cu` treated "pivot ratio still high at `delta_max`" as
-   fatal (`NumericalError`), discarding the whole solve. But architecture.txt's
+   fatal (`NumericalError`), discarding the whole solve. But docs/spec/architecture.txt's
    "at delta_max with factorization still failing" means exact singularity
    (already a separate, hard `Expected` failure from `solve()`) -- a merely
    still-elevated pivot ratio at `delta_max` is the *expected*, harmless
@@ -515,7 +515,7 @@ was shorthand for "19/19 correct" and read as something stronger than the truth.
 | **correct verdicts** | 6-7 / 19 | **19 / 19** | **19 / 19** | **18 / 19** | **18 / 19** |
 | unsolved | 12-13 | none | none | `greenbea` | `greenbea` |
 
-**HSD** (`--method=hsd`, `module.txt` section 25) is the homogeneous self-dual
+**HSD** (`--method=hsd`, `docs/spec/module.txt` section 25) is the homogeneous self-dual
 embedding: the same interior-point *family* as the IPM column, and the reason
 that column is 6-7 rather than 18. It is a fourth engine rather than a flag on
 the IPM because the IPM is GPU-resident and the embedding is host-only.
@@ -544,7 +544,7 @@ pivots) and tails off near the optimum rather than terminating at a vertex.
 What it buys is that nothing is ever factored, which is the only reason it has
 any claim on this hardware at all -- and that claim is still **unmeasured**,
 because the cuSPARSE backend and the large-instance A/B have not been built.
-See `module.txt` section 24, "Not done".
+See `docs/spec/module.txt` section 24, "Not done".
 
 *IPM, for comparison* (default settings, `--max-iter=300`): **6 reach
 `Optimal`** (`afiro`, `avgas`, `chip`, `egout`,
@@ -597,7 +597,7 @@ the default and is **compiled out** when `SOVSOLVE_ENABLE_CUDA` is off, since
   `--pdlp-cert-tol`, and one switch per enhancement so the paper's own ablation
   is reproducible from the command line -- `--pdlp-adaptive`,
   `--pdlp-restart`, `--pdlp-primal-weight`, `--pdlp-infeasibility`. Every
-  before/after figure in `module.txt` section 24 was produced with these.
+  before/after figure in `docs/spec/module.txt` section 24 was produced with these.
 - **Scaling:** `--scaling=geometric|ruiz`. `ruiz` is implied by
   `--method=pdlp` (its convergence depends on the preconditioning far more
   directly than a factorization-based method's does); pass `--scaling=` *after*
@@ -650,7 +650,7 @@ own residual -- deferred, not approximated.
 The GPU-boundary modules (`src/solver/gpu/*.cu` -- residuals, KKT assembly,
 ordering, linear solve, Newton recovery, step length, state update, mu
 control) are written directly as CUDA C++ from the start, per
-`architecture.txt`'s GPU-boundary text. They only build under
+`docs/spec/architecture.txt`'s GPU-boundary text. They only build under
 `SOVSOLVE_ENABLE_CUDA=ON` (the `cuda` CMake preset, targeting WSL2 + the
 Linux CUDA toolkit -- `nvcc` on native Windows needs MSVC as its host
 compiler, which this project avoids). The host-only build
@@ -662,7 +662,7 @@ cmake --preset cuda && cmake --build build-cuda   # WSL2, CUDA toolkit installed
 ```
 
 **Deviation from the locked v3 spec, recorded here rather than silently
-absorbed:** `module.txt` Module 12 requires *both* a CPU reference
+absorbed:** `docs/spec/module.txt` Module 12 requires *both* a CPU reference
 implementation and a GPU implementation for the linear solver, specifically
 so results can be cross-checked against each other. This build is CUDA-only
 -- there is no CPU reference path. That means a wrong answer from the linear

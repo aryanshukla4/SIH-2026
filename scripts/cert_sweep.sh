@@ -1,5 +1,5 @@
 #!/bin/bash
-# Infeasibility-certificate tolerance sweep (module.txt section 24D/24F).
+# Infeasibility-certificate tolerance sweep (docs/spec/module.txt section 24D/24F).
 #
 #   bash scripts/cert_sweep.sh <solve-binary> [iterations]
 #

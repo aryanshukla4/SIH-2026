@@ -4,7 +4,7 @@
 // IEEE754, so a poisoned residual would otherwise silently run to the
 // iteration limit and report MaxIterations on what may be a solvable
 // problem. A non-finite residual must produce NumericalError directly
-// instead (module.txt Module 18).
+// instead (docs/spec/module.txt Module 18).
 //
 // INFEASIBLE is never returned from here -- only from a definite verdict in
 // the Canonicalizer (an inconsistent empty row or a crossed bound pair).

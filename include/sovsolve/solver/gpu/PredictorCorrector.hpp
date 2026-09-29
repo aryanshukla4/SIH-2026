@@ -3,11 +3,11 @@
 // Lives under gpu/, not src/solver/ directly: it calls Modules 7, 9, 10, 12,
 // 13, 14, 15 and 16, all of which are GPU-boundary functions, so it belongs
 // in sovsolve_solver_gpu for the same reason they do (see the module list in
-// architecture.txt "## GPU boundary" and Regularization.hpp's header
+// docs/spec/architecture.txt "## GPU boundary" and Regularization.hpp's header
 // comment on why this avoids a link cycle between sovsolve_solver and
 // sovsolve_solver_gpu).
 //
-// module.txt Module 8: "affine solve, affine primal/dual step lengths,
+// docs/spec/module.txt Module 8: "affine solve, affine primal/dual step lengths,
 // mu_aff, sigma = clamp((mu_aff/mu)^3, 0, 1), corrector RHS including cross
 // terms for lower/upper/slack pairs, corrector solve, final directions,
 // separate primal/dual step lengths." Sequence, when
@@ -44,7 +44,7 @@
 //      Newton system, the same way NewtonRecovery.hpp's gap is verified.
 //   7. build_kkt + solve + recover_newton_direction again, on the corrector
 //      system -- this OVERWRITES state.dx/ds/dy/dz/dv with the final
-//      direction. NOT reused from step 4's factorization (module.txt
+//      direction. NOT reused from step 4's factorization (docs/spec/module.txt
 //      Module 8's "reuse structure where valid" is not implemented -- the
 //      dense cuSOLVER stopgap in LinearSolver.hpp factorizes from scratch
 //      both times; a real factorization-reuse path needs the sparse solver

@@ -23,7 +23,7 @@ using model::Options;
 ///     on clean solve: delta <- max(delta / decay, floor)
 ///
 /// At delta_max with factorization still failing, the caller must report
-/// NumericalError rather than escalate further (module.txt Module 11).
+/// NumericalError rather than escalate further (docs/spec/module.txt Module 11).
 ///
 /// Header-only (not paired with a .cpp): gpu::run_iteration (PredictorCorrector,
 /// in sovsolve_solver_gpu) is the only real caller, and it must not create a

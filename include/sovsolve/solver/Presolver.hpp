@@ -1,19 +1,19 @@
 // Module 4. Presolver -- safe, reversible reductions on the canonical
 // problem, run once between canonicalization and scaling
-// (gpu/Solve.cu::solve_problem). module.txt section 4.
+// (gpu/Solve.cu::solve_problem). docs/spec/module.txt section 4.
 //
 // v1 scope: empty-row removal, empty-column removal (folding an inert
 // column into the existing `RemoveFixedVariable` machinery, or detecting a
 // provable unbounded direction), and free-column-singleton substitution --
 // all iterated to a fixed point, since eliminating one thing can create
 // another ("Re-check empty rows after every reduction pass. This module
-// GENERATES them," module.txt section 4). `analysis::MatrixAnalysis`
+// GENERATES them," docs/spec/module.txt section 4). `analysis::MatrixAnalysis`
 // already detects everything this consumes (`empty_rows`, `empty_columns`,
 // `free_column_singletons()`) -- this module is what ACTS on that, which
 // nothing did before it existed.
 //
 // Deliberately NOT in this pass: singleton-row bound-tightening and
-// duplicate-row/column merging. Both are real `module.txt` §4 items, but
+// duplicate-row/column merging. Both are real `docs/spec/module.txt` §4 items, but
 // their dual recovery is materially harder than free-column-singleton
 // substitution -- tightening a bound changes which of a column's `z`/`v`
 // is active in the ORIGINAL space vs. the reduced problem's space, which
@@ -38,7 +38,7 @@ using model::TransformStack;
 /// Reduces `problem` in place, pushing reversible transforms onto
 /// `transforms` -- the SAME stack `canonicalize()` already started (see
 /// `Solve.cu`'s call order: canonicalize -> presolve -> scale -> initialize).
-/// A no-op when `options.presolve.enabled` is false (module.txt: the
+/// A no-op when `options.presolve.enabled` is false (docs/spec/module.txt: the
 /// Presolver "must not depend on" the canonicalizer's startability contract,
 /// and callers may switch it off).
 ///
@@ -81,7 +81,7 @@ using model::TransformStack;
 /// row's one-sided canonical form (a POSITIVE leftover RHS there is unused
 /// slack, not a violation; only equality rows require exact zero); returns
 /// `core::ErrorCode::PrimalInfeasible` otherwise -- never regularized away
-/// (module.txt is explicit: doing so turns a provable infeasibility into an
+/// (docs/spec/module.txt is explicit: doing so turns a provable infeasibility into an
 /// unexplained NUMERICAL_FAILURE downstream).
 ///
 /// **Singleton-row bound tightening / forcing.** A singleton row `i` (one

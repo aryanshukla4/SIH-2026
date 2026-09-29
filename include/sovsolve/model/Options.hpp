@@ -287,7 +287,7 @@ struct LogOptions {
 };
 
 /// Module 4 controls. Presolve is safe and reversible by construction (see
-/// solver/Presolver.hpp), but module.txt is explicit that startability
+/// solver/Presolver.hpp), but docs/spec/module.txt is explicit that startability
 /// (the canonicalizer's contract) "must not depend on the Presolver, which
 /// can be switched off" -- this is that switch.
 struct PresolveOptions {

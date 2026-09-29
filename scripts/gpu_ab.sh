@@ -1,5 +1,5 @@
 #!/bin/bash
-# CPU vs GPU A/B for PDLP's SpMV backend (module.txt section 24E).
+# CPU vs GPU A/B for PDLP's SpMV backend (docs/spec/module.txt section 24E).
 #
 #   wsl bash scripts/gpu_ab.sh                      # the default instance set
 #   wsl bash scripts/gpu_ab.sh path/to/model.mps    # one or more of your own

@@ -2,7 +2,7 @@
 // linear solver) to factorize.
 //
 // Reuses SparseMatrixPair/RealVector rather than introducing a new unifying
-// Matrix type. datatypes.txt section 3 asks for a single public Matrix type
+// Matrix type. docs/spec/datatypes.txt section 3 asks for a single public Matrix type
 // with no separate CSR/CSC classes; the codebase already deviates from that
 // (see core/SparseMatrix.hpp's header comment) because CSR-only forces GPU
 // atomics or a cache-hostile scatter for A'*y. A second, parallel matrix

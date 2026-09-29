@@ -165,7 +165,7 @@ void print_usage(const char* argv0) {
       "  --branching=most-fractional|pseudocost|reliability\n"
       "                        MilpOptions::branching (default reliability). A\n"
       "                        MILP with --method=dual-simplex or primal-simplex\n"
-      "                        runs the host branch-and-bound (module.txt 28).\n"
+      "                        runs the host branch-and-bound (docs/spec/module.txt 28).\n"
       "  --mip-conflicts=0|1   MilpOptions::conflict_analysis (default 1): CIP ch. 11\n"
       "  (OURS -- chosen here, not taken from a paper; tune freely:)\n"
       "  --mip-conflict-age=N  MilpOptions::conflict_max_age (default 1000)\n"
@@ -207,7 +207,7 @@ void print_usage(const char* argv0) {
 /// sits below `solver` and must not know about it.
 bool gpu_spmv = false;
 bool gpu_spmv_timing = false;
-/// The whole PDLP iterate on the device (module.txt 24F), not just `K`.
+/// The whole PDLP iterate on the device (docs/spec/module.txt 24F), not just `K`.
 bool gpu_resident = false;
 /// Module 31: CUDA graphs over the resident Halpern loop. A flag so the gain
 /// is measured against the identical launch sequence issued directly.

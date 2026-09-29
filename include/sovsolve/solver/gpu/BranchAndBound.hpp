@@ -1,7 +1,7 @@
-// Module 22 (added post-v3, see module.txt): branch-and-bound over the
+// Module 22 (added post-v3, see docs/spec/module.txt): branch-and-bound over the
 // existing continuous LP/QP relaxation solver.
 //
-// Not in the original locked module.txt spec, which predates any MILP
+// Not in the original locked docs/spec/module.txt spec, which predates any MILP
 // requirement. Recorded there as its own module rather than folded silently
 // into an existing one, matching the file's own "no module silently
 // implements another module's job" rule.
@@ -20,7 +20,7 @@
 // Warm-starting an interior-point method across a bound change is itself a
 // hard, still-researched problem (it is the reason production MILP solvers
 // use simplex, which warm-starts trivially, for node relaxations instead of
-// IPM). Cold-starting is correct, just not fast -- see the module.txt Module
+// IPM). Cold-starting is correct, just not fast -- see the docs/spec/module.txt Module
 // 22 entry for the honest scope statement.
 
 #ifndef SOVSOLVE_SOLVER_GPU_BRANCH_AND_BOUND_HPP

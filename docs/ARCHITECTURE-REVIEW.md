@@ -206,7 +206,7 @@ The distinction that matters:
 > FP64). It is **not** a GPU-vs-CPU speedup; that is a different quantity
 > (~192 GB/s against a laptop's ~51 GB/s of DDR4, so under 4× as a ceiling).
 >
-> **Measured 2026-09-15** (`module.txt` §24E, `--method=pdlp --gpu-spmv=1`),
+> **Measured 2026-09-15** (`docs/spec/module.txt` §24E, `--method=pdlp --gpu-spmv=1`),
 > identical `matrix_products` on both paths:
 >
 > | instance | size | CPU | GPU | |
@@ -225,7 +225,7 @@ The distinction that matters:
 > means *this* GPU is, and the matrix-free design is what makes the code
 > portable to one where it isn't.
 >
-> **Residency was built on 2026-09-19** (`module.txt` §24F): `datt256`
+> **Residency was built on 2026-09-19** (`docs/spec/module.txt` §24F): `datt256`
 > 16.02 s → 4.47 s (3.6×), `bab2` 15.96 s → 3.32 s (4.8×). `bab2` beats the
 > "~3.8× ceiling" above, which exposes an assumption in it: the ceiling is the
 > bandwidth ratio against a CPU that *saturates* its memory bus, and our CPU

@@ -1,6 +1,6 @@
 // Module 20: presentation only. Reads an iteration record and writes concise
 // human-readable output. Kept independent of both Diagnostics (the data
-// record) and the solver math, per module.txt Module 20.
+// record) and the solver math, per docs/spec/module.txt Module 20.
 
 #ifndef SOVSOLVE_SOLVER_LOGGING_HPP
 #define SOVSOLVE_SOLVER_LOGGING_HPP

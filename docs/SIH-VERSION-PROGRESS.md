@@ -258,7 +258,7 @@ vendored `HiGHS/` tree contains its own dual simplex at `HiGHS/highs/simplex/HEk
 **We did not read it**, deliberately, and `docs/HIGHS-COMPARISON.md` §1 now sets out
 component by component which published mathematical definition each piece was built from.
 The honest evidence that it is an independent derivation is **the shape of the bugs it
-produced** — all six are written down in `module.txt` §23: a sign convention that had to
+produced** — all six are written down in `docs/spec/module.txt` §23: a sign convention that had to
 be re-derived from scratch, a basis check that counted statuses instead of detecting a
 duplicated slot, an artificially-bounded subproblem's infeasibility mistaken for a verdict
 about the real model, and a Bland's-rule latch that never released and left `greenbea`
@@ -288,7 +288,7 @@ and the third is unblocked but not yet delivered.
 
 *(Later update: dual steepest edge pricing and cost perturbation were both added once
 branch-and-bound made the dual simplex the bottleneck, and the host branch-and-bound of
-Module 28 warm-starts every node from its parent's basis. See module.txt, section 28.)*
+Module 28 warm-starts every node from its parent's basis. See docs/spec/module.txt, section 28.)*
 
 **How to say it simply:** *"Pehle humare paas sirf ek hi tarika tha LP solve karne ka, aur
 19 mein se sirf 6–7 problems theek se solve ho rahe the. Ab humne ek doosra, bilkul alag
@@ -348,7 +348,7 @@ rule we applied to HiGHS's simplex in Version 5.)
 ### (b) The solver can now say WHICH constraints are wrong
 
 Previously the best answer to a broken model was "infeasible". Now
-(`module.txt` §26) it returns an **irreducible infeasible subsystem** — the
+(`docs/spec/module.txt` §26) it returns an **irreducible infeasible subsystem** — the
 specific rows that contradict each other, where dropping any one of them makes
 the rest satisfiable.
 

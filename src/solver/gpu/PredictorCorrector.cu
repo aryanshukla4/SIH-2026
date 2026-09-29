@@ -218,7 +218,7 @@ core::RealVector unregularized_residual(const CanonicalProblem& problem, Real de
 /// no new branching needed for "this Krylov solve didn't converge."
 ///
 /// At delta_max with that signal still set, this does NOT report
-/// NumericalError -- architecture.txt's "at delta_max with factorization
+/// NumericalError -- docs/spec/architecture.txt's "at delta_max with factorization
 /// still failing, report NumericalError" means exact singularity/breakdown,
 /// not "still somewhat ill-conditioned". A high pivot ratio (or a
 /// non-converged Krylov solve) at delta_max is the EXPECTED, harmless

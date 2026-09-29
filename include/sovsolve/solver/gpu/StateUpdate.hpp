@@ -1,6 +1,6 @@
 // Module 15: x += ap*dx, s += ap*ds, y += ad*dy, z += ad*dz, v += ad*dv.
 // Must not run until Module 19 (Diagnostics) has recorded the iteration that
-// produced `state`'s direction fields -- module.txt Module 15.
+// produced `state`'s direction fields -- docs/spec/module.txt Module 15.
 
 #ifndef SOVSOLVE_SOLVER_GPU_STATE_UPDATE_HPP
 #define SOVSOLVE_SOLVER_GPU_STATE_UPDATE_HPP

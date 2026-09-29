@@ -1,7 +1,7 @@
 // Presolver (Module 4) property tests.
 //
 // Each rule is checked independently, against hand-built tiny problems whose
-// expected outcome is worked out from the spec (module.txt section 4,
+// expected outcome is worked out from the spec (docs/spec/module.txt section 4,
 // Presolver.hpp's doc comment) rather than read out of the implementation --
 // the same discipline tests/property/canonical_test.cpp already uses.
 
