@@ -3,9 +3,15 @@
 #include <algorithm>
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <cuda_runtime.h>
 #include <cusparse.h>
+
+#ifdef SOVSOLVE_HAVE_CUDSS
+#include <cudss.h>
+#endif
 
 namespace sovsolve::solver::gpu {
 
@@ -412,5 +418,210 @@ Status ic0_apply(const Real* r_device, Real* z_device, std::size_t m) {
       "cusparseSpSV_solve(U)");
   return st;
 }
+
+// ---------------------------------------------------------------------------
+// cuDSS: the exact factor. See Preconditioner.hpp.
+// ---------------------------------------------------------------------------
+
+#ifdef SOVSOLVE_HAVE_CUDSS
+
+namespace {
+
+Status cudss_check(cudssStatus_t st, const char* what) {
+  if (st == CUDSS_STATUS_SUCCESS) return Status::Ok();
+  return core::make_error(core::ErrorCode::NumericalError,
+                          std::string(what) + " failed (cudssStatus " +
+                              std::to_string(static_cast<int>(st)) + ")");
+}
+
+struct PersistentCudssContext {
+  cudssHandle_t handle = nullptr;
+  cudssConfig_t config = nullptr;
+  cudssData_t data = nullptr;
+  cudssMatrix_t mat = nullptr;
+  cudssMatrix_t x = nullptr;
+  cudssMatrix_t b = nullptr;
+
+  int* offsets = nullptr;
+  int* indices = nullptr;
+  double* values = nullptr;
+  double* xbuf = nullptr;
+  double* bbuf = nullptr;
+
+  /// The pattern the cached analysis belongs to.
+  std::vector<int> host_offsets, host_indices;
+  std::size_t m = 0;
+  bool ready = false;
+
+  void release() {
+    if (mat) cudssMatrixDestroy(mat);
+    if (x) cudssMatrixDestroy(x);
+    if (b) cudssMatrixDestroy(b);
+    if (data && handle) cudssDataDestroy(handle, data);
+    mat = x = b = nullptr;
+    data = nullptr;
+    if (offsets) cudaFree(offsets);
+    if (indices) cudaFree(indices);
+    if (values) cudaFree(values);
+    if (xbuf) cudaFree(xbuf);
+    if (bbuf) cudaFree(bbuf);
+    offsets = indices = nullptr;
+    values = xbuf = bbuf = nullptr;
+    host_offsets.clear();
+    host_indices.clear();
+    m = 0;
+    ready = false;
+  }
+
+  ~PersistentCudssContext() {
+    release();
+    if (config) cudssConfigDestroy(config);
+    if (handle) cudssDestroy(handle);
+  }
+};
+
+PersistentCudssContext& cudss_context() {
+  static PersistentCudssContext ctx;
+  return ctx;
+}
+
+}  // namespace
+
+bool cudss_available() noexcept { return true; }
+
+Status cudss_build(const core::SparseMatrixPair<>& a, const RealVector& theta,
+                   const RealVector& diag_add, const std::vector<bool>& is_dense_column) {
+  PersistentCudssContext& dev = cudss_context();
+  dev.ready = false;
+  const std::size_t m = a.rows();
+  if (m == 0) return Status::Ok();
+
+  std::vector<int> offsets, indices;
+  std::vector<double> values;
+  build_host_pattern(a, theta, diag_add, is_dense_column, offsets, indices, values);
+  const std::size_t nnz = indices.size();
+
+  Status st = Status::Ok();
+  if (!dev.handle) {
+    st = cudss_check(cudssCreate(&dev.handle), "cudssCreate");
+    if (!st.ok()) return st;
+    st = cudss_check(cudssConfigCreate(&dev.config), "cudssConfigCreate");
+    if (!st.ok()) return st;
+  }
+
+  const bool same_pattern =
+      dev.mat != nullptr && dev.m == m && dev.host_offsets == offsets && dev.host_indices == indices;
+  if (!same_pattern) {
+    dev.release();
+    st = cuda_check(cudaMalloc(&dev.offsets, (m + 1) * sizeof(int)), "cudaMalloc(cudss off)");
+    if (!st.ok()) return st;
+    st = cuda_check(cudaMalloc(&dev.indices, nnz * sizeof(int)), "cudaMalloc(cudss idx)");
+    if (!st.ok()) return st;
+    st = cuda_check(cudaMalloc(&dev.values, nnz * sizeof(double)), "cudaMalloc(cudss val)");
+    if (!st.ok()) return st;
+    st = cuda_check(cudaMalloc(&dev.xbuf, m * sizeof(double)), "cudaMalloc(cudss x)");
+    if (!st.ok()) return st;
+    st = cuda_check(cudaMalloc(&dev.bbuf, m * sizeof(double)), "cudaMalloc(cudss b)");
+    if (!st.ok()) return st;
+    st = cuda_check(cudaMemcpy(dev.offsets, offsets.data(), (m + 1) * sizeof(int),
+                               cudaMemcpyHostToDevice),
+                    "cudaMemcpy(cudss off)");
+    if (!st.ok()) return st;
+    st = cuda_check(
+        cudaMemcpy(dev.indices, indices.data(), nnz * sizeof(int), cudaMemcpyHostToDevice),
+        "cudaMemcpy(cudss idx)");
+    if (!st.ok()) return st;
+    st = cudss_check(cudssDataCreate(dev.handle, &dev.data), "cudssDataCreate");
+    if (!st.ok()) return st;
+    const auto m64 = static_cast<int64_t>(m);
+    st = cudss_check(cudssMatrixCreateCsr(&dev.mat, m64, m64, static_cast<int64_t>(nnz),
+                                          dev.offsets, nullptr, dev.indices, dev.values,
+                                          CUDSS_R_32I, CUDSS_R_32I, CUDSS_R_64F,
+                                          CUDSS_MTYPE_SPD,
+                                          CUDSS_MVIEW_LOWER, CUDSS_BASE_ZERO),
+                     "cudssMatrixCreateCsr");
+    if (!st.ok()) return st;
+    st = cudss_check(
+        cudssMatrixCreateDn(&dev.x, m64, 1, m64, dev.xbuf, CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR),
+        "cudssMatrixCreateDn(x)");
+    if (!st.ok()) return st;
+    st = cudss_check(
+        cudssMatrixCreateDn(&dev.b, m64, 1, m64, dev.bbuf, CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR),
+        "cudssMatrixCreateDn(b)");
+    if (!st.ok()) return st;
+    dev.host_offsets = std::move(offsets);
+    dev.host_indices = std::move(indices);
+    dev.m = m;
+  }
+
+  st = cuda_check(
+      cudaMemcpy(dev.values, values.data(), nnz * sizeof(double), cudaMemcpyHostToDevice),
+      "cudaMemcpy(cudss val)");
+  if (!st.ok()) return st;
+
+  if (!same_pattern) {
+    st = cudss_check(cudssExecute(dev.handle, CUDSS_PHASE_ANALYSIS, dev.config, dev.data,
+                                  dev.mat, dev.x, dev.b),
+                     "cudssExecute(analysis)");
+    if (!st.ok()) {
+      dev.release();
+      return st;
+    }
+  }
+  st = cudss_check(cudssExecute(dev.handle, CUDSS_PHASE_FACTORIZATION, dev.config, dev.data,
+                                dev.mat, dev.x, dev.b),
+                   "cudssExecute(factorization)");
+  if (!st.ok()) return st;
+
+  // A Cholesky that met a non-positive pivot reports it here, not through the
+  // status: the factor is unusable, so the caller falls back.
+  int info = 0;
+  std::size_t written = 0;
+  st = cudss_check(cudssDataGet(dev.handle, dev.data, CUDSS_DATA_INFO, &info, sizeof(info),
+                                &written),
+                   "cudssDataGet(info)");
+  if (!st.ok()) return st;
+  if (info != 0) {
+    return core::make_error(core::ErrorCode::NumericalError,
+                            "cudss_build: Cholesky met a non-positive pivot (info " +
+                                std::to_string(info) + ")");
+  }
+  dev.ready = true;
+  return Status::Ok();
+}
+
+Status cudss_apply(const Real* r_device, Real* z_device, std::size_t m) {
+  PersistentCudssContext& dev = cudss_context();
+  if (!dev.ready || dev.m != m) {
+    return core::make_error(core::ErrorCode::NumericalError, "cudss_apply: no factor");
+  }
+  Status st = cuda_check(
+      cudaMemcpy(dev.bbuf, r_device, m * sizeof(double), cudaMemcpyDeviceToDevice),
+      "cudaMemcpy(cudss r->b)");
+  if (!st.ok()) return st;
+  st = cudss_check(cudssExecute(dev.handle, CUDSS_PHASE_SOLVE, dev.config, dev.data, dev.mat,
+                                dev.x, dev.b),
+                   "cudssExecute(solve)");
+  if (!st.ok()) return st;
+  return cuda_check(cudaMemcpy(z_device, dev.xbuf, m * sizeof(double), cudaMemcpyDeviceToDevice),
+                    "cudaMemcpy(cudss x->z)");
+}
+
+#else  // no cuDSS in this build
+
+bool cudss_available() noexcept { return false; }
+
+Status cudss_build(const core::SparseMatrixPair<>&, const RealVector&, const RealVector&,
+                   const std::vector<bool>&) {
+  return core::make_error(core::ErrorCode::UnsupportedFeature,
+                          "cudss_build: this build does not link cuDSS");
+}
+
+Status cudss_apply(const Real*, Real*, std::size_t) {
+  return core::make_error(core::ErrorCode::UnsupportedFeature,
+                          "cudss_apply: this build does not link cuDSS");
+}
+
+#endif  // SOVSOLVE_HAVE_CUDSS
 
 }  // namespace sovsolve::solver::gpu

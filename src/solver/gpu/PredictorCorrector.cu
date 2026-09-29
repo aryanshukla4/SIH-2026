@@ -245,7 +245,8 @@ Status solve_newton_system(const CanonicalProblem& problem, const Residuals& res
       if (!st.ok()) return st;
 
       Expected<LinearSolveResult> linear =
-          solve_spd_cg(ne_system, options.ipm.cg_tolerance, options.ipm.cg_max_iterations);
+          solve_spd_cg(ne_system, options.ipm.cg_tolerance, options.ipm.cg_max_iterations,
+                       options.ipm.direct);
       if (!linear.has_value()) return linear.error();
 
       if (linear->pivot_ratio > options.ipm.max_pivot_ratio) {
@@ -299,7 +300,8 @@ Status solve_newton_system(const CanonicalProblem& problem, const Residuals& res
         if (!st.ok()) return st;
 
         Expected<LinearSolveResult> correction =
-            solve_spd_cg(ne_correction, options.ipm.cg_tolerance, options.ipm.cg_max_iterations);
+            solve_spd_cg(ne_correction, options.ipm.cg_tolerance, options.ipm.cg_max_iterations,
+                       options.ipm.direct);
         if (!correction.has_value()) return correction.error();
 
         core::RealVector dx_correction =
