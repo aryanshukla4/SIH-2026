@@ -85,10 +85,23 @@ void log_concurrent_race(const ConcurrentReport& report, const LogOptions& optio
                  e.iterations, e.won ? "<-- winner" : "");
   }
   if (report.crossover_ran) {
-    std::fprintf(out, "  %-16s %-14s %10.3fs  iters=%-8zu %s\n", "crossover",
-                 spell(report.crossover_status), report.crossover_seconds,
+    std::fprintf(out,
+                 "  %-16s %-14s %10.3fs  iters=%-8zu %s  (superbasic=%zu push_pivots=%zu "
+                 "dual_superbasic=%zu dual_pivots=%zu)\n",
+                 "crossover", spell(report.crossover_status), report.crossover_seconds,
                  report.crossover_iterations,
-                 report.crossover_used ? "<-- vertex returned" : "(winner's answer kept)");
+                 report.crossover_used ? "<-- vertex returned"
+                 : report.crossover_status == core::SolverStatus::Optimal
+                     ? "(vertex disagreed; winner's answer kept)"
+                     : "(winner's answer kept)",
+                 report.crossover_superbasic, report.crossover_push_pivots,
+                 report.crossover_dual_superbasic, report.crossover_dual_pivots);
+    std::fprintf(out,
+                 "  %-16s crash %.3fs (repairs=%zu)  primal push %.3fs  dual push %.3fs  "
+                 "cleanup %.3fs  |obj - winner| %.1e\n",
+                 "", report.crossover_crash_seconds, report.crossover_repairs,
+                 report.crossover_primal_push_seconds, report.crossover_dual_push_seconds,
+                 report.crossover_cleanup_seconds, report.crossover_disagreement);
   }
 }
 

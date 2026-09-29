@@ -173,12 +173,14 @@ class LuFactorization {
 
  private:
   /// The factorization proper. When elimination stalls and the out-params are
-  /// given, they receive a row and a slot that were still active at the stall
-  /// -- the information `factorize_repairing` needs to choose a substitution,
-  /// and the reason the repair loop does not have to guess.
+  /// given, they receive EVERY row and slot still active at the stall, slots
+  /// holding structural columns first -- the information `factorize_repairing`
+  /// needs to choose its substitutions, and the reason the repair loop does
+  /// not have to guess. The two lists have the same length: each elimination
+  /// step retires one row and one slot.
   [[nodiscard]] Status factorize_impl(const AugmentedMatrix& matrix, const Basis& basis,
-                                      Real pivot_tolerance, std::size_t* stall_row,
-                                      std::size_t* stall_slot);
+                                      Real pivot_tolerance, std::vector<std::size_t>* stall_rows,
+                                      std::vector<std::size_t>* stall_slots);
 
   void apply_etas_forward(core::HostSpan<Real> v) const;
   void apply_etas_reverse(core::HostSpan<Real> v) const;
