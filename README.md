@@ -81,7 +81,15 @@ Needs a C++20 compiler, CMake ≥ 3.24 and Ninja.
 ```sh
 cmake --preset release
 cmake --build build
-ctest --test-dir build --output-on-failure      # 28 test suites
+ctest --test-dir build --output-on-failure      # 29 test suites
+```
+
+Optional, Linux/WSL only: install SuiteSparse first and the CPU interior point
+(`--method=hsd`) factors its normal equations with CHOLMOD. Without it, the
+in-house sparse LDL' does the same job, only slower on the largest models.
+
+```sh
+sudo apt-get install -y libsuitesparse-dev   # then re-run cmake --preset ...
 ```
 
 ### 2. Build — with the GPU engines (Linux or WSL2 + CUDA toolkit)
@@ -90,7 +98,7 @@ ctest --test-dir build --output-on-failure      # 28 test suites
 export PATH=/usr/local/cuda/bin:$PATH
 cmake --preset cuda
 cmake --build build-cuda
-ctest --test-dir build-cuda --output-on-failure # 31 test suites
+ctest --test-dir build-cuda --output-on-failure # 32 test suites
 ```
 
 A CPU-only build still has every engine except the GPU ones, and says so
