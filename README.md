@@ -339,3 +339,15 @@ The main sources, as cited in the code; the full list is in
   Inequalities*, ORSA J. Computing, 1990 — the IIS.
 - H. P. Williams, *Model Building in Mathematical Programming*, 5th ed.,
   Wiley, 2013 — the refinery example.
+
+---
+
+## Contributing
+
+Bug reports, failing models and pull requests are welcome. Read
+[CONTRIBUTING.md](CONTRIBUTING.md) for how to build, test and submit a change,
+and [SECURITY.md](SECURITY.md) for reporting security problems privately.
+
+## License
+
+SovSolve is licensed under the [Apache License 2.0](LICENSE).
