@@ -1,0 +1,39 @@
+name: Bug report
+description: A wrong answer, wrong status, crash or build failure
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you got, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and output
+      description: The exact command line and the solver's output.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: model
+    attributes:
+      label: Model file
+      description: Attach the `.mps`, `.lp` or `.qplib` file (zip it if GitHub refuses the extension), or link to it. If it is a public benchmark model, its name is enough.
+  - type: input
+    id: version
+    attributes:
+      label: Commit
+      description: Output of `git rev-parse --short HEAD`.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS, compiler and version, and GPU/CUDA version if relevant.
+      placeholder: Ubuntu 24.04, GCC 13.3, CPU only
+    validations:
+      required: true
