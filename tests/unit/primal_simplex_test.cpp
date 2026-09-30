@@ -221,11 +221,10 @@ End
   CHECK_NEAR(solution.x[1], 6.0, 1e-7);
 }
 
-/// Degenerate: four rows bind at a two-variable optimum, so the ratio test
-/// keeps producing zero-length steps. Dantzig pricing can cycle on that, which
-/// is why Bland's rule exists as a fallback -- and why it has to be switched
-/// back OFF once real movement resumes. The requirement here is termination
-/// with the right answer.
+/// Degenerate: four rows bind at a two-variable optimum, so a textbook ratio
+/// test keeps producing zero-length steps. EXPAND (Gill, Murray, Saunders &
+/// Wright 1989) makes every step positive instead. The requirement here is
+/// termination with the right answer.
 ///
 ///   min x + y  s.t.  x + y >= 2, x >= 1, y >= 1, x + 2y >= 3  ->  (1,1), obj 2
 void test_degenerate_terminates() {
@@ -246,6 +245,37 @@ End
   CHECK_NEAR(solution.objective, 2.0, 1e-9);
   CHECK_NEAR(solution.x[0], 1.0, 1e-7);
   CHECK_NEAR(solution.x[1], 1.0, 1e-7);
+}
+
+/// Beale's (1955) example, which cycles forever under Dantzig pricing with a
+/// textbook ratio test: the start is degenerate in both rows, and six pivots
+/// bring back the starting basis. EXPAND's steps are never zero, so no basis
+/// can repeat.
+///
+///   min -3/4 x4 + 20 x5 - 1/2 x6 + 6 x7
+///   s.t. 1/4 x4 -  8 x5 -     x6 + 9 x7 <= 0
+///        1/2 x4 - 12 x5 - 1/2 x6 + 3 x7 <= 0
+///                             x6        <= 1,   x >= 0
+///
+/// Row 2 caps x4 at x6, so x4 = x6 = 1 gives -5/4. Raising x5 by e frees 24e
+/// of x4 in row 2: a gain of 18e against a cost of 20e, so it stays at zero.
+void test_beale_cycling_example() {
+  model::Solution solution;
+  if (!solve("beale", R"(Minimize
+ obj: - 0.75 x4 + 20 x5 - 0.5 x6 + 6 x7
+Subject To
+ r1: 0.25 x4 - 8 x5 - x6 + 9 x7 <= 0
+ r2: 0.5 x4 - 12 x5 - 0.5 x6 + 3 x7 <= 0
+ r3: x6 <= 1
+End
+)",
+             solution)) {
+    return;
+  }
+  CHECK(solution.status == SolverStatus::Optimal);
+  CHECK_NEAR(solution.objective, -1.25, 1e-9);
+  CHECK_NEAR(solution.x[0], 1.0, 1e-7);
+  CHECK_NEAR(solution.x[2], 1.0, 1e-7);
 }
 
 /// The sign convention, checked independently of the dual's implementation of
@@ -406,6 +436,7 @@ int main() {
   test_unbounded_is_detected();
   test_free_variable_needs_no_box();
   test_degenerate_terminates();
+  test_beale_cycling_example();
   test_dual_signs();
   test_composite_handoff_skips_phase1();
   test_both_engines_agree();

@@ -53,6 +53,19 @@
 // sum is still positive is a PROOF of primal infeasibility: the minimum total
 // violation over the whole polytope is positive.
 //
+// --------------------------------------------------------------------------
+// Degeneracy: EXPAND
+// --------------------------------------------------------------------------
+//
+// On a degenerate vertex the textbook ratio test returns zero-length steps,
+// and nothing stops a sequence of bases from repeating. The ratio test here is
+// the EXPAND procedure (Gill, Murray, Saunders & Wright, Math. Prog. 45,
+// 1989): a working feasibility tolerance grows a little every iteration, so
+// every step is positive and the objective strictly falls. A leaving variable
+// may stay up to that tolerance past its bound until a periodic reset puts
+// every nonbasic back. See PrimalSimplex.cpp for the details and
+// docs/TUNABLES.md for the measurements.
+//
 // Derived from the method's definition, not ported -- see
 // docs/HIGHS-COMPARISON.md for why that constraint exists.
 

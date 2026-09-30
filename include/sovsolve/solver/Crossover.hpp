@@ -34,10 +34,10 @@
 //      and the point does not move.
 //
 //   4. CLEANUP. The basis is now primal feasible and close to dual feasible;
-//      the dual simplex, warm-started from it, fixes what is left. (Measured:
-//      the primal simplex is the worse finisher -- it stalls in Bland's rule
-//      on degenerate models, e.g. Netlib truss, which it cannot solve cold
-//      either -- while the dual finishes truss in 688 iterations.)
+//      the dual simplex, warm-started from it, fixes what is left. (Measured
+//      before the primal had EXPAND, when it stalled in Bland's rule on
+//      degenerate models: the dual finished truss in 688 iterations, the
+//      primal not at all. See `ConcurrentOptions::crossover_method`.)
 //
 // This header provides steps 1 to 3; the caller runs step 4 with the
 // existing simplex (ConcurrentSolve.cpp).

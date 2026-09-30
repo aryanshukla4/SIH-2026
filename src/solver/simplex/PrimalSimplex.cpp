@@ -1,5 +1,6 @@
 #include "sovsolve/solver/simplex/PrimalSimplex.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -23,14 +24,43 @@ using detail::SimplexEngine;
 /// magnitude comparison.
 constexpr Real kNoLimit = std::numeric_limits<Real>::max();
 
-/// Consecutive zero-length steps before the pricing rule switches to Bland's.
-///
-/// Dantzig pricing can cycle on a degenerate vertex -- the basis changes, the
-/// point does not, and the same sequence of bases can repeat forever. Bland's
-/// rule (always the lowest-index eligible column, and the lowest-index tie on
-/// the way out) is provably non-cycling but picks poor pivots, so it is held
-/// back until degeneracy actually persists rather than paid for throughout.
-constexpr std::size_t kDegenerateStepsBeforeBland = 100;
+// --------------------------------------------------------------------------
+// EXPAND: Gill, Murray, Saunders & Wright, "A practical anti-cycling procedure
+// for linearly constrained optimization", Math. Prog. 45 (1989)
+// --------------------------------------------------------------------------
+//
+// On a degenerate vertex the textbook ratio test returns a step of zero: the
+// basis changes, the point does not, and nothing stops the same bases from
+// repeating. EXPAND makes every step positive instead. A working feasibility
+// tolerance `delta` grows by `tau` at every iteration (section 4.2); each
+// variable was within the previous tolerance, so each is strictly inside the
+// new one and a step of at least `tau / |pivot|` is always possible (4.3).
+// With the objective strictly falling at every step no basis can repeat.
+//
+// The price is that a leaving variable may become nonbasic slightly OFF its
+// bound (by at most `delta`). It keeps that value until a reset (section 4.3)
+// puts every nonbasic back on its bound: after `K` iterations, and on each
+// tentative verdict.
+//
+// This replaced Bland's rule after 100 zero steps, which cannot cycle but
+// picks such poor pivots that Netlib `truss` had not finished after
+// 491,000 iterations.
+
+/// K, the iterations in one expanding sequence (section 4.2: K = eps^(-1/4)
+/// = 10^4 for double precision).
+constexpr std::size_t kExpandIterations = 10000;
+
+/// delta_0 and delta_K as fractions of the master tolerance delta_f
+/// (section 4.2: 0.5 and 0.99). delta_f is OUR `primal_feasibility_tolerance`
+/// (1e-7) rather than the paper's eps^(3/8) = 1e-6, so a verdict means what it
+/// meant before EXPAND.
+constexpr Real kExpandStart = 0.5;
+constexpr Real kExpandEnd = 0.99;
+
+/// R, the resets allowed on a tentative verdict (section 4.3 suggests 1, or 2
+/// for badly conditioned problems). After R, the point is accepted as it
+/// stands: every variable is within delta < delta_f of its bounds.
+constexpr std::size_t kTerminationResets = 2;
 
 enum class Step : std::uint8_t {
   Pivoted,      ///< a basis change, or a bound flip, happened
@@ -46,6 +76,11 @@ class PrimalSolver : public SimplexEngine {
       : SimplexEngine(problem, options) {
     d1_.assign(total_, 0.0);
     y1_.assign(m_, 0.0);
+    preserve_nonbasic_values_ = true;
+    const Real master = opt_.primal_feasibility_tolerance;
+    delta_start_ = kExpandStart * master;
+    tau_ = (kExpandEnd - kExpandStart) * master / static_cast<Real>(kExpandIterations);
+    delta_ = delta_start_;
   }
 
   [[nodiscard]] core::Expected<SimplexResult> run(const Basis* warm_start);
@@ -55,20 +90,39 @@ class PrimalSolver : public SimplexEngine {
   /// not re-place nonbasic columns to tidy up reduced costs -- moving a
   /// nonbasic is a change to the very thing being protected. If a basis repair
   /// has cost primal feasibility, the next iteration simply finds a positive
-  /// total infeasibility and re-enters phase 1, which is the correct response
-  /// and needs no special handling here.
-  void on_refactorized(bool /*repaired*/) override {}
+  /// total infeasibility and re-enters phase 1, which is the correct response.
+  /// A repair re-placed every nonbasic on its bound, which is an EXPAND reset,
+  /// so the expanding sequence restarts with it.
+  void on_refactorized(bool repaired) override {
+    if (repaired) restart_expanding_sequence();
+  }
 
+  /// A basic variable counts as infeasible when it is beyond `delta`, the
+  /// working tolerance (section 7.1).
   [[nodiscard]] Real total_infeasibility() const;
+  [[nodiscard]] Real max_infeasibility() const;
   void compute_phase1_duals();
   [[nodiscard]] std::size_t choose_entering(Real& direction) const;
   [[nodiscard]] Step iterate();
 
+  void restart_expanding_sequence() {
+    delta_ = delta_start_;
+    expand_iterations_ = 0;
+  }
+  /// Section 4.3: every nonbasic back on its bound, the basic variables
+  /// recomputed from them, and a new expanding sequence.
+  [[nodiscard]] Status reset();
+  [[nodiscard]] bool nonbasic_off_bounds() const;
+
   std::vector<Real> d1_;  ///< phase-1 reduced costs, w space
   std::vector<Real> y1_;  ///< phase-1 row duals, row space
   bool phase1_ = false;
-  bool bland_ = false;
-  std::size_t degenerate_steps_ = 0;
+
+  Real delta_ = 0.0;        ///< the working feasibility tolerance
+  Real delta_start_ = 0.0;  ///< delta_0
+  Real tau_ = 0.0;          ///< its growth per iteration
+  std::size_t expand_iterations_ = 0;
+  std::size_t termination_resets_ = 0;
 };
 
 // --------------------------------------------------------------------------
@@ -76,7 +130,7 @@ class PrimalSolver : public SimplexEngine {
 // --------------------------------------------------------------------------
 
 Real PrimalSolver::total_infeasibility() const {
-  const Real tol = opt_.primal_feasibility_tolerance;
+  const Real tol = delta_;
   Real sum = 0.0;
   for (std::size_t r = 0; r < m_; ++r) {
     const auto bw = static_cast<std::size_t>(basis_.basic[r]);
@@ -90,14 +144,41 @@ Real PrimalSolver::total_infeasibility() const {
   return sum;
 }
 
+Real PrimalSolver::max_infeasibility() const {
+  Real worst = 0.0;
+  for (std::size_t r = 0; r < m_; ++r) {
+    const auto bw = static_cast<std::size_t>(basis_.basic[r]);
+    const Real x = x_basic_[r];
+    worst = std::max(worst, std::max(lower_[bw] - x, x - upper_[bw]));
+  }
+  return worst;
+}
+
+bool PrimalSolver::nonbasic_off_bounds() const {
+  for (std::size_t w = 0; w < total_; ++w) {
+    const VarStatus st = basis_.status[w];
+    if (st == VarStatus::Basic || st == VarStatus::Free) continue;
+    if (value_[w] != working_value(w)) return true;
+  }
+  return false;
+}
+
+Status PrimalSolver::reset() {
+  reset_nonbasic_values();
+  restart_expanding_sequence();
+  return refactorize();
+}
+
 void PrimalSolver::compute_phase1_duals() {
   // The phase-1 objective is `sum of bound violations`. Its gradient with
   // respect to a basic variable is -1 where that variable is below its lower
   // bound (increasing it reduces the violation) and +1 where it is above its
   // upper. A nonbasic variable sits exactly on a bound, so it contributes
   // nothing and its own phase-1 cost is zero -- which is why `d1` below is
-  // `0 - Ahat_j' y1` rather than `c1_j - Ahat_j' y1`.
-  const Real tol = opt_.primal_feasibility_tolerance;
+  // `0 - Ahat_j' y1` rather than `c1_j - Ahat_j' y1`. (Under EXPAND a
+  // nonbasic may be off its bound, but never by more than `delta`, so it is
+  // never counted infeasible.)
+  const Real tol = delta_;
   for (std::size_t r = 0; r < m_; ++r) {
     const auto bw = static_cast<std::size_t>(basis_.basic[r]);
     const Real x = x_basic_[r];
@@ -160,13 +241,6 @@ std::size_t PrimalSolver::choose_entering(Real& direction) const {
       dir = d[w] < 0.0 ? 1.0 : -1.0;
     }
     if (score <= threshold) continue;
-
-    if (bland_) {
-      // Bland's rule: the LOWEST eligible index, unconditionally. Scanning in
-      // increasing `w` means the first eligible column is it.
-      direction = dir;
-      return w;
-    }
     if (score > best_score) {
       best_score = score;
       best = w;
@@ -179,8 +253,14 @@ std::size_t PrimalSolver::choose_entering(Real& direction) const {
 }
 
 Step PrimalSolver::iterate() {
+  // Section 4.2: the working tolerance grows at the start of every iteration,
+  // so every variable -- within the previous tolerance -- is strictly inside
+  // the new one.
+  delta_ += tau_;
+  ++expand_iterations_;
+
   const bool was_phase1 = phase1_;
-  phase1_ = total_infeasibility() > opt_.primal_feasibility_tolerance;
+  phase1_ = total_infeasibility() > 0.0;
   if (phase1_) {
     compute_phase1_duals();
   } else if (was_phase1) {
@@ -191,7 +271,19 @@ Step PrimalSolver::iterate() {
   }
 
   Real direction = 0.0;
-  const std::size_t entering = choose_entering(direction);
+  std::size_t entering = choose_entering(direction);
+  if (entering == total_ && phase1_ &&
+      max_infeasibility() <= opt_.primal_feasibility_tolerance) {
+    // Phase 1 is stuck on violations the working tolerance counts but the
+    // caller's tolerance accepts: `delta` restarts at half of it after every
+    // reset. Before EXPAND this point was feasible, so it must not become a
+    // proof of infeasibility now. Widen `delta` to cover it and go on in
+    // phase 2; the next reset brings `delta` back down.
+    delta_ = std::max(delta_, max_infeasibility());
+    phase1_ = false;
+    compute_dual();
+    entering = choose_entering(direction);
+  }
   if (entering == total_) {
     // Nothing improves the current objective. In phase 2 that is optimality;
     // in phase 1 it means the MINIMUM total bound violation over the whole
@@ -201,20 +293,16 @@ Step PrimalSolver::iterate() {
 
   load_and_ftran_column(entering);
 
-  // Ratio test. `x_q` moves by `t >= 0` in `direction`, so basic variable `r`
-  // moves at `rate = -alpha[r] * direction` per unit of `t`.
-  const Real tol = opt_.primal_feasibility_tolerance;
-  Real best_t = kNoLimit;
-  std::size_t leaving_slot = m_;
-  Real leaving_target = 0.0;
-  bool leaving_to_upper = false;
+  // `x_q` moves by `t >= 0` in `direction`, so basic variable `r` moves at
+  // `rate = -alpha[r] * direction` per unit of `t`. Each basic variable is
+  // classified against the working tolerance: beyond it (phase 1 only) the
+  // variable blocks where it BECOMES feasible, a breakpoint of the phase-1
+  // objective; within it, the variable blocks at the bound it moves toward.
+  const Real delta = delta_;
 
-  // The entering column's own opposite bound. Reaching it first means a bound
-  // flip: the column crosses its range and no basis change happens at all.
-  const bool entering_boxed =
-      is_finite_bound(lower_[entering]) && is_finite_bound(upper_[entering]);
-  if (entering_boxed) best_t = upper_[entering] - lower_[entering];
-
+  // Pass 1 (section 4.1, Harris's first pass): the largest step that keeps
+  // every basic variable within its bounds widened by `delta`.
+  Real max_step = kNoLimit;
   for (std::size_t r = 0; r < m_; ++r) {
     const Real rate = -column_[r] * direction;
     if (std::fabs(rate) < opt_.pivot_floor) continue;
@@ -225,45 +313,49 @@ Step PrimalSolver::iterate() {
     const Real up = upper_[bw];
 
     Real t = kNoLimit;
-    Real target = 0.0;
-    bool to_upper = false;
-
-    if (x < lo - tol) {
-      // Infeasible below. Moving up, it becomes feasible on reaching `lo` --
-      // a breakpoint of the phase-1 objective, so the step stops there.
+    if (x < lo - delta) {
       // Moving down it just gets worse, and blocks nothing.
       if (rate <= 0.0) continue;
       t = (lo - x) / rate;
-      target = lo;
-    } else if (x > up + tol) {
+    } else if (x > up + delta) {
       if (rate >= 0.0) continue;
       t = (up - x) / rate;
-      target = up;
-      to_upper = true;
     } else if (rate > 0.0) {
       if (!is_finite_bound(up)) continue;
-      t = (up - x) / rate;
-      target = up;
-      to_upper = true;
+      t = (up + delta - x) / rate;
     } else {
       if (!is_finite_bound(lo)) continue;
-      t = (lo - x) / rate;
-      target = lo;
+      t = (lo - delta - x) / rate;
     }
-
-    if (t < 0.0) t = 0.0;  // already at or just past the bound: a degenerate step
-    const bool better =
-        t < best_t ||
-        (bland_ && t <= best_t && leaving_slot != m_ &&
-         basis_.basic[r] < basis_.basic[leaving_slot]);
-    if (!better) continue;
-    best_t = t;
-    leaving_slot = r;
-    leaving_target = target;
-    leaving_to_upper = to_upper;
+    // Negative only if a refactorization moved a variable past the tolerance.
+    max_step = std::min(max_step, std::max(t, 0.0));
   }
 
-  if (best_t >= kNoLimit) {
+  // The entering column's own opposite bound. Reaching it within the pass-1
+  // step means a bound flip: the column crosses its range, lands exactly on
+  // the other bound, and no basis change happens at all.
+  const bool entering_boxed =
+      is_finite_bound(lower_[entering]) && is_finite_bound(upper_[entering]);
+  if (entering_boxed) {
+    const Real flip = direction > 0.0 ? upper_[entering] - value_[entering]
+                                      : value_[entering] - lower_[entering];
+    if (flip <= max_step) {
+      for (std::size_t i = 0; i < m_; ++i) x_basic_[i] -= column_[i] * direction * flip;
+      if (basis_.status[entering] == VarStatus::AtLower) {
+        basis_.status[entering] = VarStatus::AtUpper;
+        value_[entering] = upper_[entering];
+      } else {
+        basis_.status[entering] = VarStatus::AtLower;
+        value_[entering] = lower_[entering];
+      }
+      ++bound_flips_;
+      ++iterations_;
+      if (phase1_) ++phase1_iterations_;
+      return Step::Pivoted;
+    }
+  }
+
+  if (max_step >= kNoLimit) {
     if (phase1_) {
       // The phase-1 objective is bounded below by zero, so it cannot improve
       // without limit. Reaching here means the column or the values are stale.
@@ -276,35 +368,52 @@ Step PrimalSolver::iterate() {
     return Step::Unbounded;
   }
 
-  if (best_t > 0.0) {
-    // Real movement: the degenerate run is over, so Dantzig pricing comes back.
-    // Leaving Bland's rule latched on is a correctness-preserving disaster --
-    // it keeps picking the lowest-index eligible column for the rest of the
-    // solve, and measured on Netlib `greenbea` that left phase 1 still 1.7
-    // away from feasible after 600,000 pivots. Bland's is an escape from
-    // cycling, not a pricing rule to settle into.
-    degenerate_steps_ = 0;
-    bland_ = false;
-  } else {
-    ++degenerate_steps_;
-    if (degenerate_steps_ > kDegenerateStepsBeforeBland) bland_ = true;
-  }
+  // Pass 2 (section 4.1): among the variables whose step to their EXACT bound
+  // is within the pass-1 step, the one with the largest pivot leaves.
+  std::size_t leaving_slot = m_;
+  Real pivot = 0.0;
+  Real exact_step = 0.0;
+  bool leaving_to_upper = false;
+  for (std::size_t r = 0; r < m_; ++r) {
+    const Real rate = -column_[r] * direction;
+    if (std::fabs(rate) < opt_.pivot_floor) continue;
 
-  // Case 1: the entering column reached its own opposite bound first.
-  if (leaving_slot == m_) {
-    for (std::size_t i = 0; i < m_; ++i) x_basic_[i] -= column_[i] * direction * best_t;
-    if (basis_.status[entering] == VarStatus::AtLower) {
-      basis_.status[entering] = VarStatus::AtUpper;
-      value_[entering] = upper_[entering];
+    const auto bw = static_cast<std::size_t>(basis_.basic[r]);
+    const Real x = x_basic_[r];
+    const Real lo = lower_[bw];
+    const Real up = upper_[bw];
+
+    Real t = kNoLimit;
+    bool to_upper = false;
+    if (x < lo - delta) {
+      if (rate <= 0.0) continue;
+      t = (lo - x) / rate;
+    } else if (x > up + delta) {
+      if (rate >= 0.0) continue;
+      t = (up - x) / rate;
+      to_upper = true;
+    } else if (rate > 0.0) {
+      if (!is_finite_bound(up)) continue;
+      t = (up - x) / rate;
+      to_upper = true;
     } else {
-      basis_.status[entering] = VarStatus::AtLower;
-      value_[entering] = lower_[entering];
+      if (!is_finite_bound(lo)) continue;
+      t = (lo - x) / rate;
     }
-    ++bound_flips_;
-    ++iterations_;
-    if (phase1_) ++phase1_iterations_;
-    return Step::Pivoted;
+    if (t > max_step || std::fabs(rate) <= pivot) continue;
+    pivot = std::fabs(rate);
+    exact_step = t;
+    leaving_slot = r;
+    leaving_to_upper = to_upper;
   }
+  if (leaving_slot == m_) return Step::Refactorize;
+
+  // The step is at least `tau / |pivot|` (section 4.1, `alpha_min`), so it is
+  // never zero. It may leave the blocking variable past its bound by at most
+  // `delta`; it becomes nonbasic at that value. Capped at the pass-1 step,
+  // which is smaller only after a refactorization moved a variable past the
+  // tolerance.
+  const Real step = std::max(exact_step, std::min(tau_ / pivot, max_step));
 
   // Case 2: an ordinary pivot.
   const Real alpha = column_[leaving_slot];
@@ -317,13 +426,17 @@ Step PrimalSolver::iterate() {
   compute_pivot_row(leaving_slot);
   const Real theta = dj_[entering] / alpha;
 
+  // The leaving variable keeps the value the step gives it -- on its bound, or
+  // past it by at most `delta` -- rather than being moved onto the bound: that
+  // move would break `A x = b` by up to `delta` (section 3.3).
+  const Real leaving_value = x_basic_[leaving_slot] - alpha * direction * step;
   for (std::size_t i = 0; i < m_; ++i) {
     if (i == leaving_slot) continue;
-    x_basic_[i] -= column_[i] * direction * best_t;
+    x_basic_[i] -= column_[i] * direction * step;
   }
-  const Real entering_value = value_[entering] + direction * best_t;
+  const Real entering_value = value_[entering] + direction * step;
 
-  value_[leaving] = leaving_target;
+  value_[leaving] = leaving_value;
   if (is_finite_bound(lower_[leaving]) && is_finite_bound(upper_[leaving]) &&
       lower_[leaving] == upper_[leaving]) {
     basis_.status[leaving] = VarStatus::Fixed;
@@ -394,7 +507,14 @@ core::Expected<SimplexResult> PrimalSolver::run(const Basis* warm_start) {
       outcome = core::SolverStatus::NotConverged;
       break;
     }
-    if (force_refactor_ || lu_.num_updates() >= opt_.refactor_interval) {
+    if (expand_iterations_ >= kExpandIterations) {
+      // The end of an expanding sequence (section 4.3).
+      status = reset();
+      if (!status.ok()) {
+        outcome = core::SolverStatus::NumericalError;
+        break;
+      }
+    } else if (force_refactor_ || lu_.num_updates() >= opt_.refactor_interval) {
       status = refactorize();
       if (!status.ok()) {
         outcome = core::SolverStatus::NumericalError;
@@ -427,6 +547,22 @@ core::Expected<SimplexResult> PrimalSolver::run(const Basis* warm_start) {
     // reason.
     if (lu_.num_updates() > 0) {
       status = refactorize();
+      if (!status.ok()) {
+        outcome = core::SolverStatus::NumericalError;
+        break;
+      }
+      continue;
+    }
+
+    // A tentative verdict with nonbasic variables still off their bounds: put
+    // them back and check the verdict again (section 4.3), at most R times.
+    // On a well-conditioned model the verdict holds straight after the reset.
+    // The same goes for a working tolerance widened past the caller's (see
+    // the phase-1 case in `iterate`): the reset brings it back to delta_0.
+    if (termination_resets_ < kTerminationResets &&
+        (nonbasic_off_bounds() || delta_ > opt_.primal_feasibility_tolerance)) {
+      ++termination_resets_;
+      status = reset();
       if (!status.ok()) {
         outcome = core::SolverStatus::NumericalError;
         break;

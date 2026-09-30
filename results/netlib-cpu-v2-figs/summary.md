@@ -1,6 +1,6 @@
 # Benchmark summary
 
-Machine: i5-12450H laptop, WSL2, on AC — 12 cores — Linux 6.6.87.2-microsoft-standard-WSL2. CPU only. Time limit 300 s. Commit `d7c8419`. Wall clock, including reading the file.
+Machine: i5-12450H laptop, WSL2, on AC — 12 cores — Linux 6.6.87.2-microsoft-standard-WSL2. CPU only. Time limit 300 s. Commit `d7c8419` (tag `bench-netlib-v2`). Wall clock, including reading the file.
 
 ## Netlib feasible
 

@@ -25,7 +25,7 @@ number would be.
 
 ## 1. Version 0 — The design was reviewed *before* a line of solver code was written
 
-**When:** 2026-08-30 to 2026-08-31 (`e62ee11`, `34d22c2`)
+**When:** 2026-08-30 to 2026-08-31 (`a52b0aa`, `87635ff`)
 
 Before writing the actual solver, the team wrote out the intended architecture and then
 **deliberately audited it for flaws** — this is `docs/ARCHITECTURE-REVIEW.md`, and it is
@@ -53,7 +53,7 @@ cuSOLVER/cuDSS compliance problem) and 3.1 (the predictor-corrector problem).
 
 ## 2. Version 1 — Foundation: ingestion, and a discipline of honest measurement
 
-**When:** 2026-08-30 to 2026-09-02 (`34d22c2` → `4eb87a3`, ~9 commits)
+**When:** 2026-08-30 to 2026-09-02 (`87635ff` → `a9e2138`, ~9 commits)
 
 This version has **no solver yet** — it's the parser, canonicalizer, and the first real
 external-validation habit. The important thing to show here is not speed, it's that the
@@ -85,7 +85,7 @@ project mein continue hui."*
 
 ## 3. Version 2 — The first real solver: replacing the compliance-risk design with our own math
 
-**When:** 2026-09-04 to 2026-09-07 (`dafcc47`, `4f16c55`, `bccd393`)
+**When:** 2026-09-04 to 2026-09-07 (`6b53ef4`, `4dce3c9`)
 
 This is where Version 0's problem #1 (cuSOLVER/cuDSS delegation) actually gets fixed in
 code: the solver ships with its **own** matrix-free Conjugate Gradient / MINRES solve and
@@ -112,8 +112,8 @@ independent solver (HiGHS) se cross-check karte hain.'"*
 
 ## 4. Version 3 — Presolve done, MILP added, and three self-caught bugs (2026-09-08)
 
-**When:** all four on 2026-09-08, `6fc7146` (01:13) → `070b956` (04:42) → `1713ebb`
-(11:13) → `8962542` (11:57) — a single, intense day of iteration.
+**When:** all four on 2026-09-08, `e430363` (01:13) → `edea164` (04:42) → `cdfd8b7`
+(11:13) → `5076593` (11:57) — a single, intense day of iteration.
 
 This is the richest version for the "we test ourselves and catch our own mistakes"
 story. Three real, sequential bugs were found and fixed on the `markshare_4_0.mps`
@@ -143,8 +143,8 @@ because it looks like success. It's documented in `src/solver/MilpPresolve.cpp` 
 
 **Also this version:** MILP branch-and-bound layer added (best-first search via a
 `std::priority_queue`, warm-started child nodes, cover/GCD cutting planes computed once
-at the root) — commit `1713ebb` — and cross-row cutting plus a binary-column eligibility
-fix — commit `8962542`.
+at the root) — commit `cdfd8b7` — and cross-row cutting plus a binary-column eligibility
+fix — commit `5076593`.
 
 **Honest limit, not hidden:** on the *harder* `markshare` family instances, the LP bound
 still doesn't tighten with search depth — measured across three runs at 2,000 / 4,014 /

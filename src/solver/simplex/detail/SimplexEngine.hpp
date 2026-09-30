@@ -92,9 +92,10 @@ class SimplexEngine {
   /// over a neighbouring problem's basis cannot always know it still applies.
   void install_basis(const Basis* warm_start);
 
-  /// Re-place every nonbasic variable on the bound its status names. Nonbasic
-  /// variables always sit exactly on a bound, so this is idempotent -- it
-  /// exists to re-derive values after the BOUNDS moved underneath them.
+  /// Re-place every nonbasic variable on the bound its status names. In the
+  /// dual simplex nonbasic variables always sit exactly on a bound, so there
+  /// this re-derives values after the BOUNDS moved underneath them; in the
+  /// primal simplex it is also EXPAND's reset (`preserve_nonbasic_values_`).
   void reset_nonbasic_values();
 
   [[nodiscard]] Real working_value(std::size_t w) const {
@@ -205,6 +206,13 @@ class SimplexEngine {
   std::size_t repairs_ = 0;
   std::size_t phase1_iterations_ = 0;
   bool force_refactor_ = false;
+
+  /// When set, `refactorize()` keeps each nonbasic variable's stored value
+  /// instead of re-placing it on its bound. The primal simplex's EXPAND
+  /// procedure leaves nonbasic variables slightly off their bounds on purpose
+  /// and moves them back only at its own resets. A basis repair still
+  /// re-places them all: a displaced column's stored value is stale.
+  bool preserve_nonbasic_values_ = false;
 };
 
 }  // namespace sovsolve::solver::simplex::detail
