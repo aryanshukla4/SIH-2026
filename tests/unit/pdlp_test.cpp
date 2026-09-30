@@ -684,6 +684,10 @@ End
     solver::pdlp::HostMatVec mv(p);
     solver::pdlp::InfeasibilityDetector detector(p, mv);
     core::RealVector v_x(p.num_cols(), 0.0);
+    // A failed canonicalization leaves no columns, and v_x[0] would write
+    // through the allocator's null pointer for a zero-byte request.
+    CHECK(!v_x.empty());
+    if (v_x.empty()) return;
     v_x[0] = 1.0;  // x, which is boxed
     core::RealVector v_y(p.num_rows(), 0.0);
     CHECK(detector.classify(v_x, v_y, 1e-6) == solver::pdlp::CertificateKind::None);
@@ -719,6 +723,8 @@ End
     solver::pdlp::HostMatVec mv(p);
     solver::pdlp::InfeasibilityDetector detector(p, mv);
     core::RealVector v_x(p.num_cols(), 0.0);
+    CHECK(!v_x.empty());
+    if (v_x.empty()) return;
     v_x[0] = 1.0;
     core::RealVector v_y(p.num_rows(), 0.0);
     // The ratio is 1/1e7 = 1e-7: inside the old default, outside the new one.

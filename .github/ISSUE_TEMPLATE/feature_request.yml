@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest a new capability or an improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve
+      description: The model class, file format or workflow you need, and what is missing today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: How you would like it to work. Cite a paper if the idea comes from one.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
